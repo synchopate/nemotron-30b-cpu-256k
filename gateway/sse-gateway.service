@@ -1,0 +1,14 @@
+[Unit]
+Description=Nemotron 30B Dynamic Thinking & HARP-Cache SSE Gateway (Port 8787)
+After=network.target nemotron-256k.service
+Requires=nemotron-256k.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 -u /opt/nemotron-256k/gateway/sse_gateway.py 8787
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

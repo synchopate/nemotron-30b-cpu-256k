@@ -1,0 +1,905 @@
+diff --git a/ggml/src/ggml-cpu/arch/x86/quants.c b/ggml/src/ggml-cpu/arch/x86/quants.c
+index ea54cfe..68b926e 100644
+--- a/ggml/src/ggml-cpu/arch/x86/quants.c
++++ b/ggml/src/ggml-cpu/arch/x86/quants.c
+@@ -721,6 +721,12 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
+ 
+     // Main loop
+     for (; ib < nb; ++ib) {
++#if defined(__AVX2__) || defined(__AVX512F__)
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from weight streaming pollution
++        if (ib + 4 < nb) {
++            _mm_prefetch((const char *)&x[ib + 4], _MM_HINT_NTA);
++        }
++#endif
+         /* Compute combined scale for the block */
+         const __m256 d = _mm256_set1_ps( GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d) );
+ 
+@@ -1162,6 +1168,12 @@ void ggml_vec_dot_q5_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
+ 
+     // Main loop
+     for (; ib < nb; ++ib) {
++#if defined(__AVX2__) || defined(__AVX512F__)
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from weight streaming pollution
++        if (ib + 4 < nb) {
++            _mm_prefetch((const char *)&x[ib + 4], _MM_HINT_NTA);
++        }
++#endif
+         /* Compute combined scale for the block */
+         const __m256 d = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d));
+ 
+@@ -1186,6 +1198,12 @@ void ggml_vec_dot_q5_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
+ 
+     // Main loop
+     for (; ib < nb; ++ib) {
++#if defined(__AVX2__) || defined(__AVX512F__)
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from weight streaming pollution
++        if (ib + 4 < nb) {
++            _mm_prefetch((const char *)&x[ib + 4], _MM_HINT_NTA);
++        }
++#endif
+         /* Compute combined scale for the block */
+         const __m256 d = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d));
+ 
+@@ -1591,6 +1609,15 @@ void ggml_vec_dot_q2_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+     __m256 acc = _mm256_setzero_ps();
+ 
+     for (int i = 0; i < nb; ++i) {
++#if defined(__AVX2__) || defined(__AVX512F__)
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
++        if (i + 2 < nb) {
++            _mm_prefetch((const char *)&x[i + 2], _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 128, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 192, _MM_HINT_NTA);
++        }
++#endif
+ 
+         const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
+         const float dmin = -y[i].d * GGML_CPU_FP16_TO_FP32(x[i].dmin);
+@@ -1790,6 +1817,15 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+     uint32_t aux[3];
+ 
+     for (int i = 0; i < nb; ++i) {
++#if defined(__AVX2__) || defined(__AVX512F__)
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
++        if (i + 2 < nb) {
++            _mm_prefetch((const char *)&x[i + 2], _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 128, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 192, _MM_HINT_NTA);
++        }
++#endif
+ 
+         const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
+ 
+@@ -1895,6 +1931,15 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+     const uint32_t *aux;
+ 
+     for (int i = 0; i < nb; ++i) {
++#if defined(__AVX2__) || defined(__AVX512F__)
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
++        if (i + 2 < nb) {
++            _mm_prefetch((const char *)&x[i + 2], _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 128, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 192, _MM_HINT_NTA);
++        }
++#endif
+ 
+         const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
+ 
+@@ -2062,6 +2107,15 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+     __m128 acc_m = _mm_setzero_ps();
+ 
+    for (int i = 0; i < nb; ++i) {
++#if defined(__AVX2__) || defined(__AVX512F__)
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
++        if (i + 2 < nb) {
++            _mm_prefetch((const char *)&x[i + 2], _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 128, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 192, _MM_HINT_NTA);
++        }
++#endif
+ 
+         const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
+         const float dmin = -y[i].d * GGML_CPU_FP16_TO_FP32(x[i].dmin);
+@@ -2128,6 +2182,15 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+     __m128 acc_m = _mm_setzero_ps();
+ 
+    for (int i = 0; i < nb; ++i) {
++#if defined(__AVX2__) || defined(__AVX512F__)
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
++        if (i + 2 < nb) {
++            _mm_prefetch((const char *)&x[i + 2], _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 128, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 192, _MM_HINT_NTA);
++        }
++#endif
+ 
+         const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
+         const float dmin = -y[i].d * GGML_CPU_FP16_TO_FP32(x[i].dmin);
+@@ -2323,6 +2386,15 @@ void ggml_vec_dot_q5_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+     float summs = 0.f;
+ 
+     for (int i = 0; i < nb; ++i) {
++#if defined(__AVX2__) || defined(__AVX512F__)
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
++        if (i + 2 < nb) {
++            _mm_prefetch((const char *)&x[i + 2], _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 128, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 192, _MM_HINT_NTA);
++        }
++#endif
+ 
+         const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
+         const float dmin = -y[i].d * GGML_CPU_FP16_TO_FP32(x[i].dmin);
+@@ -2444,6 +2516,15 @@ void ggml_vec_dot_q6_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+     __m256 acc = _mm256_setzero_ps();
+ 
+     for (int i = 0; i < nb; ++i) {
++#if defined(__AVX2__) || defined(__AVX512F__)
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
++        if (i + 2 < nb) {
++            _mm_prefetch((const char *)&x[i + 2], _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 128, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 192, _MM_HINT_NTA);
++        }
++#endif
+ 
+         const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
+ 
+@@ -2515,6 +2596,15 @@ void ggml_vec_dot_q6_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+     __m256 acc = _mm256_setzero_ps();
+ 
+     for (int i = 0; i < nb; ++i) {
++#if defined(__AVX2__) || defined(__AVX512F__)
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
++        if (i + 2 < nb) {
++            _mm_prefetch((const char *)&x[i + 2], _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 128, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 192, _MM_HINT_NTA);
++        }
++#endif
+ 
+         const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
+ 
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 7918845..66811d6 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -489,6 +489,8 @@ struct ggml_threadpool {
+     atomic_int GGML_CACHE_ALIGN n_barrier;
+     atomic_int GGML_CACHE_ALIGN n_barrier_passed;
+     atomic_int GGML_CACHE_ALIGN current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.
++    atomic_int GGML_CACHE_ALIGN ccd_phase;     // Dual-CCD vertical pipeline phase synchronization
++    bool dual_ccd_active;
+ 
+     // these are atomic as an annotation for thread-sanitizer
+     atomic_bool stop;         // Used for stopping the threadpool altogether
+@@ -579,8 +581,11 @@ void ggml_barrier(struct ggml_threadpool * tp) {
+     }
+ 
+ #ifdef GGML_USE_OPENMP
+-    #pragma omp barrier
+-#else
++    if (!tp->dual_ccd_active) {
++        #pragma omp barrier
++        return;
++    }
++#endif
+     int n_passed = atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed);
+ 
+     // enter barrier (full seq-cst fence)
+@@ -607,7 +612,6 @@ void ggml_barrier(struct ggml_threadpool * tp) {
+     #else
+     atomic_thread_fence(memory_order_seq_cst);
+     #endif
+-#endif
+ }
+ 
+ void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value) {
+@@ -3057,6 +3061,66 @@ static int ggml_cpu_try_fuse_ops(
+     return 0;
+ }
+ 
++static thread_ret_t ggml_graph_compute_thread_range(struct ggml_compute_state * state, int node_start, int node_end) {
++    struct ggml_threadpool    * tp    = state->threadpool;
++
++    const struct ggml_cgraph * cgraph = tp->cgraph;
++    const struct ggml_cplan  * cplan  = tp->cplan;
++
++#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
++    ggml_backend_cpu_riscv64_spacemit_set_numa_thread_affinity(state->ith);
++#else
++    set_numa_thread_affinity(state->ith);
++#endif
++
++    struct ggml_compute_params params = {
++        /*.ith        =*/ state->ith,
++        /*.nth        =*/ atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK,
++        /*.wsize      =*/ cplan->work_size,
++        /*.wdata      =*/ cplan->work_data,
++        /*.threadpool =*/ tp,
++        /*.use_ref    =*/ cplan->use_ref,
++    };
++
++    for (int node_n = node_start; node_n < node_end && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
++        struct ggml_tensor * node = cgraph->nodes[node_n];
++
++        if (ggml_op_is_empty(node->op)) {
++            // skip NOPs
++            continue;
++        }
++
++        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
++            continue;
++        }
++
++        const int n_fused = (node_n + 1 < node_end) ? ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan) : 0;
++        if (n_fused > 0) {
++            node_n += n_fused;
++        } else {
++            ggml_compute_forward(&params, node);
++        }
++
++        if (state->ith == 0 && cplan->abort_callback &&
++                cplan->abort_callback(cplan->abort_callback_data)) {
++            atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
++            tp->ec    = GGML_STATUS_ABORTED;
++        }
++
++        if (node_n + 1 < node_end) {
++            ggml_barrier(state->threadpool);
++        }
++    }
++
++    ggml_barrier(state->threadpool);
++
++#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
++    ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);
++#endif
++
++    return 0;
++}
++
+ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+     struct ggml_threadpool    * tp    = state->threadpool;
+@@ -3284,6 +3348,8 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
+         threadpool->n_barrier        = 0;
+         threadpool->n_barrier_passed = 0;
+         threadpool->current_chunk    = 0;
++        threadpool->ccd_phase        = 0;
++        threadpool->dual_ccd_active  = false;
+         threadpool->stop             = false;
+         threadpool->pause            = tpp->paused;
+         threadpool->abort            = -1;
+@@ -3376,7 +3442,111 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+     }
+ 
+ #ifdef GGML_USE_OPENMP
+-    if (n_threads > 1) {
++    static int s_dual_ccd_split_layer = -2;
++    if (s_dual_ccd_split_layer == -2) {
++        const char * env_split = getenv("LLAMA_DUAL_CCD_SPLIT");
++        s_dual_ccd_split_layer = (env_split && atoi(env_split) > 0) ? atoi(env_split) : -1;
++        if (s_dual_ccd_split_layer > 0) {
++            fprintf(stderr, "[GGML-DUAL-CCD] Vertical Layer Partitioning ACTIVE: Layers 0..%d -> CCD0 (32MB L3), Layers %d..N -> CCD1 (32MB L3)\n",
++                    s_dual_ccd_split_layer - 1, s_dual_ccd_split_layer);
++        }
++    }
++
++    if (s_dual_ccd_split_layer > 0 && n_threads > 1) {
++        int split_node = -1;
++        if (cgraph->n_nodes > 64) {
++            char target_nemotron[64];
++            char target_std[64];
++            snprintf(target_nemotron, sizeof(target_nemotron), "nemotron_h_block_out-%d", s_dual_ccd_split_layer - 1);
++            snprintf(target_std,      sizeof(target_std),      "l_out-%d",                s_dual_ccd_split_layer - 1);
++            for (int i = 0; i < cgraph->n_nodes; i++) {
++                const char * tname = cgraph->nodes[i]->name;
++                if (strcmp(tname, target_nemotron) == 0 || strcmp(tname, target_std) == 0) {
++                    split_node = i + 1;
++                    break;
++                }
++            }
++        }
++
++        threadpool->dual_ccd_active = true;
++        atomic_store_explicit(&threadpool->n_graph, n_threads, memory_order_relaxed);
++        atomic_store_explicit(&threadpool->n_barrier, 0, memory_order_relaxed);
++        atomic_store_explicit(&threadpool->n_barrier_passed, 0, memory_order_relaxed);
++        atomic_store_explicit(&threadpool->current_chunk, 0, memory_order_relaxed);
++        atomic_store_explicit(&threadpool->ccd_phase, 0, memory_order_relaxed);
++
++        #pragma omp parallel num_threads(n_threads * 2)
++        {
++            int omp_id = omp_get_thread_num();
++
++            static const int ccd0_cpus[16] = {0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23};
++            static const int ccd1_cpus[16] = {8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31};
++            static __thread int tls_pinned_cpu = -1;
++            int target_cpu = (omp_id < n_threads)
++                ? ccd0_cpus[omp_id % 16]
++                : ccd1_cpus[(omp_id - n_threads) % 16];
++            if (tls_pinned_cpu != target_cpu) {
++                cpu_set_t cpuset;
++                CPU_ZERO(&cpuset);
++                CPU_SET(target_cpu, &cpuset);
++                if (pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) == 0) {
++                    tls_pinned_cpu = target_cpu;
++                }
++            }
++
++            if (split_node > 0 && split_node < cgraph->n_nodes) {
++                if (omp_id < n_threads) {
++                    struct ggml_compute_state local_state;
++                    memset(&local_state, 0, sizeof(local_state));
++                    local_state.threadpool = threadpool;
++                    local_state.ith        = omp_id;
++                    ggml_graph_compute_thread_range(&local_state, 0, split_node);
++
++                    if (omp_id == 0) {
++                        atomic_store_explicit(&threadpool->current_chunk, 0, memory_order_relaxed);
++                        atomic_store_explicit(&threadpool->ccd_phase, 1, memory_order_seq_cst);
++                    }
++
++                    while (atomic_load_explicit(&threadpool->ccd_phase, memory_order_acquire) < 2) {
++                        ggml_thread_cpu_relax();
++                    }
++                } else if (omp_id < n_threads * 2) {
++                    while (atomic_load_explicit(&threadpool->ccd_phase, memory_order_acquire) < 1) {
++                        ggml_thread_cpu_relax();
++                    }
++
++                    if (atomic_load_explicit(&threadpool->abort, memory_order_relaxed) < 0) {
++                        struct ggml_compute_state local_state;
++                        memset(&local_state, 0, sizeof(local_state));
++                        local_state.threadpool = threadpool;
++                        local_state.ith        = omp_id - n_threads;
++                        ggml_graph_compute_thread_range(&local_state, split_node, cgraph->n_nodes);
++                    }
++
++                    if (omp_id == n_threads) {
++                        atomic_store_explicit(&threadpool->ccd_phase, 2, memory_order_seq_cst);
++                    }
++                }
++            } else {
++                if (omp_id < n_threads) {
++                    struct ggml_compute_state local_state;
++                    memset(&local_state, 0, sizeof(local_state));
++                    local_state.threadpool = threadpool;
++                    local_state.ith        = omp_id;
++                    ggml_graph_compute_thread_range(&local_state, 0, cgraph->n_nodes);
++
++                    if (omp_id == 0) {
++                        atomic_store_explicit(&threadpool->ccd_phase, 2, memory_order_seq_cst);
++                    }
++                } else {
++                    while (atomic_load_explicit(&threadpool->ccd_phase, memory_order_acquire) < 2) {
++                        ggml_thread_cpu_relax();
++                    }
++                }
++            }
++        }
++        threadpool->dual_ccd_active = false;
++    } else if (n_threads > 1) {
+         #pragma omp parallel num_threads(n_threads)
+         {
+             #pragma omp single
+@@ -3392,6 +3562,16 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+             ggml_thread_apply_priority(threadpool->prio);
+             if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
+                 ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
++            } else if (n_threads == 16) {
++                static __thread int tls_std_pinned_cpu = -1;
++                if (tls_std_pinned_cpu != ith) {
++                    cpu_set_t cpuset;
++                    CPU_ZERO(&cpuset);
++                    CPU_SET(ith, &cpuset);
++                    if (pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) == 0) {
++                        tls_std_pinned_cpu = ith;
++                    }
++                }
+             }
+             ggml_graph_compute_thread(&threadpool->workers[ith]);
+         }
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 42ec809..7ab75f9 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -12,6 +12,10 @@
+ #include <cfloat>
+ #include <cmath>
+ 
++#if defined(__x86_64__) || defined(_M_X64)
++#include <immintrin.h>
++#endif
++
+ // ggml_compute_forward_dup
+ 
+ static void ggml_compute_forward_dup_same_cont(
+@@ -8465,6 +8469,93 @@ void ggml_compute_forward_top_k(
+     }
+ }
+ 
++#if defined(__AVX2__) || defined(__AVX512F__)
++#include <sys/mman.h>
++#include <fcntl.h>
++#include <unistd.h>
++
++struct llama_modchip_shm_t {
++    uint32_t magic;            // 0x4D4F4443 ("MODC")
++    uint32_t version;          // 1
++    int32_t  kv_l3_window;     // L3 hot window tokens (0 = disable KV NTA)
++    int32_t  attn_window;      // SWA window tokens (0 = full global attention)
++    int32_t  attn_sinks;       // Attention sinks (default 16)
++    int32_t  swa_stride;       // 0/1 = all layers SWA; 4 = 3:1 Interleaved SWA (keep every 4th layer global)
++    int32_t  disable_chunking; // 1 = static GQA Dual-CCD L3 partition
++    int32_t  rc_enabled;       // 1 = RouteCrack on, 0 = off
++    int32_t  rc_cert_d0;       // Step 0 certainty gate (84 strict / 78 balanced)
++    int32_t  rc_cert_d1;       // Step 1 certainty gate (92 strict / 88 balanced)
++    int32_t  rc_cert_d2;       // Step 2 certainty gate (96 strict / 94 balanced)
++    int32_t  moe_top_k;        // Active MoE Top-K
++};
++
++struct kv_l3_policy_config {
++    int64_t kv_l3_window;
++    int64_t kv_nta_prefix;
++    int64_t attn_window;
++    int64_t attn_sinks;
++    int64_t swa_stride;
++    const volatile llama_modchip_shm_t * shm_ptr;
++
++    kv_l3_policy_config() : shm_ptr(nullptr) {
++        const char * env_w  = getenv("LLAMA_KV_L3_WINDOW");
++        kv_l3_window        = env_w ? atoll(env_w) : 2048;
++        const char * env_p  = getenv("LLAMA_KV_L3_NTA_PREFIX");
++        kv_nta_prefix       = env_p ? atoll(env_p) : -1;
++        const char * env_aw = getenv("LLAMA_ATTN_WINDOW");
++        attn_window         = env_aw ? atoll(env_aw) : 4096;
++        const char * env_as = getenv("LLAMA_ATTN_SINKS");
++        attn_sinks          = env_as ? atoll(env_as) : 16;
++        const char * env_st = getenv("LLAMA_SWA_STRIDE");
++        swa_stride          = env_st ? atoll(env_st) : 0;
++
++        int fd = open("/dev/shm/llama_modchip.bin", O_RDONLY);
++        if (fd >= 0) {
++            void * p = mmap(nullptr, sizeof(llama_modchip_shm_t), PROT_READ, MAP_SHARED, fd, 0);
++            close(fd);
++            if (p != MAP_FAILED) {
++                const llama_modchip_shm_t * s = (const llama_modchip_shm_t *)p;
++                if (s->magic == 0x4D4F4443u) {
++                    shm_ptr = s;
++                }
++            }
++        }
++
++        if (attn_window > 0) {
++            fprintf(stderr, "[GGML-MODCHIP] SWA ACTIVE: Window=%ld, Sinks=%ld, Stride=%ld, L3 Window=%ld\n",
++                    (long)attn_window, (long)attn_sinks, (long)swa_stride, (long)kv_l3_window);
++        } else {
++            fprintf(stderr, "[GGML-MODCHIP] Full 256K Global Attention ACTIVE: Window=FULL, L3 NTA Window=%ld\n",
++                    (long)kv_l3_window);
++        }
++    }
++};
++
++static inline const kv_l3_policy_config & get_kv_l3_policy() {
++    static const kv_l3_policy_config cfg;
++    return cfg;
++}
++
++static inline int parse_tensor_layer_id(const ggml_tensor * t) {
++    if (!t) return -1;
++    const char * s = (t->view_src && t->view_src->name[0]) ? t->view_src->name : t->name;
++    int last_num = -1;
++    while (*s) {
++        if (*s >= '0' && *s <= '9') {
++            int v = 0;
++            while (*s >= '0' && *s <= '9') {
++                v = v * 10 + (*s - '0');
++                s++;
++            }
++            last_num = v;
++        } else {
++            s++;
++        }
++    }
++    return last_num;
++}
++#endif
++
+ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+         const ggml_compute_params * params,
+         ggml_tensor * dst,
+@@ -8473,6 +8564,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+         float * partials, int64_t partial_stride) {
+ 
+     const bool write_partials = (partials != nullptr);
++#if defined(__AVX2__) || defined(__AVX512F__)
++    const kv_l3_policy_config & l3_cfg = get_kv_l3_policy();
++#endif
+     const ggml_tensor * q     = dst->src[0];
+     const ggml_tensor * k     = dst->src[1];
+     const ggml_tensor * v     = dst->src[2];
+@@ -8588,8 +8682,21 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+         // online softmax / attention
+         // loop over n_kv and n_head_kv
+         // ref: https://arxiv.org/pdf/2112.05682.pdf
++        const int64_t cur_pos = (N == 1) ? (ic_end - 1) : (ic_end - N + iq1);
+ 
+         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
++#if defined(__AVX2__) || defined(__AVX512F__)
++            const int64_t eff_aw = (l3_cfg.shm_ptr && l3_cfg.shm_ptr->magic == 0x4D4F4443u) ? l3_cfg.shm_ptr->attn_window : l3_cfg.attn_window;
++            const int64_t eff_as = (l3_cfg.shm_ptr && l3_cfg.shm_ptr->magic == 0x4D4F4443u) ? l3_cfg.shm_ptr->attn_sinks  : l3_cfg.attn_sinks;
++            const int64_t eff_st = (l3_cfg.shm_ptr && l3_cfg.shm_ptr->magic == 0x4D4F4443u) ? l3_cfg.shm_ptr->swa_stride  : l3_cfg.swa_stride;
++            if (eff_aw > 0 && cur_pos > eff_aw) {
++                const int lid = (eff_st > 1) ? parse_tensor_layer_id(k) : 0;
++                const bool is_global_anchor = (eff_st > 1) && (lid < 0 || ((lid + 1) % eff_st == 0));
++                if (!is_global_anchor && ic >= eff_as && ic < (cur_pos - eff_aw)) {
++                    continue; // Skip out-of-window tokens (SWA or Interleaved SWA)
++                }
++            }
++#endif
+             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+             if (mv == -INFINITY) {
+                 continue;
+@@ -8597,6 +8704,26 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+ 
+             float s; // KQ value
+ 
++#if defined(__AVX2__) || defined(__AVX512F__)
++            if (ic + 4 < ic_end) {
++                const char * k_pref = (const char *) k->data + ((ic + 4)*nbk1 + ik2*nbk2 + ik3*nbk3);
++                const char * v_pref = ((const char *) v->data + ((ic + 4)*nbv1 + iv2*nbv2 + iv3*nbv3));
++                const int64_t eff_l3w = (l3_cfg.shm_ptr && l3_cfg.shm_ptr->magic == 0x4D4F4443u) ? l3_cfg.shm_ptr->kv_l3_window : l3_cfg.kv_l3_window;
++                const bool is_nta = (N == 1) && ((l3_cfg.kv_nta_prefix > 0 && (ic + 4) < l3_cfg.kv_nta_prefix) ||
++                                    (eff_l3w > 0 && (ic_end - (ic + 4)) > eff_l3w));
++                if (is_nta) {
++                    _mm_prefetch(k_pref,      _MM_HINT_NTA);
++                    _mm_prefetch(k_pref + 64, _MM_HINT_NTA);
++                    _mm_prefetch(v_pref,      _MM_HINT_NTA);
++                    _mm_prefetch(v_pref + 64, _MM_HINT_NTA);
++                } else {
++                    _mm_prefetch(k_pref,      _MM_HINT_T0);
++                    _mm_prefetch(k_pref + 64, _MM_HINT_T0);
++                    _mm_prefetch(v_pref,      _MM_HINT_T0);
++                    _mm_prefetch(v_pref + 64, _MM_HINT_T0);
++                }
++            }
++#endif
+             const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
+             kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+ 
+@@ -9149,7 +9276,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+         const int64_t nr = neq1*neq2*neq3;
+ 
+         // disable for NUMA
+-        const bool disable_chunking = ggml_is_numa();
++        const bool disable_chunking = true; // Static GQA KV-Head Dual-CCD L3 Partitioning
+ 
+         // 4x chunks per thread
+         int nth_scaled = nth * 4;
+@@ -10894,7 +11021,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
+     int64_t nr = V->ne[1] * V->ne[3];
+ 
+     // disable for NUMA
+-    const bool disable_chunking = ggml_is_numa();
++    const bool disable_chunking = true; // Static GQA KV-Head Dual-CCD L3 Partitioning
+ 
+     int nth = params->nth;
+     int ith = params->ith;
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index da7f3a5..6aa727a 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -380,6 +380,13 @@ void * ggml_aligned_malloc(size_t size) {
+         GGML_LOG_ERROR("%s: %s (attempted to allocate %6.2f MB)\n", __func__, error_desc, size/(1024.0*1024.0));
+         return NULL;
+     }
++#if defined(__linux__) && defined(MADV_HUGEPAGE)
++    if (size >= 2 * 1024 * 1024) {
++        uintptr_t page_mask = ~(uintptr_t)(4096 - 1);
++        void * page_aligned = (void *)((uintptr_t)aligned_memory & page_mask);
++        madvise(page_aligned, size, MADV_HUGEPAGE);
++    }
++#endif
+     return aligned_memory;
+ #endif
+ }
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index ed572da..b18ef4a 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -458,6 +458,9 @@ struct llama_mmap::impl {
+         if (addr == MAP_FAILED) {
+             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
+         }
++#if defined(__linux__) && defined(MADV_HUGEPAGE)
++        madvise(addr, file->size(), MADV_HUGEPAGE);
++#endif
+ 
+         if (prefetch > 0) {
+             if (posix_madvise(addr, std::min(file->size(), prefetch), POSIX_MADV_WILLNEED)) {
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 3d50f8a..37a376c 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -462,6 +462,10 @@ namespace GGUFMeta {
+                 GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(metadata, kid);
+ 
+             if (n != arr_info.length) {
++                if (arr_info.length <= n) {
++                    result.fill(0);
++                    return get_arr(key, result, required);
++                }
+                 throw std::runtime_error(format("key %s has wrong array length; expected %u, got %u", key.c_str(), n, (uint32_t) arr_info.length));
+             }
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 3bf3a22..b4f5af5 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -40,8 +40,6 @@
+ 
+ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
+     switch (arch) {
+-        case LLM_ARCH_CLIP:
+-            return new llama_model_clip(params);
+         case LLM_ARCH_LLAMA:
+             return new llama_model_llama(params);
+         case LLM_ARCH_LLAMA4:
+@@ -114,8 +112,6 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
+             return new llama_model_qwen3vl(params);
+         case LLM_ARCH_QWEN3VLMOE:
+             return new llama_model_qwen3vlmoe(params);
+-        case LLM_ARCH_QWEN3TTS:
+-            return new llama_model_qwen3tts(params);
+         case LLM_ARCH_PHI2:
+             return new llama_model_phi2(params);
+         case LLM_ARCH_PHI3:
+@@ -176,8 +172,6 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
+             return new llama_model_olmo2(params);
+         case LLM_ARCH_OLMOE:
+             return new llama_model_olmoe(params);
+-        case LLM_ARCH_MUSE_GLIMMER:
+-            return new llama_model_muse_glimmer(params);
+         case LLM_ARCH_OPENELM:
+             return new llama_model_openelm(params);
+         case LLM_ARCH_GPTNEOX:
+@@ -238,8 +232,6 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
+             return new llama_model_granite(params);
+         case LLM_ARCH_GRANITE_MOE:
+             return new llama_model_granite_moe(params);
+-        case LLM_ARCH_GRANITE_SWITCH:
+-            return new llama_model_granite_switch(params);
+         case LLM_ARCH_MINICPM:
+             return new llama_model_minicpm(params);
+         case LLM_ARCH_GRANITE_HYBRID:
+@@ -1104,6 +1096,18 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);
+     ml.get_key(LLM_KV_EXPERT_GROUP_USED_COUNT, hparams.n_group_used,    false);
+ 
++    {
++        const char * env_moe_top_k = getenv("LLAMA_MOE_TOP_K");
++        if (env_moe_top_k && atoi(env_moe_top_k) > 0) {
++            const uint32_t val = (uint32_t)atoi(env_moe_top_k);
++            if (val <= hparams.n_expert && hparams.n_expert_used > 0) {
++                LLAMA_LOG_INFO("%s: [ROUTECRACK] Dynamic Expert Selection: overriding n_expert_used from %u to %u (LLAMA_MOE_TOP_K)\n",
++                    __func__, hparams.n_expert_used, val);
++                hparams.n_expert_used = val;
++            }
++        }
++    }
++
+     if (arch == LLM_ARCH_HUNYUAN_VL || arch == LLM_ARCH_HUNYUAN_DENSE) {
+         if (hparams.n_expert <= 1) {
+             hparams.n_expert      = 0;
+@@ -1918,7 +1922,6 @@ void llama_model::print_info() const {
+                 arch == LLM_ARCH_GRANITE ||
+                 arch == LLM_ARCH_GRANITE_MOE ||
+                 arch == LLM_ARCH_GRANITE_HYBRID ||
+-                arch == LLM_ARCH_GRANITE_SWITCH ||
+                 arch == LLM_ARCH_NEMOTRON_H_MOE) {
+             LLAMA_LOG_INFO("%s: f_embedding_scale     = %f\n", __func__, hparams.f_embedding_scale);
+             LLAMA_LOG_INFO("%s: f_residual_scale      = %f\n", __func__, hparams.f_residual_scale);
+@@ -2235,9 +2238,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE);
+ 
+-                const bool mtp_on_hybrid_nemotron =
+-                    params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
+-
+                 if (llm_arch_is_recurrent(arch)) {
+                     res = new llama_memory_recurrent(
+                             *this,
+@@ -2248,7 +2248,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             cparams.n_seq_max,
+                             cparams.n_rs_seq,
+                             nullptr);
+-                } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron) {
++                } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen) {
+                     // The main difference between hybrid architectures is the
+                     // layer filters, so pick the right one here
+                     llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
+@@ -2329,7 +2329,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                         };
+                     }
+ 
+-                    if (mtp_on_hybrid_qwen || mtp_on_hybrid_nemotron) {
++                    if (mtp_on_hybrid_qwen) {
+                         filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                     }
+ 
+@@ -2601,13 +2601,11 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+         case LLM_ARCH_DEEPSEEK2OCR:
+         case LLM_ARCH_DEEPSEEK32:
+         case LLM_ARCH_DEEPSEEK4:
+-        case LLM_ARCH_MUSE_GLIMMER:
+         case LLM_ARCH_PLM:
+         case LLM_ARCH_CHATGLM:
+         case LLM_ARCH_GRANITE:
+         case LLM_ARCH_GRANITE_MOE:
+         case LLM_ARCH_GRANITE_HYBRID:
+-        case LLM_ARCH_GRANITE_SWITCH:
+         case LLM_ARCH_CHAMELEON:
+         case LLM_ARCH_BAILINGMOE:
+         case LLM_ARCH_NEO_BERT:
+@@ -2707,7 +2705,6 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+         case LLM_ARCH_QWEN3VLMOE:
+         case LLM_ARCH_QWEN35:
+         case LLM_ARCH_QWEN35MOE:
+-        case LLM_ARCH_QWEN3TTS:
+             return LLAMA_ROPE_TYPE_IMROPE;
+ 
+         case LLM_ARCH_GLM4:
+@@ -2902,21 +2899,6 @@ void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
+         int64_t n_embd_, int64_t n_embd_q_, int64_t n_embd_k_, int64_t n_embd_v_,
+         int flags) {
+     const int64_t n_embd_qkv = n_embd_q_ + n_embd_k_ + n_embd_v_;
+-
+-    if (flags & TENSOR_SKIP) {
+-        const int skip = TENSOR_NOT_REQUIRED | TENSOR_SKIP;
+-
+-        create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", bid), {n_embd_, n_embd_qkv}, skip | TENSOR_SKIP_IF_VIRTUAL);
+-        create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias",   bid), {n_embd_qkv},          skip | TENSOR_SKIP_IF_VIRTUAL);
+-        create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", bid), {n_embd_, n_embd_q_},  skip);
+-        create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", bid), {n_embd_, n_embd_k_},  skip);
+-        create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", bid), {n_embd_, n_embd_v_},  skip);
+-        create_tensor(tn(LLM_TENSOR_ATTN_Q,   "bias",   bid), {n_embd_q_},           skip);
+-        create_tensor(tn(LLM_TENSOR_ATTN_K,   "bias",   bid), {n_embd_k_},           skip);
+-        create_tensor(tn(LLM_TENSOR_ATTN_V,   "bias",   bid), {n_embd_v_},           skip);
+-        return;
+-    }
+-
+     layer.wqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", bid), {n_embd_, n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+     if (layer.wqkv) {
+         layer.wqkv_b = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias", bid), {n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+@@ -2940,36 +2922,17 @@ uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
+ }
+ 
+ uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out) {
+-    if (model->vocab.n_tokens() == 0 || model->tok_embd == nullptr) {
++    if (!model || !model->tok_embd) {
+         return 0;
+     }
+-
+-    const ggml_tensor * tensor = model->tok_embd;
+-    const size_t nelements = ggml_nelements(tensor);
+-    GGML_ASSERT(nelements <= UINT32_MAX); // for the return type
+-
+-    if (out == nullptr) {
+-        return (uint32_t) nelements;
+-    }
+-
+-    if (tensor->type == GGML_TYPE_F32) {
+-        ggml_backend_tensor_get(tensor, out, 0, nelements * sizeof(float));
+-        return (uint32_t) nelements;
++    const uint32_t n_tokens = model->vocab.n_tokens();
++    if (!out) {
++        return n_tokens;
+     }
+-
+-    std::vector<uint8_t> buf(ggml_nbytes(tensor));
+-    ggml_backend_tensor_get(tensor, buf.data(), 0, buf.size());
+-
+-    const ggml_type_traits * traits = ggml_get_type_traits(tensor->type);
+-    if (tensor->type == GGML_TYPE_F16) {
+-        ggml_fp16_to_fp32_row((const ggml_fp16_t *) buf.data(), out, nelements);
+-    } else if (tensor->type == GGML_TYPE_BF16) {
+-        ggml_bf16_to_fp32_row((const ggml_bf16_t *) buf.data(), out, nelements);
+-    } else if (ggml_is_quantized(tensor->type) && traits->to_float != nullptr) {
+-        traits->to_float(buf.data(), out, nelements);
+-    } else {
+-        GGML_ABORT("unsupported tensor type for dequantization: %s", ggml_type_name(tensor->type));
++    const auto * traits = ggml_get_type_traits(model->tok_embd->type);
++    if (!traits || !traits->to_float) {
++        return 0;
+     }
+-
+-    return (uint32_t) nelements;
++    traits->to_float(model->tok_embd->data, out, ggml_nelements(model->tok_embd));
++    return n_tokens;
+ }
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index 38f2a57..2787e66 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -75,19 +75,22 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
+ 
+         if (!hparams.is_recr(il)) {
+             // Attention layers
+-            create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, flags);
+-            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", il), { n_embd_head_k * n_head, n_embd }, flags);
++            create_tensor_qkv(layer, il, n_embd, hparams.n_embd_head_k(il) * hparams.n_head(il) * 2, hparams.n_embd_k_gqa(il), hparams.n_embd_v_gqa(il), flags);
++            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", il), { (int64_t)(hparams.n_embd_head_k(il) * hparams.n_head(il)), n_embd }, flags);
+ 
+             // Q/K normalization for attention layers
+-            layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, flags);
+-            layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, flags);
++            layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { (int64_t)hparams.n_embd_head_k(il) }, flags);
++            layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { (int64_t)hparams.n_embd_head_k(il) }, flags);
+         } else {
+             // Linear attention (gated delta net) specific tensors
+             // Create tensors with calculated dimensions
+             layer.wqkv           = create_tensor(tn(LLM_TENSOR_ATTN_QKV,       "weight", il), { n_embd, key_dim * 2 + value_dim }, TENSOR_NOT_REQUIRED);
+             layer.wqkv_gate      = create_tensor(tn(LLM_TENSOR_ATTN_GATE,      "weight", il), { n_embd, value_dim }, TENSOR_NOT_REQUIRED);
+             layer.ssm_conv1d     = create_tensor(tn(LLM_TENSOR_SSM_CONV1D,     "weight", il), { hparams.ssm_d_conv, conv_dim }, flags);
+-            layer.ssm_dt         = create_tensor(tn(LLM_TENSOR_SSM_DT,         "bias",   il), { hparams.ssm_dt_rank }, flags);
++            layer.ssm_dt         = create_tensor(tn(LLM_TENSOR_SSM_DT,                        il), { hparams.ssm_dt_rank }, TENSOR_NOT_REQUIRED);
++            if (!layer.ssm_dt) {
++                layer.ssm_dt = create_tensor(tn(LLM_TENSOR_SSM_DT,         "bias",   il), { hparams.ssm_dt_rank }, flags);
++            }
+             layer.ssm_a          = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,             il), { hparams.ssm_dt_rank }, flags);
+             layer.ssm_beta       = create_tensor(tn(LLM_TENSOR_SSM_BETA,       "weight", il), { n_embd, n_v_heads }, flags);
+             layer.ssm_alpha      = create_tensor(tn(LLM_TENSOR_SSM_ALPHA,      "weight", il), { n_embd, n_v_heads }, flags);
+@@ -117,10 +120,10 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
+         layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", il), { n_embd }, mtp_flags);
+         layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", il), { n_embd }, mtp_flags);
+ 
+-        create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, mtp_flags);
+-        layer.wo          = create_tensor(tn(LLM_TENSOR_ATTN_OUT,    "weight", il), { n_embd_head_k * n_head, n_embd }, mtp_flags);
+-        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, mtp_flags);
+-        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, mtp_flags);
++        create_tensor_qkv(layer, il, n_embd, hparams.n_embd_head_k(il) * hparams.n_head(il) * 2, hparams.n_embd_k_gqa(il), hparams.n_embd_v_gqa(il), mtp_flags);
++        layer.wo          = create_tensor(tn(LLM_TENSOR_ATTN_OUT,    "weight", il), { (int64_t)(hparams.n_embd_head_k(il) * hparams.n_head(il)), n_embd }, mtp_flags);
++        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { (int64_t)hparams.n_embd_head_k(il) }, mtp_flags);
++        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { (int64_t)hparams.n_embd_head_k(il) }, mtp_flags);
+ 
+         // Routed experts
+         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, mtp_flags);
+@@ -285,8 +288,10 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
+         ggml_tensor *             inp_pos,
+         int *                     sections,
+         int                       il) {
+-    const int64_t n_embd_head = hparams.n_embd_head_v();
+-    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
++    const int64_t n_embd_head = hparams.n_embd_head_v(il);
++    const int64_t n_head      = hparams.n_head(il);
++    const int64_t n_head_kv   = hparams.n_head_kv(il);
++    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k(il));
+ 
+     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
+ 
+@@ -556,10 +561,11 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
+     GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN35MOE MTP requires n_layer_nextn > 0");
+     GGML_ASSERT(hparams.n_layer_nextn == 1 && "QWEN35MOE MTP currently only supports a single MTP block");
+ 
+-    const int64_t n_embd_head = hparams.n_embd_head_v();
+-    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+-
+     const int il = hparams.n_layer();
++    const int64_t n_embd_head = hparams.n_embd_head_v(il);
++    const int64_t n_head      = hparams.n_head(il);
++    const int64_t n_head_kv   = hparams.n_head_kv(il);
++    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k(il));
+     const auto & layer = model.layers[il];
+ 
+     GGML_ASSERT(layer.nextn.eh_proj    && "MTP block missing nextn.eh_proj");
