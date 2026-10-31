@@ -1,0 +1,39 @@
+[Unit]
+Description=Nemotron 3.5 Lightning 30B MoE (256k Context, Dual-CCD 64MB L3 NTA Slicing, 16 Physical Zen 5 Cores, Port 8789)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+CPUAffinity=0-15
+Environment="LLAMA_MOE_TOP_K=4" "LLAMA_KV_L3_WINDOW=2048"
+ExecStart=/usr/local/bin/llama-server \
+  --model /opt/models/nemotron/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0.gguf \
+  --port 8789 \
+  --host 127.0.0.1 \
+  --no-webui \
+  --offline \
+  -c 262144 \
+  -np 1 \
+  -b 2048 \
+  -ub 2048 \
+  -t 16 \
+  --cache-type-k q4_0 \
+  --cache-type-v q4_0 \
+  --flash-attn auto \
+  --load-mode none \
+  --cache-reuse 256 \
+  --slot-save-path /dev/shm \
+  --ctx-checkpoints 64 \
+  --checkpoint-min-step 128 \
+  --spec-type ngram-simple \
+  --spec-ngram-simple-size-n 4 \
+  --spec-ngram-simple-size-m 5 \
+  --spec-ngram-simple-min-hits 1 \
+  --reasoning-format deepseek \
+  --reasoning-budget 0
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
