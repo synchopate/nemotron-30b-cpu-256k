@@ -140,13 +140,26 @@ class HARPCacheEngine:
         return float(unique_tokens) / float(len(tokens))
 
     def _prune_radix_hash(self, node: Dict[int, Dict[str, Any]], target_hash: int) -> None:
-        """Recursively removes an evicted page_hash from the Radix Tree."""
-        if target_hash in node:
-            del node[target_hash]
-        for child_entry in list(node.values()):
+        """
+        Recursively removes an evicted page_hash from the Radix Tree without
+        destroying active descendant subtrees:
+        - Traverses children first (bottom-up cleanup).
+        - If `node[target_hash]["children"]` is non-empty, sets `node[target_hash]["page"] = None`
+          so descendant suffix pages remain attached to the Radix Tree.
+        - Only deletes `node[target_hash]` when `"children"` is empty.
+        """
+        for child_hash, child_entry in list(node.items()):
             children = child_entry.get("children")
             if children:
                 self._prune_radix_hash(children, target_hash)
+            if child_hash != target_hash and child_entry.get("page") is None and not children:
+                del node[child_hash]
+
+        if target_hash in node:
+            if node[target_hash].get("children"):
+                node[target_hash]["page"] = None
+            else:
+                del node[target_hash]
 
     def _acquire_physical_page_id(self) -> int:
         """
@@ -193,8 +206,8 @@ class HARPCacheEngine:
 
                 page: Optional[HARPPage] = None
                 if radix_cursor is not None and h in radix_cursor:
-                    cand = radix_cursor[h]["page"]
-                    if cand.tokens == chunk:
+                    cand = radix_cursor[h].get("page")
+                    if cand is not None and cand.tokens == chunk:
                         page = cand
                         radix_cursor = radix_cursor[h]["children"]
                     else:
@@ -236,11 +249,18 @@ class HARPCacheEngine:
                 h = hash_token_block(chunk)
 
                 existing = self.hash_to_page.get(h)
-                if existing is not None:
+                if existing is not None and existing.tokens == chunk:
                     existing.last_accessed = now
                     existing.access_count += 1
                     page = existing
                 else:
+                    if existing is not None:
+                        # 64-bit hash collision with distinct token block: evict & recycle colliding entry cleanly
+                        colliding_page = self.hash_to_page.pop(h)
+                        self._prune_radix_hash(self.radix_root, h)
+                        self.free_page_ids.append(colliding_page.page_id)
+                        self.evictions += 1
+
                     page_id = self._acquire_physical_page_id()
                     shm_offset = page_id * self.PAGE_KV_BYTES
                     entropy = self.calculate_entropy(chunk)

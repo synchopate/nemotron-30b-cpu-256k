@@ -42,12 +42,13 @@ def _ensure_slot0_restored(target_upstream: str) -> None:
     if not os.path.exists(shm_snap):
         for disk_cand in (
             os.path.join(_REPO_ROOT, "workspace", "cache", SLOT0_SNAPSHOT_NAME),
-            f"/opt/vex/cache/{SLOT0_SNAPSHOT_NAME}",
             f"/opt/models/nemotron/cache/{SLOT0_SNAPSHOT_NAME}",
         ):
             if os.path.exists(disk_cand):
                 try:
                     shutil.copyfile(disk_cand, shm_snap)
+                    if os.path.exists(disk_cand + ".ckpt") and not os.path.exists(shm_snap + ".ckpt"):
+                        shutil.copyfile(disk_cand + ".ckpt", shm_snap + ".ckpt")
                     print(f"[Gateway] [Slot0-Guard] Copied {disk_cand} -> {shm_snap}", flush=True)
                 except Exception:
                     pass
@@ -671,11 +672,26 @@ def parse_slash_command(target_text: str):
 
     return ("NORMAL", "", text_clean)
 
+_READ_LINE_NUM_RE = re.compile(r"(?m)^[ \t]*\d+[\t→]")
+
 def normalize_anthropic_messages(messages):
     """
     Preserves native Anthropic tool_use and tool_result blocks for llama-server /v1/messages
-    (server_chat_convert_anthropic_to_oai in server-chat.cpp natively converts them to OpenAI format).
+    while stripping Claude Code Read tool line-number prefixes (`1\\t`, `1→`) so source files
+    enter the KV cache and RouteCrack 16K Hot Zone as verbatim code tokens.
     """
+    if not isinstance(messages, list):
+        return
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "tool_result":
+                    tr_c = part.get("content")
+                    if isinstance(tr_c, str) and ("1\t" in tr_c[:32] or "1→" in tr_c[:32]):
+                        part["content"] = _READ_LINE_NUM_RE.sub("", tr_c)
     return
 
 def sanitize_non_streaming_response(resp_dict):

@@ -203,6 +203,12 @@ if [[ -f "$MODEL_PATH" ]]; then
     echo "[*] Building 8-level FNV-64 Hash Cascade, 300 Hot Rules & Macro Codebook..."
     "${WORKSPACE_DIR}/bin/rc_build_tables" "$CORPUS_BIN" "${WORKSPACE_DIR}/routecrack"
     echo "[+] RouteCrack tables ready in ${WORKSPACE_DIR}/routecrack/"
+    if [[ -d "/opt/models/nemotron" && -w "/opt/models/nemotron" ]]; then
+        ln -sfn "${WORKSPACE_DIR}/routecrack" "/opt/models/nemotron/routecrack" 2>/dev/null || true
+    elif sudo -n true 2>/dev/null; then
+        sudo mkdir -p /opt/models/nemotron 2>/dev/null || true
+        sudo ln -sfn "${WORKSPACE_DIR}/routecrack" "/opt/models/nemotron/routecrack" 2>/dev/null || true
+    fi
 else
     echo "[i] GGUF model not downloaded yet — RouteCrack will use its zero-setup online Trie/PPM/Two-Zone engine until tables are generated."
 fi

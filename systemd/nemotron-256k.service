@@ -17,17 +17,25 @@ CPUAffinity=0-15
 # - LLAMA_MOE_TOP_K=4           : Norm-preserving active-expert pruning override (reduces Nemotron 3.5
 #                                 routed experts from 6 -> 4, and Qwen3-30B-A3B from 8 -> 4; surviving
 #                                 4 gates are automatically renormalized via expert_weights_norm=True).
-# - LLAMA_ATTN_WINDOW=4096      : Sliding Window Attention horizon on GQA layers (+ LLAMA_ATTN_SINKS=16).
-#                                 Set LLAMA_ATTN_WINDOW=0 for Full 256K global GQA attention across all tokens.
+# - LLAMA_ATTN_WINDOW=0         : Default Mode A (Full 256K Exact Global GQA across all 262,144 tokens,
+#                                 relying on LLAMA_KV_L3_WINDOW=2048 _MM_HINT_NTA streaming so cold KV
+#                                 sweeps never evict L3). Set LLAMA_ATTN_WINDOW=4096 (Mode B below) for
+#                                 Ultra-Low-Latency SWA-4096 + 16 Attention Sinks + 46-layer Mamba-2 SSM.
 # - LLAMA_KV_L3_WINDOW=2048     : Boundary in ggml-cpu/ops.cpp between _MM_HINT_T0 (L3-resident hot KV)
 #                                 and _MM_HINT_NTA (non-temporal L3-bypass streaming for older KV blocks).
-# - LLAMA_SWA_STRIDE=1          : Apply SWA to all 6 GQA layers on Hybrid SSM models (46 Mamba-2 layers
-#                                 carry global state). Pure GQA models auto-lock to LLAMA_SWA_STRIDE=4 (3:1).
+# - LLAMA_SWA_STRIDE=1          : When LLAMA_ATTN_WINDOW > 0, apply SWA to all 6 GQA layers on Hybrid SSM
+#                                 models (46 Mamba-2 layers carry global state). Pure GQA models auto-lock
+#                                 to LLAMA_SWA_STRIDE=4 (3:1 Interleaved SWA).
 # - LLAMA_KV_DISABLE_CHUNKING=1 : Static per-head GQA partitioning across CCDs (eliminates cross-CCD snoops).
 # - RC_TABLES_DIR               : Directory containing RouteCrack offline cascade tables (hc_top4_k*.bin,
 #                                 hot_rules.bin, macro_codebook.bin, corpus_nemotron_warm.bin).
 # - OMP_PROC_BIND=close         : Welds each OpenMP worker thread 1:1 to its assigned physical core.
-Environment="LLAMA_MOE_TOP_K=4" "LLAMA_KV_L3_WINDOW=2048" "LLAMA_ATTN_WINDOW=4096" "LLAMA_ATTN_SINKS=16" "LLAMA_SWA_STRIDE=1" "LLAMA_KV_DISABLE_CHUNKING=1" "LLAMA_RC_ENABLED=1" "LLAMA_RC_CERT_D0=84" "LLAMA_RC_CERT_D1=92" "LLAMA_RC_CERT_D2=96" "RC_TABLES_DIR=/opt/vex/routecrack" "OMP_PROC_BIND=close" "OMP_PLACES=cores"
+
+# Mode A (Active Default): Full 256K Exact Global GQA Attention (NTA Streaming + 2048-token L3 Hot Window)
+Environment="LLAMA_MOE_TOP_K=4" "LLAMA_KV_L3_WINDOW=2048" "LLAMA_ATTN_WINDOW=0" "LLAMA_ATTN_SINKS=16" "LLAMA_SWA_STRIDE=1" "LLAMA_KV_DISABLE_CHUNKING=1" "LLAMA_RC_ENABLED=1" "LLAMA_RC_CERT_D0=84" "LLAMA_RC_CERT_D1=92" "LLAMA_RC_CERT_D2=96" "RC_TABLES_DIR=/opt/models/nemotron/routecrack" "OMP_PROC_BIND=close" "OMP_PLACES=cores"
+
+# Mode B (Optional): Ultra-Low-Latency SWA-4096 + 16 Sinks (100% L3-Resident 6.3 MB GQA + 46 Mamba-2 Global SSM Layers)
+# Environment="LLAMA_MOE_TOP_K=4" "LLAMA_KV_L3_WINDOW=2048" "LLAMA_ATTN_WINDOW=4096" "LLAMA_ATTN_SINKS=16" "LLAMA_SWA_STRIDE=1" "LLAMA_KV_DISABLE_CHUNKING=1" "LLAMA_RC_ENABLED=1" "LLAMA_RC_CERT_D0=84" "LLAMA_RC_CERT_D1=92" "LLAMA_RC_CERT_D2=96" "RC_TABLES_DIR=/opt/models/nemotron/routecrack" "OMP_PROC_BIND=close" "OMP_PLACES=cores"
 
 # Note on --spec-type ngram-simple:
 # common/ngram-map.cpp overrides common_ngram_simple_draft() to hijack the ngram-simple hook and

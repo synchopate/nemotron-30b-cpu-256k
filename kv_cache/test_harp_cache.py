@@ -87,12 +87,50 @@ def test_harp_agentic_prefill_simulation():
         os.remove("/dev/shm/harp_kv_cache_test.bin")
     print("[+] TEST 2 PASSED: 100% Prefix Hit & Zero-Prefill Verified.")
 
+def test_radix_intermediate_eviction_and_collision():
+    print("\n--- TEST 3: Intermediate Radix Eviction & Hash Collision Safety ---")
+    engine = HARPCacheEngine(shm_path="/dev/shm/harp_kv_cache_test_lru.bin", max_pages=3)
+    p0 = [100 + i for i in range(32)]
+    p1 = [200 + i for i in range(32)]
+    p2 = [300 + i for i in range(32)]
+    p3 = [400 + i for i in range(32)]
+
+    # Store [p0, p1, p2] -> fills all 3 physical pages
+    assert engine.store_prefix(p0 + p1 + p2) == 3
+    h0, h1, h2 = hash_token_block(p0), hash_token_block(p1), hash_token_block(p2)
+
+    # Touch p0 and p2 so p1 (intermediate node) becomes Least Recently Used
+    time.sleep(0.002)
+    engine.hash_to_page[h0].last_accessed = time.time()
+    engine.hash_to_page[h2].last_accessed = time.time()
+
+    # Storing p3 evicts intermediate page p1; p2 must remain attached in radix_root[h0]["children"][h1]["children"]
+    assert engine.store_prefix(p3) == 1
+    assert engine.radix_root[h0]["children"][h1]["page"] is None, "Evicted intermediate node should set page=None"
+    assert h2 in engine.radix_root[h0]["children"][h1]["children"], "Descendant subtree must not be orphaned"
+
+    # Touch p0 and p2 after p3 so p3 becomes LRU when p1 is re-inserted
+    time.sleep(0.002)
+    engine.hash_to_page[h0].last_accessed = time.time()
+    engine.hash_to_page[h2].last_accessed = time.time()
+
+    # Re-storing [p0, p1] evicts p3 and reconnects p1 without losing p2 child in Radix Tree
+    engine.store_prefix(p0 + p1)
+    cached, _, _ = engine.resolve_prefix(p0 + p1 + p2)
+    assert cached == 96, f"Expected full 96-token Radix path after reconnecting intermediate node, got {cached}"
+
+    engine.close()
+    if os.path.exists("/dev/shm/harp_kv_cache_test_lru.bin"):
+        os.remove("/dev/shm/harp_kv_cache_test_lru.bin")
+    print("[+] TEST 3 PASSED: Intermediate Radix Eviction & Subtree Preservation Verified.")
+
 if __name__ == "__main__":
     print("=" * 80)
     print("🚀 ROUTECRACK-KV PHASE 2: HARP-CACHE ENGINE VALIDATION SUITE")
     print("=" * 80)
     test_fnv1a_throughput()
     test_harp_agentic_prefill_simulation()
+    test_radix_intermediate_eviction_and_collision()
     print("\n" + "=" * 80)
     print("🎉 ALL PHASE 1 & PHASE 2 TESTS COMPLETED SUCCESSFULLY!")
     print("=" * 80)
