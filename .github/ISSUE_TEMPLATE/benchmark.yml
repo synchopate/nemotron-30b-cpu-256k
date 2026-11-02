@@ -1,0 +1,42 @@
+name: "🏆 Submit CPU Benchmark Scorecard (./modchip bench)"
+description: "Share your './modchip bench' scorecard to be added to the Verified Community CPU Leaderboard in README.md!"
+title: "[Benchmark] <Your CPU Model> — <Decode tok/s> (<RAM Size & Speed>)"
+labels: ["benchmark"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ### 🚀 Thank you for benchmarking `llama-modchip v2.1`!
+        Run `./modchip bench` (and optionally `python3 scripts/check_cpu_readiness.py`) and paste the output below to be added to the official **Community CPU Leaderboard** in `README.md`.
+  - type: input
+    id: cpu_model
+    attributes:
+      label: "CPU / SoC Model"
+      description: "e.g., AMD Ryzen 9 9955HX, AMD Threadripper PRO 7985WX, Apple M4 Pro, Intel Xeon 8480+"
+      placeholder: "AMD Ryzen 9 9950X (16C/32T)"
+    validations:
+      required: true
+  - type: input
+    id: memory_os
+    attributes:
+      label: "RAM Configuration & OS"
+      description: "e.g., 64 GB DDR5-6000 Dual-Channel, Ubuntu 24.04 (Kernel 6.8)"
+      placeholder: "64 GB DDR5-6000, Linux 6.11"
+    validations:
+      required: true
+  - type: textarea
+    id: scorecard
+    attributes:
+      label: "Paste Your './modchip bench' Scorecard Output"
+      description: "Copy-paste the output from running `./modchip bench`"
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: readiness
+    attributes:
+      label: "Optional: Output of 'python3 scripts/check_cpu_readiness.py'"
+      description: "Helps verify L3 cache size, CCD count, and sustained DRAM bandwidth"
+      render: text
+    validations:
+      required: false

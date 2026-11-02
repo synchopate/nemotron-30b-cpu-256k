@@ -1,0 +1,126 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 540" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0e14"/>
+      <stop offset="100%" stop-color="#111722"/>
+    </linearGradient>
+    <linearGradient id="cardGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#161d2b"/>
+      <stop offset="100%" stop-color="#121722"/>
+    </linearGradient>
+    <style>
+      .mono { font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      .sans { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; }
+      .pulse { animation: pulseAnim 2.2s infinite ease-in-out; }
+      .reveal1 { opacity: 0; animation: fadeIn 0.4s 0.4s forwards; }
+      .reveal2 { opacity: 0; animation: fadeIn 0.4s 1.2s forwards; }
+      .reveal3 { opacity: 0; animation: fadeIn 0.4s 2.2s forwards; }
+      .reveal4 { opacity: 0; animation: fadeIn 0.5s 3.2s forwards; }
+      @keyframes pulseAnim {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.45; }
+      }
+      @keyframes fadeIn {
+        from { opacity: 0; transform: translateY(3px); }
+        to { opacity: 1; transform: translateY(0); }
+      }
+    </style>
+  </defs>
+
+  <!-- Outer Window -->
+  <rect width="980" height="540" rx="12" fill="url(#bgGrad)" stroke="#263248" stroke-width="1.5"/>
+
+  <!-- Window Title Bar -->
+  <rect width="980" height="38" rx="12" fill="#151b26"/>
+  <rect y="26" width="980" height="12" fill="#151b26"/>
+  <line x1="0" y1="38" x2="980" y2="38" stroke="#263248" stroke-width="1"/>
+  <circle cx="20" cy="19" r="6" fill="#ff5f56"/>
+  <circle cx="40" cy="19" r="6" fill="#ffbd2e"/>
+  <circle cx="60" cy="19" r="6" fill="#27c93f"/>
+  <text x="84" y="24" fill="#e6edf3" font-size="13" font-weight="700" class="mono">♟️ llama-modchip v2.1 — 256K CPU Co-Design + Stockfish-PVS (M=7) Telemetry HUD</text>
+  <rect x="838" y="9" width="124" height="20" rx="10" fill="#122d1f" stroke="#2ea043" stroke-width="1"/>
+  <circle cx="850" cy="19" r="4" fill="#3fb950" class="pulse"/>
+  <text x="860" y="23" fill="#3fb950" font-size="11" font-weight="700" class="mono">0 GPU • ONLINE</text>
+
+  <!-- Top HUD Cards (5 Columns) -->
+  <!-- Card 1: Decode Speed -->
+  <g transform="translate(16, 50)">
+    <rect width="182" height="68" rx="8" fill="url(#cardGrad)" stroke="#263248"/>
+    <text x="12" y="19" fill="#8b949e" font-size="10" font-weight="600" class="mono">⚡ DECODE SPEED (CPU)</text>
+    <text x="12" y="42" fill="#3fb950" font-size="20" font-weight="700" class="mono">48.39 tok/s</text>
+    <text x="12" y="58" fill="#58a6ff" font-size="11" class="mono">Peak burst: 60.40 tok/s</text>
+  </g>
+
+  <!-- Card 2: Stockfish-PVS M=7 -->
+  <g transform="translate(207, 50)">
+    <rect width="194" height="68" rx="8" fill="url(#cardGrad)" stroke="#263248"/>
+    <text x="12" y="19" fill="#8b949e" font-size="10" font-weight="600" class="mono">♟️ STOCKFISH-PVS (M=7)</text>
+    <text x="12" y="42" fill="#bc8cff" font-size="20" font-weight="700" class="mono">96.4% Accept</text>
+    <text x="12" y="58" fill="#8b949e" font-size="11" class="mono">Mean len: 6.90 tok/step</text>
+  </g>
+
+  <!-- Card 3: TTFT & Slot 0 Restore -->
+  <g transform="translate(410, 50)">
+    <rect width="182" height="68" rx="8" fill="url(#cardGrad)" stroke="#263248"/>
+    <text x="12" y="19" fill="#8b949e" font-size="10" font-weight="600" class="mono">⏱️ SLOT 0 / PREFILL</text>
+    <text x="12" y="42" fill="#58a6ff" font-size="20" font-weight="700" class="mono">18.9 ms</text>
+    <text x="12" y="58" fill="#8b949e" font-size="11" class="mono">Prefill: 241–306.8 tok/s</text>
+  </g>
+
+  <!-- Card 4: 256K KV & L3 Cache -->
+  <g transform="translate(601, 50)">
+    <rect width="182" height="68" rx="8" fill="url(#cardGrad)" stroke="#263248"/>
+    <text x="12" y="19" fill="#8b949e" font-size="10" font-weight="600" class="mono">💾 256K KV + MAMBA-2</text>
+    <text x="12" y="42" fill="#d29922" font-size="20" font-weight="700" class="mono">432 MB @ 256K</text>
+    <text x="12" y="58" fill="#8b949e" font-size="11" class="mono">-94% RAM vs 7.1GB GQA</text>
+  </g>
+
+  <!-- Card 5: Modchip Safety Locks -->
+  <g transform="translate(792, 50)">
+    <rect width="172" height="68" rx="8" fill="url(#cardGrad)" stroke="#263248"/>
+    <text x="12" y="19" fill="#8b949e" font-size="10" font-weight="600" class="mono">🔧 MODCHIP LOCKS</text>
+    <text x="12" y="42" fill="#3fb950" font-size="18" font-weight="700" class="mono">MoE Top-K: 6→4</text>
+    <text x="12" y="58" fill="#8b949e" font-size="11" class="mono">2MB THP: 19.04 GiB</text>
+  </g>
+
+  <!-- Terminal Body -->
+  <rect x="16" y="130" width="948" height="394" rx="8" fill="#090c12" stroke="#222c40"/>
+
+  <!-- Prompt Line 1 -->
+  <text x="32" y="158" fill="#3fb950" font-size="13" font-weight="700" class="mono">paolo@zen5-9955hx:~/nemotron-30b-cpu-256k$</text>
+  <text x="382" y="158" fill="#e6edf3" font-size="13" font-weight="700" class="mono">./modchip bench</text>
+
+  <!-- Stage 1 Output -->
+  <g class="reveal1">
+    <text x="32" y="184" fill="#58a6ff" font-size="12.5" font-weight="700" class="mono">[1/2] Stage 1: Warm Agentic &lt;tool_call&gt; + C++20 Lock-Free Ring Buffer (22.3K Active Context)...</text>
+    <text x="32" y="204" fill="#8b949e" font-size="12" class="mono">  ├─ Slot 0 Restored from /dev/shm/claude_40tools_slot0.bin (22,237 tokens) in 18.9 ms</text>
+    <text x="32" y="222" fill="#3fb950" font-size="12.5" font-weight="700" class="mono">  └─ ⚡ 34.52 tok/s (2.45s total turn) │ TTFT: 412 ms │ ♟️ Stockfish-PVS: 35/42 (83.3% accepted, len 4.18)</text>
+  </g>
+
+  <!-- Stage 2 Output -->
+  <g class="reveal2">
+    <text x="32" y="254" fill="#bc8cff" font-size="12.5" font-weight="700" class="mono">[2/2] Stage 2: In-Context Code Refactoring — Stockfish-PVS (M=7) Singular Horizon Burst (25.4K Context)...</text>
+    <text x="32" y="274" fill="#8b949e" font-size="12" class="mono">  ├─ Active Drafter: 8-Level FNV-64 Cascade + Online Session Trie + 11,382 Macro Codebook + 1.64MB Zobrist TT</text>
+    <text x="32" y="292" fill="#e6edf3" font-size="12" class="mono">  ├─ Streaming: class HARPCacheEngine: def resolve_prefix(self, token_ids: List[int]) -&gt; Tuple[int, List[int]]: ...</text>
+    <text x="32" y="310" fill="#3fb950" font-size="12.5" font-weight="700" class="mono">  └─ ⚡ 48.39 tok/s avg (Peak: 60.40 tok/s, 500 tok in 10.33s) │ ♟️ Stockfish-PVS: 401/416 (96.39% acc, mean len 6.90)</text>
+  </g>
+
+  <!-- Stage 3 / Scorecard Box -->
+  <g class="reveal3">
+    <rect x="32" y="330" width="916" height="148" rx="6" fill="#0f1722" stroke="#2ea043" stroke-width="1.2"/>
+    <text x="48" y="353" fill="#3fb950" font-size="13" font-weight="700" class="mono">🚀 LLAMA-MODCHIP v2.1 BENCHMARK SCORECARD — AMD Ryzen 9 9955HX (16C/32T Zen 5 • 0 GPUs • 64GB DDR5)</text>
+    <line x1="48" y1="363" x2="932" y2="363" stroke="#233146" stroke-width="1"/>
+    <text x="48" y="384" fill="#e6edf3" font-size="12.5" class="mono">• Model &amp; Context      : NVIDIA-Nemotron-3.5-30B-A3B-Q4_0 (23 Mamba-2 + 23 MoE + 6 GQA) @ 262,144 Tokens (256K)</text>
+    <text x="48" y="404" fill="#e6edf3" font-size="12.5" class="mono">• Cold Prompt Prefill  : 241.0 tok/s (Peak: 306.8 tok/s @ -b 2048) │ Warm 22.2K Slot 0 Restore: 18.9 ms</text>
+    <text x="48" y="424" fill="#e6edf3" font-size="12.5" class="mono">• Decode (Mixed/Audit) : 28.61 tok/s avg / 48.47 tok/s peak (86.1% acc) │ Prose Audit: 85.0% draft acceptance</text>
+    <text x="48" y="444" fill="#3fb950" font-size="12.5" font-weight="700" class="mono">• Decode (M=7 Burst)   : 48.39 tok/s avg / 60.40 tok/s peak (96.4% Stockfish-PVS acc, 6.90 tokens/step!)</text>
+    <text x="48" y="466" fill="#58a6ff" font-size="11.5" class="mono">👉 Run './modchip chat' or open http://127.0.0.1:8787 for Live Web Chat &amp; Telemetry HUD</text>
+  </g>
+
+  <!-- Bottom Prompt -->
+  <g class="reveal4">
+    <text x="32" y="504" fill="#3fb950" font-size="13" font-weight="700" class="mono">paolo@zen5-9955hx:~/nemotron-30b-cpu-256k$</text>
+    <text x="382" y="504" fill="#e6edf3" font-size="13" font-weight="700" class="mono">./modchip chat</text>
+    <rect x="498" y="491" width="9" height="16" fill="#3fb950" class="pulse"/>
+  </g>
+</svg>

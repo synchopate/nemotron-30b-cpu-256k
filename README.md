@@ -1,9 +1,13 @@
-# `llama-modchip` (Beta) & 256K CPU Co-Design: Running 30B Hybrid SSM-MoE & GQA Models on CPU at 20–50+ tok/s
+# `llama-modchip` v2.1 & 256K CPU Co-Design: Running 30B Hybrid SSM-MoE & GQA Models on Pure CPU at 20–60+ tok/s (`0 GPUs`)
 
-**`llama-modchip` ("Priiloader for CPU GGUF Inference" — `v0.9 Public Beta`): Model-Agnostic GGUF Binary Inspector, Safety-Locked Microarchitectural Auto-Patcher, and Live `/dev/shm` Runtime Controller for `llama.cpp` — Validated on Dual-CCD AMD Zen 5 (`0 GPUs`) with `Nemotron-3.5-30B-A3B` (`256K`), `Qwen3-30B-A3B` (`+38.5%` Decode), `Nemotron-H-8B`, and `Llama-40L`**
+**`llama-modchip` ("Priiloader for CPU GGUF Inference") + `RouteCrack` & `Stockfish-PVS v2 (M=7)`: How a `1.64 MB` Chess-Engine Search Inside L3 Cache + `2MB` HugePages + `_MM_HINT_NTA` Unlocks `48.4–60.4 tok/s` on `Nemotron-3.5-30B-A3B` (`256K` Context) and `+38.5%` Decode on `Qwen3-30B-A3B` with Zero GPUs**
+
+<p align="center">
+  <img src="assets/modchip_demo.svg" alt="llama-modchip v2.1 Live CPU Telemetry & Stockfish-PVS (M=7) Demo" width="100%" />
+</p>
 
 > 📄 **Documentation Navigation:**
-> - **Overview, `llama-modchip` Beta Matrix & Quickstart (`README.md`)** — *You are here*
+> - **Overview, 60-Second Quickstart, `Stockfish-PVS` vs Neural Draft & Leaderboard (`README.md`)** — *You are here*
 > - **[Full Technical Paper & Mathematical Proofs (`ARCHITECTURE.md`)](ARCHITECTURE.md)** — *Deep dive into Mamba-2/GQA physics, `_MM_HINT_NTA`, `2MB` HugePages STLB math, `LLAMA_MOE_TOP_K=4` norm preservation, `RouteCrack + Stockfish-PVS v2` break-even theorem, negative ablations, and Linux Kernel auditing benchmarks*
 > - **[`RouteCrack + Stockfish-PVS v2` Catalog of 96+ Techniques (`speculative/ROUTECRACK_TECHNIQUES.md`)](speculative/ROUTECRACK_TECHNIQUES.md)** — *How Chess-Engine PVS + Zobrist Transposition Tables unlocked 4 dormant RouteCrack techniques (`M=7` Singular Horizon Extension, `60.40 tok/s` peak, `mean len = 6.90`)*
 > - **[Engineering FAQ & Xeon/EPYC Server Scaling (`FAQ.md`)](FAQ.md)** — *SWA vs Full 256K NIAH retrieval, Mamba-2 zero-rollback gating, Stockfish-PVS L3 cache physics, and Intel Xeon Scalable / AMD EPYC multi-agent scaling*
@@ -49,6 +53,35 @@ git clone https://github.com/synchopate/nemotron-30b-cpu-256k.git && cd nemotron
 ./modchip web                    # 🌐 Open Live Web Chat & Telemetry HUD at http://127.0.0.1:8787
 ./modchip claude                 # 🤖 Launch Claude Code CLI wired to the local 256K CPU engine
 ```
+
+---
+
+### ♟️ Why a `1.64 MB` Stockfish Chess Engine in L3 Cache Beats a `1B` Neural Draft Model on CPU
+
+On GPUs (`3,350 GB/s` HBM3), running a 1B neural draft model takes `< 1 ms`. **On a CPU (`71.7 GB/s` Dual-Channel DDR5), small neural draft models fail catastrophically** because streaming `600 MB` of 1B draft weights for 5 steps (`3.0 GB` from DDR5) takes **`40 ms` — slower than running the 30B Sparse MoE target model itself (`1.8 GB` active $\rightarrow 25\text{ ms}$)**, while completely flushing the `64 MB` L3 cache!
+
+Instead, we paired **[`RouteCrack`](speculative/ROUTECRACK_TECHNIQUES.md)** (an 8-level FNV-64 Hash Cascade + Online Session Trie + 11,382-entry Macro Codebook acting as an $O(1)$ candidate move generator) with **[`StockfishDrafter` (`rc_stockfish.h`)](speculative/cpp/rc_stockfish.h)** — a **Chess-Engine Principal Variation Search (PVS) + 4-Way Bucketed Zobrist Transposition Table** that lives in **`1.64 MB` (`2.5%` of L3 cache)**:
+
+| Speculative Drafter Architecture (on CPU + Sparse MoE) | Memory Footprint | DDR5 Read per 5-Step Draft | Draft Latency | L3 Cache Eviction | Live 25K-Ctx Refactoring Speed (`Nemotron-30B-A3B`) |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **1B Neural Draft Model (`Q4_0`)** | `~600 MB` | `3,000 MB` (`5 × 600 MB`) | `~40.0 ms` | 🔴 **100% Flushed** | **~11.5 tok/s** *(Net Slowdown vs No-Spec!)* |
+| **Vanilla `llama.cpp` `ngram-simple`** | `< 1 MB` | `0 MB` | `0.005 ms` | 🟢 `0%` | **~16.2 tok/s** *(41% wasted MoE reads + Mamba-2 rollbacks)* |
+| **`RouteCrack` Static Cascade (`M=5`)** | `~14 MB` | `0 MB` | `0.002 ms` | 🟢 `< 20%` | **`40.91 tok/s` avg / `45.43 tok/s` peak** *(`mean len = 5.47`)* |
+| **♟️ `RouteCrack + Stockfish-PVS v2 (M=7)`** | **`1.64 MB` Zobrist TT** *(+Cascade)* | **`0 MB` (100% L2/L3)** | **`< 0.005 ms`** | 🟢 **`2.5%` of 64MB L3** | **`48.39 tok/s` avg / `60.40 tok/s` peak** *(**`96.4%` acc, `mean len = 6.90`!**)* |
+
+---
+
+### 🏆 Verified Community CPU & Unified-Memory Leaderboard
+
+Run **`./modchip bench`** on your machine and **[➕ Click Here to Submit Your CPU Scorecard (1-Click GitHub Issue)](https://github.com/synchopate/nemotron-30b-cpu-256k/issues/new?template=benchmark.yml)** to be added to the table below!
+
+| Hardware Platform (`CPU / SoC`) | Cores / CCDs / Cache | Memory Subsystem | Prompt Prefill (`tok/s`) | Decode — Prose / Agent (`tok/s`) | Decode — Refactor / `Stockfish M=7` (`tok/s`) | Contributor & Config |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **AMD Ryzen 9 9955HX (`Zen 5`)** | `16C/32T` (`2 CCDs`, `64 MB` L3, `AVX-512 VNNI`) | `64 GB` DDR5 Dual-Ch (`0 GPUs`) | **`241.0`** *(Peak **`306.8`**)* | **`20.7 – 34.52 tok/s`** *(`85.0%` acc)* | **`48.39 avg / 60.40 peak`** *(`mean len 6.90`)* | `@synchopate` ([Linux 256K](systemd/nemotron-256k.service)) |
+| **Apple M4 Pro (`14-Core SoC`)** | `14C CPU + 20C Metal` | `24 GB` Unified (`273 GB/s`, `0 Swap`) | **`256.0 – 549.0`** | **`47.0 – 48.0 tok/s`** *(at 128K ctx)* | **`49.0+ tok/s`** | `@jarorosFork` ([`apple-silicon/`](apple-silicon/README.md)) |
+| **AMD Ryzen 7 8745HS (`GEEKOM A8`)** | `8C/16T` (`1 CCD` Zen 4, `16 MB` L3, `AVX-512`) | `64 GB` DDR5-5600 (`Mini-PC`) | *Verified Fedora 44* | *Verified (`--spec-type ngram`)* | *Verified (`CPU` & `780M`)* | `@jarorosFork` ([`fedora/`](fedora/README.md)) |
+| **AMD Threadripper PRO 7985WX** | `64C/128T` (`8 CCDs`, `256 MB` L3, `AVX-512`) | `256 GB` DDR5-6000 (`8-Channel`) | *Testing in [#1](https://github.com/synchopate/nemotron-30b-cpu-256k/issues/1)* | *Auto-tuned `-t 32 -tb 64`* | *Submit via `./modchip bench`!* | `@aifartist` ([Issue #1](https://github.com/synchopate/nemotron-30b-cpu-256k/issues/1)) |
+| **Your CPU (`Ryzen / EPYC / Xeon / M-Series`)** | *Run `./modchip bench`* | *Any `>=24 GB` RAM* | *?* | *?* | **[➕ Submit Scorecard](https://github.com/synchopate/nemotron-30b-cpu-256k/issues/new?template=benchmark.yml)** | *You!* |
 
 ---
 
