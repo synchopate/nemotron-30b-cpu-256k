@@ -27,6 +27,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -34,6 +35,16 @@ from typing import Any, Dict, List, Optional, Tuple
 SHM_PATH = "/dev/shm/llama_modchip.bin"
 SHM_MAGIC = 0x4D4F4443  # "MODC"
 SHM_VERSION = 1
+
+
+def get_shm_paths(primary_path: str = SHM_PATH) -> List[str]:
+    paths = []
+    xdg = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if xdg and os.path.isdir(xdg) and os.access(xdg, os.W_OK):
+        paths.append(os.path.join(xdg, "llama_modchip.bin"))
+    if primary_path not in paths:
+        paths.append(primary_path)
+    return paths
 
 # GGUF value type IDs
 GGUF_TYPE_UINT8 = 0
@@ -404,7 +415,7 @@ class ModchipProfile:
     hacks: List[HackItem] = field(default_factory=list)
 
 
-def compute_modchip_profile(hw: HardwareInfo, model: GGUFModelInfo) -> ModchipProfile:
+def compute_modchip_profile(hw: HardwareInfo, model: GGUFModelInfo, swa_override: int = 0) -> ModchipProfile:
     # 1. Dynamic L3 KV Window sizing: target 25% of L3 cache capacity
     # using the active KV bytes/token (with EAKV Q8_0/Q4_0 enabled)
     kv_bpt = max(model.kv_bytes_per_tok_q8q4, 256)
@@ -417,30 +428,47 @@ def compute_modchip_profile(hw: HardwareInfo, model: GGUFModelInfo) -> ModchipPr
         l3_window = min(4096, max(256, (raw_l3_tokens // 64) * 64))
 
     # 2. Sliding Window Attention (SWA) + Attention Sinks + Safety Lock
+    # Default: attn_window = 0 (Full 256K Exact Global Attention, matching systemd service).
+    # Opt-in via --swa <tokens> (e.g., --swa 4096) for approximate windowed attention.
     attn_sinks = 16
     if model.is_hybrid_ssm:
-        # Hybrid Mamba-2 / DeltaNet: Mamba state carries 100% global memory -> Full SWA (stride=1) is 100% safe!
-        attn_window = 4096
+        attn_window = swa_override if swa_override > 0 else 0
         swa_stride = 1
-        swa_safety = "SAFE"
-        swa_val = f"WIN={attn_window}, SINKS={attn_sinks}, STRIDE=1 (All {model.attn_layers} GQA layers)"
-        swa_reason = (
-            f"Hybrid SSM detected ({model.ssm_layers} Mamba-2 layers hold 256K global state). "
-            f"Full SWA on all {model.attn_layers} GQA layers is lossless."
-        )
+        if attn_window == 0:
+            swa_safety = "SAFE"
+            swa_val = f"WIN=0 (Full 256K Exact Global Attention on all {model.attn_layers} GQA layers; opt-in --swa 4096)"
+            swa_reason = (
+                f"Hybrid SSM ({model.ssm_layers} Mamba-2 + {model.attn_layers} GQA): "
+                f"defaults to exact 256K attention (1.5 GiB KV); pass --swa 4096 for approximate SWA."
+            )
+        else:
+            swa_safety = "APPROXIMATE"
+            swa_val = f"WIN={attn_window}, SINKS={attn_sinks}, STRIDE=1 (All {model.attn_layers} GQA layers — Approximate)"
+            swa_reason = (
+                f"Approximate beyond {attn_window}t window: {model.ssm_layers} Mamba-2 layers hold recurrent state, "
+                f"while {model.attn_layers} GQA layers attend to {attn_sinks} sinks + last {attn_window} tokens."
+            )
     else:
         # Pure GQA Transformer: SAFETY LOCK! Full SWA would erase memory beyond 4K.
-        # Activate Interleaved 3:1 SWA (LLAMA_SWA_STRIDE=4): 75% SWA layers + 25% Full 256K global layers!
-        attn_window = 4096
+        # When SWA is enabled, activate Interleaved 3:1 SWA (LLAMA_SWA_STRIDE=4).
+        attn_window = swa_override if swa_override > 0 else 0
         swa_stride = 4
         global_layers = model.attn_layers // swa_stride
         swa_layers = model.attn_layers - global_layers
-        swa_safety = "INTERLEAVED"
-        swa_val = f"WIN={attn_window}, SINKS={attn_sinks}, STRIDE=4 ({swa_layers} SWA + {global_layers} Global)"
-        swa_reason = (
-            f"SAFETY LOCK: Pure GQA ({model.attn_layers}L) has no SSM state. "
-            f"Full SWA blocked to prevent >4K amnesia; auto-switched to 3:1 Interleaved SWA."
-        )
+        if attn_window == 0:
+            swa_safety = "SAFE"
+            swa_val = f"WIN=0 (Full Exact Global Attention on all {model.attn_layers} GQA layers)"
+            swa_reason = (
+                f"Pure GQA ({model.attn_layers}L): defaults to exact global attention; "
+                f"if --swa is enabled, Safety Lock enforces 3:1 Interleaved SWA ({global_layers} global layers)."
+            )
+        else:
+            swa_safety = "INTERLEAVED"
+            swa_val = f"WIN={attn_window}, SINKS={attn_sinks}, STRIDE=4 ({swa_layers} SWA + {global_layers} Global)"
+            swa_reason = (
+                f"SAFETY LOCK: Pure GQA ({model.attn_layers}L) has no SSM state. "
+                f"Full SWA blocked to prevent >4K amnesia; auto-switched to 3:1 Interleaved SWA."
+            )
 
     # 3. RouteCrack Confidence Gate:
     # Empirical CPU benchmark proves <75% precision wastes DDR5 bandwidth on rejected MoE experts.
@@ -463,13 +491,16 @@ def compute_modchip_profile(hw: HardwareInfo, model: GGUFModelInfo) -> ModchipPr
         moe_top_k = 4
         saved_pct = int(round((1.0 - (moe_top_k / model.expert_used_count)) * 100))
         if model.expert_weights_norm:
-            moe_safety = "SAFE"
+            moe_safety = "TRADE-OFF"
             moe_val = (
                 f"Top-K: {model.expert_used_count} -> {moe_top_k} "
                 f"({model.effective_expert_units} -> {moe_top_k + (model.effective_expert_units - model.expert_used_count)} eff. units, "
                 f"-{saved_pct}% routed DRAM, norm=True, scale={model.expert_weights_scale})"
             )
-            moe_reason = "GGUF has expert_weights_norm=True: llama.cpp renormalizes surviving 4 experts automatically."
+            moe_reason = (
+                "Speed/Quality Trade-off: expert_weights_norm=True renormalizes top-4 experts; "
+                f"set LLAMA_MOE_TOP_K={model.expert_used_count} for unpruned native quality."
+            )
         else:
             moe_safety = "EXPERIMENTAL"
             moe_val = f"Top-K: {model.expert_used_count} -> {moe_top_k} (-{saved_pct}% routed MoE DRAM, norm=False)"
@@ -571,7 +602,7 @@ def compute_modchip_profile(hw: HardwareInfo, model: GGUFModelInfo) -> ModchipPr
 
 
 def write_modchip_shm(prof: ModchipProfile, shm_path: str = SHM_PATH) -> None:
-    """Packs the live-tunable Modchip parameters into /dev/shm/llama_modchip.bin."""
+    """Packs the live-tunable Modchip parameters atomically (mode 0600) into XDG_RUNTIME_DIR and /dev/shm."""
     payload = struct.pack(
         "<IIiiiiiiiiii",
         SHM_MAGIC,
@@ -587,8 +618,21 @@ def write_modchip_shm(prof: ModchipProfile, shm_path: str = SHM_PATH) -> None:
         prof.rc_cert_d2,
         prof.moe_top_k,
     )
-    with open(shm_path, "wb") as f:
-        f.write(payload)
+    for target in get_shm_paths(shm_path):
+        parent = os.path.dirname(target) or "/dev/shm"
+        if not os.path.isdir(parent) or not os.access(parent, os.W_OK):
+            continue
+        fd, tmp_path = tempfile.mkstemp(prefix=".llama_modchip_", dir=parent)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(payload)
+            os.replace(tmp_path, target)
+        except OSError:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def _detect_default_server_bin() -> str:
@@ -661,6 +705,8 @@ def build_launch_command(
 BADGE_MAP = {
     "SAFE": "🟢 [SAFE / ON]       ",
     "ADAPTIVE": "🔵 [AUTO-ADAPTIVE]   ",
+    "TRADE-OFF": "🔵 [NORM-PRESERVING] ",
+    "APPROXIMATE": "🟡 [APPROX / OPT-IN] ",
     "INTERLEAVED": "🟡 [SAFETY-LOCK 3:1] ",
     "EXPERIMENTAL": "🟠 [EXP / PRUNED]    ",
     "LOCKED": "⚪ [LOCKED / N/A]    ",
@@ -671,7 +717,7 @@ def print_profile_report(prof: ModchipProfile) -> None:
     m = prof.model
     hw = prof.hw
     print("┌" + "─" * 98 + "┐")
-    print(f"│ {'CPU-MODCHIP v1.0 (Priiloader for GGUF Microarchitectural Hacks)':<96} │")
+    print(f"│ {'CPU-MODCHIP v2.1.0 (Priiloader for GGUF Microarchitectural Hacks)':<96} │")
     print("├" + "─" * 98 + "┤")
     print(f"│ [HARDWARE] CPU: {hw.cpu_model[:44]:<44} | CCDs: {hw.num_ccds}x{hw.l3_per_ccd_mb:.0f}MB L3 | RAM: {hw.ram_total_gib:.0f} GiB │")
     print(f"│ [ISA/THP]  Flags: {', '.join(hw.isa_flags):<42} | THP: {hw.thp_mode:<10} | Cores: {len(hw.physical_core_cpus):<6} │")
@@ -805,7 +851,7 @@ def run_ab_benchmark(prof: ModchipProfile, bench_bin: Optional[str] = None) -> i
     native_top_k = m.expert_used_count if m.is_moe else 0
 
     print("\n" + "=" * 100)
-    print(f" RUNNING 1-COMMAND A/B BENCHMARK: Stock Baseline vs. llama-modchip v0.9 ({m.filename})")
+    print(f" RUNNING 1-COMMAND A/B BENCHMARK: Stock Baseline vs. llama-modchip v2.1.0 ({m.filename})")
     print("=" * 100)
 
     # 1. Baseline (Stock FP16 KV, Native Top-K, No SWA, No SHM override)
@@ -867,7 +913,7 @@ def run_ab_benchmark(prof: ModchipProfile, bench_bin: Optional[str] = None) -> i
         print("| :--- | :---: | :---: | :--- |")
         print(f"| **Stock Baseline** | `{pp_a:.2f} tok/s` | `{tg_a:.2f} tok/s` | `Top-K={native_top_k or 'Dense'}`, `FP16 KV`, `No SWA` |")
         print(
-            f"| **`llama-modchip v0.9`** | **`{pp_b:.2f} tok/s` (`{pp_gain:+.1f}%`)** | "
+            f"| **`llama-modchip v2.1.0`** | **`{pp_b:.2f} tok/s` (`{pp_gain:+.1f}%`)** | "
             f"**`{tg_b:.2f} tok/s` (`{tg_gain:+.1f}%`)** | "
             f"`Top-K={prof.moe_top_k or 'Dense'}`, `SWA_STRIDE={prof.swa_stride}`, `L3_WIN={prof.l3_window}`, `Q8_0/Q4_0` |"
         )
@@ -891,7 +937,7 @@ def run_tui(prof: ModchipProfile, port: int = 8001) -> None:
             h, w = stdscr.getmaxyx()
             m = prof.model
             hw = prof.hw
-            stdscr.addstr(0, 0, f"=== CPU-MODCHIP v1.0 (Priiloader TUI) == Target: {m.filename} ==="[:w - 1], curses.A_BOLD)
+            stdscr.addstr(0, 0, f"=== CPU-MODCHIP v2.1.0 (Priiloader TUI) == Target: {m.filename} ==="[:w - 1], curses.A_BOLD)
             stdscr.addstr(1, 0, f"CPU: {hw.cpu_model} ({hw.num_ccds}x{hw.l3_per_ccd_mb:.0f}MB L3) | Arch: {m.arch_summary}"[:w - 1])
             stdscr.addstr(2, 0, "-" * min(w - 1, 96))
 
@@ -953,6 +999,7 @@ def main() -> int:
     parser.add_argument("--bench", action="store_true", help="Run 1-command A/B benchmark (Stock vs llama-modchip) via llama-bench")
     parser.add_argument("--bench-bin", type=str, default=None, help="Optional path to llama-bench binary for --bench")
     parser.add_argument("--port", type=int, default=8001, help="llama-server port for --print-cmd and --tui live telemetry (default: 8001)")
+    parser.add_argument("--swa", type=int, default=0, help="Opt-in approximate Sliding Window Attention size in tokens (default: 0 = full exact attention)")
     parser.add_argument("--json", action="store_true", help="Output profile as JSON")
     parser.add_argument("--tui", action="store_true", help="Launch interactive Priiloader Curses TUI")
     args = parser.parse_args()
@@ -963,7 +1010,7 @@ def main() -> int:
         profiles = []
         for path in args.audit:
             info = inspect_gguf(path)
-            prof = compute_modchip_profile(hw, info)
+            prof = compute_modchip_profile(hw, info, swa_override=args.swa)
             profiles.append(prof)
             print_profile_report(prof)
             if args.print_cmd:
@@ -977,7 +1024,7 @@ def main() -> int:
         parser.error("Provide --model /path/to/model.gguf or --audit model1.gguf model2.gguf ...")
 
     info = inspect_gguf(args.model)
-    prof = compute_modchip_profile(hw, info)
+    prof = compute_modchip_profile(hw, info, swa_override=args.swa)
 
     if args.apply_shm:
         write_modchip_shm(prof)

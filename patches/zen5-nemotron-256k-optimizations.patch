@@ -7,7 +7,7 @@ index ea54cfe..68b926e 100644
      // Main loop
      for (; ib < nb; ++ib) {
 +#if defined(__AVX2__) || defined(__AVX512F__)
-+        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from weight streaming pollution
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q4_0 weight streaming pollution
 +        if (ib + 4 < nb) {
 +            _mm_prefetch((const char *)&x[ib + 4], _MM_HINT_NTA);
 +        }
@@ -20,7 +20,7 @@ index ea54cfe..68b926e 100644
      // Main loop
      for (; ib < nb; ++ib) {
 +#if defined(__AVX2__) || defined(__AVX512F__)
-+        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from weight streaming pollution
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q5_0 weight streaming pollution
 +        if (ib + 4 < nb) {
 +            _mm_prefetch((const char *)&x[ib + 4], _MM_HINT_NTA);
 +        }
@@ -33,7 +33,7 @@ index ea54cfe..68b926e 100644
      // Main loop
      for (; ib < nb; ++ib) {
 +#if defined(__AVX2__) || defined(__AVX512F__)
-+        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from weight streaming pollution
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q5_0 weight streaming pollution
 +        if (ib + 4 < nb) {
 +            _mm_prefetch((const char *)&x[ib + 4], _MM_HINT_NTA);
 +        }
@@ -46,7 +46,7 @@ index ea54cfe..68b926e 100644
  
      for (int i = 0; i < nb; ++i) {
 +#if defined(__AVX2__) || defined(__AVX512F__)
-+        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q2_K weight streaming
 +        if (i + 2 < nb) {
 +            _mm_prefetch((const char *)&x[i + 2], _MM_HINT_NTA);
 +            _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
@@ -62,7 +62,7 @@ index ea54cfe..68b926e 100644
  
      for (int i = 0; i < nb; ++i) {
 +#if defined(__AVX2__) || defined(__AVX512F__)
-+        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q3_K weight streaming
 +        if (i + 2 < nb) {
 +            _mm_prefetch((const char *)&x[i + 2], _MM_HINT_NTA);
 +            _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
@@ -78,7 +78,7 @@ index ea54cfe..68b926e 100644
  
      for (int i = 0; i < nb; ++i) {
 +#if defined(__AVX2__) || defined(__AVX512F__)
-+        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q3_K weight streaming
 +        if (i + 2 < nb) {
 +            _mm_prefetch((const char *)&x[i + 2], _MM_HINT_NTA);
 +            _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
@@ -94,7 +94,7 @@ index ea54cfe..68b926e 100644
  
     for (int i = 0; i < nb; ++i) {
 +#if defined(__AVX2__) || defined(__AVX512F__)
-+        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q4_K weight streaming
 +        if (i + 2 < nb) {
 +            _mm_prefetch((const char *)&x[i + 2], _MM_HINT_NTA);
 +            _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
@@ -110,7 +110,7 @@ index ea54cfe..68b926e 100644
  
     for (int i = 0; i < nb; ++i) {
 +#if defined(__AVX2__) || defined(__AVX512F__)
-+        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q4_K weight streaming
 +        if (i + 2 < nb) {
 +            _mm_prefetch((const char *)&x[i + 2], _MM_HINT_NTA);
 +            _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
@@ -126,7 +126,7 @@ index ea54cfe..68b926e 100644
  
      for (int i = 0; i < nb; ++i) {
 +#if defined(__AVX2__) || defined(__AVX512F__)
-+        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q5_K weight streaming
 +        if (i + 2 < nb) {
 +            _mm_prefetch((const char *)&x[i + 2], _MM_HINT_NTA);
 +            _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
@@ -397,7 +397,7 @@ index 7918845..66811d6 100644
              ggml_thread_apply_priority(threadpool->prio);
              if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
                  ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
-+            } else if (n_threads == 16) {
++            } else if (n_threads == 16 && getenv("LLAMA_PIN_16C")) {
 +                static __thread int tls_std_pinned_cpu = -1;
 +                if (tls_std_pinned_cpu != ith) {
 +                    cpu_set_t cpuset;
@@ -425,12 +425,13 @@ index 42ec809..7ab75f9 100644
  // ggml_compute_forward_dup
  
  static void ggml_compute_forward_dup_same_cont(
-@@ -8465,6 +8469,93 @@ void ggml_compute_forward_top_k(
+@@ -8465,6 +8469,114 @@ void ggml_compute_forward_top_k(
      }
  }
  
 +#if defined(__AVX2__) || defined(__AVX512F__)
 +#include <sys/mman.h>
++#include <sys/stat.h>
 +#include <fcntl.h>
 +#include <unistd.h>
 +
@@ -455,6 +456,7 @@ index 42ec809..7ab75f9 100644
 +    int64_t attn_window;
 +    int64_t attn_sinks;
 +    int64_t swa_stride;
++    bool    disable_chunking;
 +    const volatile llama_modchip_shm_t * shm_ptr;
 +
 +    kv_l3_policy_config() : shm_ptr(nullptr) {
@@ -463,29 +465,48 @@ index 42ec809..7ab75f9 100644
 +        const char * env_p  = getenv("LLAMA_KV_L3_NTA_PREFIX");
 +        kv_nta_prefix       = env_p ? atoll(env_p) : -1;
 +        const char * env_aw = getenv("LLAMA_ATTN_WINDOW");
-+        attn_window         = env_aw ? atoll(env_aw) : 4096;
++        attn_window         = env_aw ? atoll(env_aw) : 0;
 +        const char * env_as = getenv("LLAMA_ATTN_SINKS");
 +        attn_sinks          = env_as ? atoll(env_as) : 16;
 +        const char * env_st = getenv("LLAMA_SWA_STRIDE");
 +        swa_stride          = env_st ? atoll(env_st) : 0;
++        const char * env_dc = getenv("LLAMA_KV_DISABLE_CHUNKING");
++        disable_chunking    = env_dc ? (atoi(env_dc) != 0) : ggml_is_numa();
 +
-+        int fd = open("/dev/shm/llama_modchip.bin", O_RDONLY);
++        int fd = -1;
++        const char * xdg = getenv("XDG_RUNTIME_DIR");
++        if (xdg && xdg[0]) {
++            char path_buf[512];
++            snprintf(path_buf, sizeof(path_buf), "%s/llama_modchip.bin", xdg);
++            fd = open(path_buf, O_RDONLY | O_NOFOLLOW);
++        }
++        if (fd < 0) {
++            fd = open("/dev/shm/llama_modchip.bin", O_RDONLY | O_NOFOLLOW);
++        }
 +        if (fd >= 0) {
-+            void * p = mmap(nullptr, sizeof(llama_modchip_shm_t), PROT_READ, MAP_SHARED, fd, 0);
-+            close(fd);
-+            if (p != MAP_FAILED) {
-+                const llama_modchip_shm_t * s = (const llama_modchip_shm_t *)p;
-+                if (s->magic == 0x4D4F4443u) {
-+                    shm_ptr = s;
++            struct stat st;
++            if (fstat(fd, &st) == 0 &&
++                S_ISREG(st.st_mode) &&
++                st.st_size >= (off_t)sizeof(llama_modchip_shm_t) &&
++                st.st_uid == getuid()) {
++                void * p = mmap(nullptr, sizeof(llama_modchip_shm_t), PROT_READ, MAP_SHARED, fd, 0);
++                if (p != MAP_FAILED) {
++                    const llama_modchip_shm_t * s = (const llama_modchip_shm_t *)p;
++                    if (s->magic == 0x4D4F4443u) {
++                        shm_ptr = s;
++                    } else {
++                        munmap(p, sizeof(llama_modchip_shm_t));
++                    }
 +                }
 +            }
++            close(fd);
 +        }
 +
 +        if (attn_window > 0) {
-+            fprintf(stderr, "[GGML-MODCHIP] SWA ACTIVE: Window=%ld, Sinks=%ld, Stride=%ld, L3 Window=%ld\n",
++            fprintf(stderr, "[GGML-MODCHIP] SWA ACTIVE (Approximate beyond window): Window=%ld, Sinks=%ld, Stride=%ld, L3 Window=%ld\n",
 +                    (long)attn_window, (long)attn_sinks, (long)swa_stride, (long)kv_l3_window);
 +        } else {
-+            fprintf(stderr, "[GGML-MODCHIP] Full 256K Global Attention ACTIVE: Window=FULL, L3 NTA Window=%ld\n",
++            fprintf(stderr, "[GGML-MODCHIP] Full 256K Exact Global Attention ACTIVE: Window=FULL, L3 NTA Window=%ld\n",
 +                    (long)kv_l3_window);
 +        }
 +    }
@@ -519,7 +540,7 @@ index 42ec809..7ab75f9 100644
  static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
          const ggml_compute_params * params,
          ggml_tensor * dst,
-@@ -8473,6 +8564,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+@@ -8473,6 +8584,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
          float * partials, int64_t partial_stride) {
  
      const bool write_partials = (partials != nullptr);
@@ -529,7 +550,7 @@ index 42ec809..7ab75f9 100644
      const ggml_tensor * q     = dst->src[0];
      const ggml_tensor * k     = dst->src[1];
      const ggml_tensor * v     = dst->src[2];
-@@ -8588,8 +8682,21 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+@@ -8588,8 +8702,21 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
          // online softmax / attention
          // loop over n_kv and n_head_kv
          // ref: https://arxiv.org/pdf/2112.05682.pdf
@@ -551,7 +572,7 @@ index 42ec809..7ab75f9 100644
              const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
              if (mv == -INFINITY) {
                  continue;
-@@ -8597,6 +8704,26 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+@@ -8597,6 +8724,26 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
  
              float s; // KQ value
  
@@ -578,21 +599,31 @@ index 42ec809..7ab75f9 100644
              const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
              kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
  
-@@ -9149,7 +9276,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+@@ -9149,7 +9296,12 @@ static void ggml_compute_forward_flash_attn_ext_f16(
          const int64_t nr = neq1*neq2*neq3;
  
          // disable for NUMA
 -        const bool disable_chunking = ggml_is_numa();
-+        const bool disable_chunking = true; // Static GQA KV-Head Dual-CCD L3 Partitioning
++#if defined(__AVX2__) || defined(__AVX512F__)
++        const kv_l3_policy_config & l3_dc = get_kv_l3_policy();
++        const bool disable_chunking = (l3_dc.shm_ptr && l3_dc.shm_ptr->magic == 0x4D4F4443u) ? (l3_dc.shm_ptr->disable_chunking != 0) : l3_dc.disable_chunking;
++#else
++        const bool disable_chunking = ggml_is_numa();
++#endif
  
          // 4x chunks per thread
          int nth_scaled = nth * 4;
-@@ -10894,7 +11021,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
+@@ -10894,7 +11046,12 @@ static void ggml_compute_forward_gated_delta_net_f32(
      int64_t nr = V->ne[1] * V->ne[3];
  
      // disable for NUMA
 -    const bool disable_chunking = ggml_is_numa();
-+    const bool disable_chunking = true; // Static GQA KV-Head Dual-CCD L3 Partitioning
++#if defined(__AVX2__) || defined(__AVX512F__)
++    const kv_l3_policy_config & l3_dc = get_kv_l3_policy();
++    const bool disable_chunking = (l3_dc.shm_ptr && l3_dc.shm_ptr->magic == 0x4D4F4443u) ? (l3_dc.shm_ptr->disable_chunking != 0) : l3_dc.disable_chunking;
++#else
++    const bool disable_chunking = ggml_is_numa();
++#endif
  
      int nth = params->nth;
      int ith = params->ith;
@@ -600,7 +631,7 @@ diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 index da7f3a5..6aa727a 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -380,6 +380,13 @@ void * ggml_aligned_malloc(size_t size) {
+@@ -380,6 +380,14 @@ void * ggml_aligned_malloc(size_t size) {
          GGML_LOG_ERROR("%s: %s (attempted to allocate %6.2f MB)\n", __func__, error_desc, size/(1024.0*1024.0));
          return NULL;
      }
@@ -608,7 +639,8 @@ index da7f3a5..6aa727a 100644
 +    if (size >= 2 * 1024 * 1024) {
 +        uintptr_t page_mask = ~(uintptr_t)(4096 - 1);
 +        void * page_aligned = (void *)((uintptr_t)aligned_memory & page_mask);
-+        madvise(page_aligned, size, MADV_HUGEPAGE);
++        size_t adv_size = size + ((uintptr_t)aligned_memory - (uintptr_t)page_aligned);
++        madvise(page_aligned, adv_size, MADV_HUGEPAGE);
 +    }
 +#endif
      return aligned_memory;
@@ -628,62 +660,11 @@ index ed572da..b18ef4a 100644
  
          if (prefetch > 0) {
              if (posix_madvise(addr, std::min(file->size(), prefetch), POSIX_MADV_WILLNEED)) {
-diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 3d50f8a..37a376c 100644
---- a/src/llama-model-loader.cpp
-+++ b/src/llama-model-loader.cpp
-@@ -462,6 +462,10 @@ namespace GGUFMeta {
-                 GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(metadata, kid);
- 
-             if (n != arr_info.length) {
-+                if (arr_info.length <= n) {
-+                    result.fill(0);
-+                    return get_arr(key, result, required);
-+                }
-                 throw std::runtime_error(format("key %s has wrong array length; expected %u, got %u", key.c_str(), n, (uint32_t) arr_info.length));
-             }
- 
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
 index 3bf3a22..b4f5af5 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -40,8 +40,6 @@
- 
- static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
-     switch (arch) {
--        case LLM_ARCH_CLIP:
--            return new llama_model_clip(params);
-         case LLM_ARCH_LLAMA:
-             return new llama_model_llama(params);
-         case LLM_ARCH_LLAMA4:
-@@ -114,8 +112,6 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
-             return new llama_model_qwen3vl(params);
-         case LLM_ARCH_QWEN3VLMOE:
-             return new llama_model_qwen3vlmoe(params);
--        case LLM_ARCH_QWEN3TTS:
--            return new llama_model_qwen3tts(params);
-         case LLM_ARCH_PHI2:
-             return new llama_model_phi2(params);
-         case LLM_ARCH_PHI3:
-@@ -176,8 +172,6 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
-             return new llama_model_olmo2(params);
-         case LLM_ARCH_OLMOE:
-             return new llama_model_olmoe(params);
--        case LLM_ARCH_MUSE_GLIMMER:
--            return new llama_model_muse_glimmer(params);
-         case LLM_ARCH_OPENELM:
-             return new llama_model_openelm(params);
-         case LLM_ARCH_GPTNEOX:
-@@ -238,8 +232,6 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
-             return new llama_model_granite(params);
-         case LLM_ARCH_GRANITE_MOE:
-             return new llama_model_granite_moe(params);
--        case LLM_ARCH_GRANITE_SWITCH:
--            return new llama_model_granite_switch(params);
-         case LLM_ARCH_MINICPM:
-             return new llama_model_minicpm(params);
-         case LLM_ARCH_GRANITE_HYBRID:
-@@ -1104,6 +1096,18 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
+@@ -1104,6 +1104,18 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
      ml.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);
      ml.get_key(LLM_KV_EXPERT_GROUP_USED_COUNT, hparams.n_group_used,    false);
  
@@ -702,204 +683,3 @@ index 3bf3a22..b4f5af5 100644
      if (arch == LLM_ARCH_HUNYUAN_VL || arch == LLM_ARCH_HUNYUAN_DENSE) {
          if (hparams.n_expert <= 1) {
              hparams.n_expert      = 0;
-@@ -1918,7 +1922,6 @@ void llama_model::print_info() const {
-                 arch == LLM_ARCH_GRANITE ||
-                 arch == LLM_ARCH_GRANITE_MOE ||
-                 arch == LLM_ARCH_GRANITE_HYBRID ||
--                arch == LLM_ARCH_GRANITE_SWITCH ||
-                 arch == LLM_ARCH_NEMOTRON_H_MOE) {
-             LLAMA_LOG_INFO("%s: f_embedding_scale     = %f\n", __func__, hparams.f_embedding_scale);
-             LLAMA_LOG_INFO("%s: f_residual_scale      = %f\n", __func__, hparams.f_residual_scale);
-@@ -2235,9 +2238,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
-                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
-                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE);
- 
--                const bool mtp_on_hybrid_nemotron =
--                    params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
--
-                 if (llm_arch_is_recurrent(arch)) {
-                     res = new llama_memory_recurrent(
-                             *this,
-@@ -2248,7 +2248,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
-                             cparams.n_seq_max,
-                             cparams.n_rs_seq,
-                             nullptr);
--                } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron) {
-+                } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen) {
-                     // The main difference between hybrid architectures is the
-                     // layer filters, so pick the right one here
-                     llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
-@@ -2329,7 +2329,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
-                         };
-                     }
- 
--                    if (mtp_on_hybrid_qwen || mtp_on_hybrid_nemotron) {
-+                    if (mtp_on_hybrid_qwen) {
-                         filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
-                     }
- 
-@@ -2601,13 +2601,11 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
-         case LLM_ARCH_DEEPSEEK2OCR:
-         case LLM_ARCH_DEEPSEEK32:
-         case LLM_ARCH_DEEPSEEK4:
--        case LLM_ARCH_MUSE_GLIMMER:
-         case LLM_ARCH_PLM:
-         case LLM_ARCH_CHATGLM:
-         case LLM_ARCH_GRANITE:
-         case LLM_ARCH_GRANITE_MOE:
-         case LLM_ARCH_GRANITE_HYBRID:
--        case LLM_ARCH_GRANITE_SWITCH:
-         case LLM_ARCH_CHAMELEON:
-         case LLM_ARCH_BAILINGMOE:
-         case LLM_ARCH_NEO_BERT:
-@@ -2707,7 +2705,6 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
-         case LLM_ARCH_QWEN3VLMOE:
-         case LLM_ARCH_QWEN35:
-         case LLM_ARCH_QWEN35MOE:
--        case LLM_ARCH_QWEN3TTS:
-             return LLAMA_ROPE_TYPE_IMROPE;
- 
-         case LLM_ARCH_GLM4:
-@@ -2902,21 +2899,6 @@ void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
-         int64_t n_embd_, int64_t n_embd_q_, int64_t n_embd_k_, int64_t n_embd_v_,
-         int flags) {
-     const int64_t n_embd_qkv = n_embd_q_ + n_embd_k_ + n_embd_v_;
--
--    if (flags & TENSOR_SKIP) {
--        const int skip = TENSOR_NOT_REQUIRED | TENSOR_SKIP;
--
--        create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", bid), {n_embd_, n_embd_qkv}, skip | TENSOR_SKIP_IF_VIRTUAL);
--        create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias",   bid), {n_embd_qkv},          skip | TENSOR_SKIP_IF_VIRTUAL);
--        create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", bid), {n_embd_, n_embd_q_},  skip);
--        create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", bid), {n_embd_, n_embd_k_},  skip);
--        create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", bid), {n_embd_, n_embd_v_},  skip);
--        create_tensor(tn(LLM_TENSOR_ATTN_Q,   "bias",   bid), {n_embd_q_},           skip);
--        create_tensor(tn(LLM_TENSOR_ATTN_K,   "bias",   bid), {n_embd_k_},           skip);
--        create_tensor(tn(LLM_TENSOR_ATTN_V,   "bias",   bid), {n_embd_v_},           skip);
--        return;
--    }
--
-     layer.wqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", bid), {n_embd_, n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
-     if (layer.wqkv) {
-         layer.wqkv_b = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias", bid), {n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
-@@ -2940,36 +2922,17 @@ uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
- }
- 
- uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out) {
--    if (model->vocab.n_tokens() == 0 || model->tok_embd == nullptr) {
-+    if (!model || !model->tok_embd) {
-         return 0;
-     }
--
--    const ggml_tensor * tensor = model->tok_embd;
--    const size_t nelements = ggml_nelements(tensor);
--    GGML_ASSERT(nelements <= UINT32_MAX); // for the return type
--
--    if (out == nullptr) {
--        return (uint32_t) nelements;
--    }
--
--    if (tensor->type == GGML_TYPE_F32) {
--        ggml_backend_tensor_get(tensor, out, 0, nelements * sizeof(float));
--        return (uint32_t) nelements;
-+    const uint32_t n_tokens = model->vocab.n_tokens();
-+    if (!out) {
-+        return n_tokens;
-     }
--
--    std::vector<uint8_t> buf(ggml_nbytes(tensor));
--    ggml_backend_tensor_get(tensor, buf.data(), 0, buf.size());
--
--    const ggml_type_traits * traits = ggml_get_type_traits(tensor->type);
--    if (tensor->type == GGML_TYPE_F16) {
--        ggml_fp16_to_fp32_row((const ggml_fp16_t *) buf.data(), out, nelements);
--    } else if (tensor->type == GGML_TYPE_BF16) {
--        ggml_bf16_to_fp32_row((const ggml_bf16_t *) buf.data(), out, nelements);
--    } else if (ggml_is_quantized(tensor->type) && traits->to_float != nullptr) {
--        traits->to_float(buf.data(), out, nelements);
--    } else {
--        GGML_ABORT("unsupported tensor type for dequantization: %s", ggml_type_name(tensor->type));
-+    const auto * traits = ggml_get_type_traits(model->tok_embd->type);
-+    if (!traits || !traits->to_float) {
-+        return 0;
-     }
--
--    return (uint32_t) nelements;
-+    traits->to_float(model->tok_embd->data, out, ggml_nelements(model->tok_embd));
-+    return n_tokens;
- }
-diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
-index 38f2a57..2787e66 100644
---- a/src/models/qwen35moe.cpp
-+++ b/src/models/qwen35moe.cpp
-@@ -75,19 +75,22 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
- 
-         if (!hparams.is_recr(il)) {
-             // Attention layers
--            create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, flags);
--            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", il), { n_embd_head_k * n_head, n_embd }, flags);
-+            create_tensor_qkv(layer, il, n_embd, hparams.n_embd_head_k(il) * hparams.n_head(il) * 2, hparams.n_embd_k_gqa(il), hparams.n_embd_v_gqa(il), flags);
-+            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", il), { (int64_t)(hparams.n_embd_head_k(il) * hparams.n_head(il)), n_embd }, flags);
- 
-             // Q/K normalization for attention layers
--            layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, flags);
--            layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, flags);
-+            layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { (int64_t)hparams.n_embd_head_k(il) }, flags);
-+            layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { (int64_t)hparams.n_embd_head_k(il) }, flags);
-         } else {
-             // Linear attention (gated delta net) specific tensors
-             // Create tensors with calculated dimensions
-             layer.wqkv           = create_tensor(tn(LLM_TENSOR_ATTN_QKV,       "weight", il), { n_embd, key_dim * 2 + value_dim }, TENSOR_NOT_REQUIRED);
-             layer.wqkv_gate      = create_tensor(tn(LLM_TENSOR_ATTN_GATE,      "weight", il), { n_embd, value_dim }, TENSOR_NOT_REQUIRED);
-             layer.ssm_conv1d     = create_tensor(tn(LLM_TENSOR_SSM_CONV1D,     "weight", il), { hparams.ssm_d_conv, conv_dim }, flags);
--            layer.ssm_dt         = create_tensor(tn(LLM_TENSOR_SSM_DT,         "bias",   il), { hparams.ssm_dt_rank }, flags);
-+            layer.ssm_dt         = create_tensor(tn(LLM_TENSOR_SSM_DT,                        il), { hparams.ssm_dt_rank }, TENSOR_NOT_REQUIRED);
-+            if (!layer.ssm_dt) {
-+                layer.ssm_dt = create_tensor(tn(LLM_TENSOR_SSM_DT,         "bias",   il), { hparams.ssm_dt_rank }, flags);
-+            }
-             layer.ssm_a          = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,             il), { hparams.ssm_dt_rank }, flags);
-             layer.ssm_beta       = create_tensor(tn(LLM_TENSOR_SSM_BETA,       "weight", il), { n_embd, n_v_heads }, flags);
-             layer.ssm_alpha      = create_tensor(tn(LLM_TENSOR_SSM_ALPHA,      "weight", il), { n_embd, n_v_heads }, flags);
-@@ -117,10 +120,10 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
-         layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", il), { n_embd }, mtp_flags);
-         layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", il), { n_embd }, mtp_flags);
- 
--        create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, mtp_flags);
--        layer.wo          = create_tensor(tn(LLM_TENSOR_ATTN_OUT,    "weight", il), { n_embd_head_k * n_head, n_embd }, mtp_flags);
--        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, mtp_flags);
--        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, mtp_flags);
-+        create_tensor_qkv(layer, il, n_embd, hparams.n_embd_head_k(il) * hparams.n_head(il) * 2, hparams.n_embd_k_gqa(il), hparams.n_embd_v_gqa(il), mtp_flags);
-+        layer.wo          = create_tensor(tn(LLM_TENSOR_ATTN_OUT,    "weight", il), { (int64_t)(hparams.n_embd_head_k(il) * hparams.n_head(il)), n_embd }, mtp_flags);
-+        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { (int64_t)hparams.n_embd_head_k(il) }, mtp_flags);
-+        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { (int64_t)hparams.n_embd_head_k(il) }, mtp_flags);
- 
-         // Routed experts
-         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, mtp_flags);
-@@ -285,8 +288,10 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
-         ggml_tensor *             inp_pos,
-         int *                     sections,
-         int                       il) {
--    const int64_t n_embd_head = hparams.n_embd_head_v();
--    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
-+    const int64_t n_embd_head = hparams.n_embd_head_v(il);
-+    const int64_t n_head      = hparams.n_head(il);
-+    const int64_t n_head_kv   = hparams.n_head_kv(il);
-+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k(il));
- 
-     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
- 
-@@ -556,10 +561,11 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
-     GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN35MOE MTP requires n_layer_nextn > 0");
-     GGML_ASSERT(hparams.n_layer_nextn == 1 && "QWEN35MOE MTP currently only supports a single MTP block");
- 
--    const int64_t n_embd_head = hparams.n_embd_head_v();
--    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
--
-     const int il = hparams.n_layer();
-+    const int64_t n_embd_head = hparams.n_embd_head_v(il);
-+    const int64_t n_head      = hparams.n_head(il);
-+    const int64_t n_head_kv   = hparams.n_head_kv(il);
-+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k(il));
-     const auto & layer = model.layers[il];
- 
-     GGML_ASSERT(layer.nextn.eh_proj    && "MTP block missing nextn.eh_proj");

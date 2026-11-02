@@ -1,8 +1,8 @@
 /*
- * rc_stockfish.h — L1/L2-Resident Stockfish-Style PVS + Multi-Order Zobrist TT + AVX-512 NNUE
+ * rc_stockfish.h — L1/L2-Resident Multi-Order Zobrist Transposition Table + History Gravity
  *                  for Draftless CPU Speculative Decoding on Hybrid Mamba-2 + GQA Models
  *
- * Microarchitectural & Cache-Isolation Guarantees (Zero L3 Cache Pollution):
+ * Role in the Speculative Pipeline (queried by ngram-map.cpp during multi-step draft rollout):
  *   1. Multi-Order Lockless Zobrist Transposition & Refutation Table (tt5 + tt4 + tt3):
  *      3 x 4,096 entries x 16 bytes = 192 KB total (< 19% of Core 0's private 1 MB L2 cache on Zen 5).
  *      Never spills into the shared 64 MB Victim L3 cache (0% eviction of hot KV or Mamba-2 states).
@@ -10,10 +10,9 @@
  *      Updates move history scores via h += bonus - h * |bonus| / 512, bounding scores strictly
  *      in [-512, +512] without saturation and penalizing static cascade predictions that were
  *      refuted by the 30B target model earlier in the session.
- *   3. 1-Ply Quiescence Lookahead & Multi-Branch Conflict Disambiguation:
- *      Resolves the 1-ply Horizon Effect by checking whether a candidate token at ply d unlocks
- *      a high-certainty forced continuation at ply d+1, and disambiguates conflicting in-context
- *      suffix matches when one branch is backed by both the RouteCrack ensemble and Zobrist TT.
+ *   3. 1-Ply Quiescence Lookahead & Multi-Branch Conflict Disambiguation (in ngram-map.cpp):
+ *      Queries StockfishDrafter::query() at each rollout step d to resolve 1-ply horizon choices
+ *      and disambiguate conflicting in-context suffix matches.
  */
 
 #ifndef RC_STOCKFISH_H
@@ -23,10 +22,6 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
-
-#if defined(__AVX512F__) && defined(__AVX512BW__)
-#include <immintrin.h>
-#endif
 
 struct alignas(16) SFTTBucket {
     uint32_t key32;          // Upper 32 bits of SplitMix64 Zobrist hash

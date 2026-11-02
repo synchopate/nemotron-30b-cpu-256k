@@ -1,8 +1,9 @@
 /*
- * RouteCrack Engine — C++ Speculative Decoding with BFS Tree Verification
+ * RouteCrack Engine — Standalone C++ CLI Research Harness (BFS Tree Verification)
  *
- * Standalone engine using llama.cpp for model inference and our C++ predictors
- * (trie + cascade + PPM + skipgram + codebook) for zero-FLOP drafting.
+ * NOTE: This file is a standalone CLI benchmark harness for multi-branch BFS tree
+ * verification experiments. The active production speculative proposer linked into
+ * llama-server is speculative/cpp/ngram-map.cpp (+ rc_stockfish.h + rc_predictor.h).
  *
  * Features:
  *   - BFS tree builder with budget allocation (SGLang-style)
@@ -10,17 +11,6 @@
  *   - Adaptive draft depth D (increases as accept rate rises)
  *   - Online learning from every generated token
  *   - 5 C++ predictors (0.002ms per call)
- *
- * Build:
- *   g++ -O2 -std=c++17 -o rc_engine rc_engine.cpp \
- *     -I<llama.cpp>/include -I<llama.cpp>/ggml/include \
- *     -L<llama.cpp>/build/bin -lllama -lggml -lggml-base \
- *     -lpthread -ldl -lm -Wl,-rpath,<llama.cpp>/build/bin
- *
- * Usage:
- *   ./rc_engine -m model.gguf --bench
- *   ./rc_engine -m model.gguf --tree-k 3 --adaptive-d
- *   ./rc_engine -m model.gguf -fh hashconf_k10.bin -fh hashconf_k8.bin
  */
 #include "llama.h"
 #include "rc_predictor.h"

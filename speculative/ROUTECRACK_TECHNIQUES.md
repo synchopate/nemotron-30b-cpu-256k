@@ -26,52 +26,52 @@ where $D$ is total drafted tokens, $A$ is accepted tokens, and $W_{\text{wasted}
 
 ---
 
-## 2. `Stockfish-PVS` Architecture (`speculative/cpp/rc_stockfish.h`)
+## 2. `Stockfish-PVS` Architecture (`speculative/cpp/rc_stockfish.h` + `ngram-map.cpp`)
 
-Instead of treating speculative drafting as a static lookup table, **`Stockfish-PVS`** ([`speculative/cpp/rc_stockfish.h`](cpp/rc_stockfish.h)) models token drafting as a **Chess Engine Principal Variation Search (PVS)** where:
-- The **Board State** is the rolling token context hashed incrementally via **64-bit Zobrist Keys** (`ZOBRIST_POS[8][4096]`).
+Instead of treating speculative drafting as a static lookup table, **`StockfishDrafter`** ([`speculative/cpp/rc_stockfish.h`](cpp/rc_stockfish.h)) + [`speculative/cpp/ngram-map.cpp`](cpp/ngram-map.cpp) model token drafting using **Chess-Engine Transposition Tables + History Gravity + Quiescence Lookahead** where:
+- The **Context State** is hashed via **64-bit SplitMix64 Zobrist Keys** (`zhash`) across 5-gram, 4-gram, and 3-gram suffixes.
 - **Move Generation** is provided by the Two-Zone In-Context Matcher (`16K Hot + 24K Prefix`) and the 6-engine `RouteCrack` statistical cascade ([`speculative/cpp/rc_predictor.h`](cpp/rc_predictor.h)).
-- **Search Verification Feedback (`verify_and_update`)**: On every subsequent `llama-server` forward pass, `StockfishDrafter` compares the sequence of tokens it drafted (`last_draft[0..d]`) against the actual tokens committed by Nemotron (`inp` delta):
-  - Every **accepted token** (`actual == drafted`) increments `wins` in the multi-horizon Zobrist Transposition Tables (`tt5`, `tt4`, `tt3`), reinforces the **Countermove Table**, and boosts the **2-Ply Continuation History (`+32 * (ply + 1)`)**.
-  - The **first rejected token** (`actual != drafted` at divergence ply `d`) records `drafted` as `refuted_move` (Killer/Refutation Move), promotes `actual` as `best_move` in `tt5/tt4/tt3`, and penalizes the refuted continuation (`-48 * (ply + 1)`).
+- **Search Verification Feedback (`StockfishDrafter::observe`)**: On every subsequent `llama-server` forward pass, `StockfishDrafter` compares the sequence of tokens it drafted (`last_draft[0..d]`) against the actual tokens committed by Nemotron (`inp` delta):
+  - Every **accepted token** (`actual == drafted`) increments `wins` in the multi-horizon Zobrist Transposition Tables (`tt5`, `tt4`, `tt3`) and boosts `history` via the **Stockfish History Gravity formula (`h += bonus - h * |bonus| / 512`)**.
+  - Any **rejected token** (`actual != drafted`) records `drafted` as `refuted_move` (Killer/Refutation Move), promotes `actual` as `best_move` in `tt5/tt4/tt3`, and penalizes the refuted entry (`-128` to `-224`).
 
-### L2/L3 Cache Footprint (Zero L3 Cache Pollution)
-| `Stockfish-PVS` Component (`rc_stockfish.h`) | Entries | Size in RAM / Cache | Role in Speculative Search |
+### L2 Cache Footprint (Zero L3 Cache Pollution)
+| `StockfishDrafter` Component (`rc_stockfish.h`) | Entries | Size in RAM / Cache | Role in Speculative Search |
 | :--- | :---: | :---: | :--- |
-| **Zobrist Multi-Horizon Transposition Tables (`tt5`, `tt4`, `tt3`)** | $3 \times 8,192$ (`SF_TT_SIZE`) | **`384 KB`** | Exact 5-gram, 4-gram & 3-gram verification history (`best_move`, `refuted_move`, `wins`, `fails`, `eval_cert`) |
-| **Countermove Table (`countermove`)** | $65,536 \times 2$ (`16B/slot`) | **`1.00 MB`** | Maps `(prev_tok_1, prev_tok_0)` to the verified token that replaced a failed prediction |
-| **2-Ply Continuation History (`cont_hist`)** | $256 \times 256 \times 4\text{B}$ | **`256 KB`** | Dynamic $[-512, +512]$ butterfly history score across consecutive draft plies |
-| **Total `StockfishDrafter` Working Set** | — | **`1.64 MB` (`2.5%` of 64 MB L3)** | **100% L2/L3-resident (`4.4 µs/step`), zero DRAM bandwidth** |
+| **5-Gram Zobrist Transposition Table (`tt5`)** | $4,096 \times 16\text{B}$ | **`64 KB`** | Exact 5-gram verification history (`key32`, `best_move`, `refuted_move`, `history`, `wins`, `total`) |
+| **4-Gram Zobrist Transposition Table (`tt4`)** | $4,096 \times 16\text{B}$ | **`64 KB`** | 4-gram verification & Top-4 cascade disambiguation |
+| **3-Gram Zobrist Refutation Table (`tt3`)** | $4,096 \times 16\text{B}$ | **`64 KB`** | Immediate 3-gram refutation guard on single-hit in-context matches |
+| **Total `StockfishDrafter` Working Set** | $3 \times 4,096$ | **`192 KB` (`< 19%` of Core 0's 1 MB L2)** | **100% L2-resident (`< 3 µs/step`), zero L3 cache eviction** |
 
 ---
 
 ## 3. The 4 `RouteCrack` Techniques Unlocked by `Stockfish-PVS v2 (Sweet Spot, M=7)`
 
-Across 121 experiments on 5 models (`Nemotron-3.5-30B-A3B`, `Qwen3-30B-A3B`, `Qwen2.5-Coder-32B`, `DeepSeek-V2-Lite`, `GPT-2`), we cataloged **96 distinct draftless prediction techniques** (summarized in Section 4 below). Previously, several of the highest-ceiling techniques could not be activated in production because static predictors were correlated on errors or lacked an online refutation filter.
+Across 121 experiments on 5 models (`Nemotron-3.5-30B-A3B`, `Qwen3-30B-A3B`, `Qwen2.5-Coder-32B`, `DeepSeek-V2-Lite`, `GPT-2`), we cataloged **96 distinct draftless prediction techniques** (summarized in Section 5 below). Previously, several of the highest-ceiling techniques could not be activated in production because static predictors were correlated on errors or lacked an online refutation filter.
 
-Integrating `Stockfish-PVS` unlocked **4 major techniques** in [`speculative/cpp/ngram-map.cpp`](cpp/ngram-map.cpp):
+Integrating `StockfishDrafter` unlocked **4 major techniques** in [`speculative/cpp/ngram-map.cpp`](cpp/ngram-map.cpp):
 
 ### Breakthrough #1 — Technique #1: *Online Session Context Trie v2 Rescue* (Fixing the `k=1` Cascade Shadowing Bug)
 - **The Problem**: In `query_rc_nolock()`, the 8-level FNV-64 Hash Cascade (`hc_top4_k10..k1.bin`) was queried first in an `if (casc_tok >= 0)` block, while the Online Session Trie (`rc_trie_v2.h`) was placed in the `else if (trie_tok >= 0)` branch. Because `hc_top4_k1.bin` (static unigram/bigram table) covers **99.9%** of vocabulary contexts, `casc_tok >= 0` was true **99.9% of the time**—even when the cascade fell all the way down to `k=1..3` with low certainty (`out_cert < 84`) that subsequently failed the certainty gate! As a result, the standalone Online Session Trie fallback was unreachable dead code on 99.9% of steps.
-- **How `Stockfish-PVS` Unlocks It ([`ngram-map.cpp` L254-L280](cpp/ngram-map.cpp#L254-L280))**: Whenever the static cascade fails to reach the `d=0` certainty gate (`out_cert < 84`), we check if the Online Session Trie has a deep, repeated match (`trie_depth >= 4 && trie_obs >= 4 && trie_conf >= 0.90`) that is **either confirmed by the Stockfish Zobrist TT (`tt5`/`tt4`), backed by `trie_depth >= 5 && trie_obs >= 6 && trie_conf >= 0.93`, or corroborated by online PPM**, and is **not refuted** by `tt5`, `tt4`, or `tt3`.
+- **How `StockfishDrafter` Unlocks It ([`ngram-map.cpp` L374-L391](cpp/ngram-map.cpp#L374-L391))**: Whenever the static cascade fails to reach the `d=0` certainty gate (`out_cert < 84`), we check if the Online Session Trie has a deep, repeated match (`trie_depth >= 4 && trie_obs >= 4 && trie_conf >= 0.92`) that is **either confirmed by the Stockfish Zobrist TT (`tt5`/`tt4`), or backed by `trie_depth >= 6 && trie_obs >= 5 && t_agree >= 3`**, and is **not refuted** by `tt5`, `tt4`, or `tt3`.
 - **Measured Oracle Precision (`77,456` Nemotron tokens)**: Rescues **`832` tokens** that previously produced zero draft, with **`92.19%` accuracy (`767 / 832` accepted)**!
 
 ### Breakthrough #2 — Technique #2: *Top-4 Hash Cascade Disambiguation via Orthogonal Stockfish TT*
 - **The Problem**: All 8 offline cascade tables (`hc_top4_k10..k1.bin`, `26.7 MB`) store **4 ranked candidates (`ent.pred[0..3]`, `ent.conf[0..3]`)** per bucket. Across held-out corpora, Top-1 accuracy is `48.4%` while Top-4 accuracy is **`64.5%` (`+16.1%` "Prediction Gap")**. However, in our offline experiments (`#65 Disambiguator v1`, `#79 Disambiguator v2`), promoting `ent.pred[1..3]` using PPM or Trie alone failed (`+0.0%` net gain) because all static/corpus predictors were trained on the same token distribution and made correlated errors.
-- **How `Stockfish-PVS` Unlocks It ([`ngram-map.cpp` L176-L214](cpp/ngram-map.cpp#L176-L214))**: Stockfish's Zobrist Transposition Table (`tt5`, `tt4`) is an **orthogonal live-session signal** populated exclusively by Nemotron's own ground-truth verifications in the active conversation. When `ent.pred[0]` has been explicitly refuted in the current context (`tt5->refuted_move == pred[0]` or `tt4->refuted_move == pred[0]`) or has `casc_conf < 80`, we scan `ent.pred[1..3]` (`conf >= 20`): if a secondary candidate is **simultaneously** the verified `best_move` in Stockfish TT (`tt5 wins >= 3, fails == 0` or `tt4 wins >= 4, fails == 0`) **and** supported by Online Session Trie + PPM, it is promoted to primary candidate.
+- **How `StockfishDrafter` Unlocks It ([`ngram-map.cpp` L313-L334](cpp/ngram-map.cpp#L313-L334))**: Stockfish's Zobrist Transposition Table (`tt5`, `tt4`) is an **orthogonal live-session signal** populated exclusively by Nemotron's own ground-truth verifications in the active conversation. When `ent.pred[0]` has been explicitly refuted in the current context (`tt5->refuted_move == pred[0]` or `tt4->refuted_move == pred[0]`) or has `casc_conf < 80`, we scan `ent.pred[1..3]` (`conf >= 20`): if a secondary candidate is **simultaneously** the verified `best_move` in Stockfish TT (`tt5 wins >= 3` or `tt4 wins >= 4`) **and** supported by Online Session Trie + PPM, it is promoted to primary candidate.
 
-### Breakthrough #3 — Technique #5 & #89: *`RCMacroCodebook` 4-Token Chains (`macro_codebook.bin`)*
-- **The Problem**: [`speculative/cpp/rc_build_tables.cpp`](cpp/rc_build_tables.cpp) extracts **11,382 multi-token Nemotron sequences** (`k=2..6` context $\to$ `4` consecutive continuation tokens `[c0, c1, c2, c3]` with Laplace-smoothed sequence confidence $\ge 82\%$) into `macro_codebook.bin` (`819 KB`). Although `ngram-map.cpp` loaded `macro_codebook.bin` into `pred.macro` at startup, `pred.macro` was **never queried** because firing a 4-token macro blindly without per-step refutation tracking risked 4-token Mamba-2 rollbacks.
-- **How `Stockfish-PVS` Unlocks It ([`ngram-map.cpp` L306-L316, L570-L607](cpp/ngram-map.cpp#L570-L607))**: During Stage 2 drafting, when `pred.macro.lookup` matches at `k ∈ {6, 5}` with `conf >= 92` and its opening token `c0` matches the verified `d=0` move, `active_macro` is latched across plies `d = 1, 2, 3` (extending Stage 2 max draft from `3` to `4` tokens) as long as Stockfish Zobrist TT (`tt5/tt4/tt3`) has no refutation on each subsequent ply.
+### Breakthrough #3 — Technique #5 & #89: *`RCMacroCodebook` Multi-Token Chains (`macro_codebook.bin`)*
+- **The Problem**: [`speculative/cpp/rc_build_tables.cpp`](cpp/rc_build_tables.cpp) extracts **11,382 multi-token Nemotron sequences** into `macro_codebook.bin`. Although `ngram-map.cpp` loaded `macro_codebook.bin` into `pred.macro` at startup, `pred.macro` was **never queried** because firing a multi-token macro blindly without per-step refutation tracking risked multi-token Mamba-2 rollbacks.
+- **How `StockfishDrafter` Unlocks It ([`ngram-map.cpp` L646-L745](cpp/ngram-map.cpp#L646-L745))**: During Stage 2 drafting, when `pred.macro` matches at `k ∈ {6, 5}` and its opening token matches the verified `d=0` move, `active_macro` is latched across subsequent plies as long as Stockfish Zobrist TT (`tt5/tt4/tt3`) has no refutation on each subsequent ply.
 - **Measured Oracle Precision (`77,456` Nemotron tokens)**: Given a verified `c0` at `k >= 5`, conditional accuracy along the 4-token macro chain is **`91.81%` (`c1`: `852/928`) $\to$ `95.54%` (`c2`: `814/852`) $\to$ `96.44%` (`c3`: `785/814`)**!
 
 ### Breakthrough #4 — Technique #17 & #73: *Stockfish Singular Horizon Extension ($M=5 \to M=7$) & `true_consensus_hits` Fix*
 - **The Problem**: In `eval_match()` (`ngram-map.cpp`), we uncovered two subtle bugs that prevented extending the in-context draft horizon beyond `M=5`:
   1. When scanning the context for secondary occurrences of a suffix, `hits++` was incremented even when a secondary match had `k + 1 < best_k` and was never checked for continuation agreement!
   2. When a secondary match had `k >= best_k && agree > 0`, `consensus_len = agree` overwrote `consensus_len` instead of taking `std::min(consensus_len, agree)`.
-- **How `Stockfish-PVS` Unlocks It ([`ngram-map.cpp` L432-L545](cpp/ngram-map.cpp#L432-L545))**:
+- **How `StockfishDrafter` Unlocks It ([`ngram-map.cpp` L506-L643](cpp/ngram-map.cpp#L506-L643))**:
   1. We separated `true_consensus_hits` (incremented **only** when at least 2 distinct occurrences in the context agree on the continuation tokens) and computed `consensus_len = std::min(consensus_len, agree)` up to `7` tokens (`--spec-ngram-simple-size-m 7`, `batch = 8` tokens).
-  2. For normal matches, we preserve the conservative `base_m` (`1..5` tokens). However, when a **Singular Super-Match** occurs—either `(best_k >= 7 && true_consensus_hits >= 2 && consensus_len >= 6)` or `best_k >= 10` (a 10–12 token exact context match)—we activate **Stockfish Singular Horizon Extension** up to `max_m = 6..7` tokens (`consensus_len` for multi-hit consensus, or `6` for single-hit `best_k >= 10` / `7` for `best_k >= 12`), requiring every extended token $i \ge \text{base\_m}$ to be actively confirmed by `RouteCrack` (`rc_agree >= req_agree`) or Stockfish Zobrist TT (`tt5`/`tt4`) and unrefuted.
+  2. For normal matches, we preserve the conservative `base_m` (`1..5` tokens). However, when a **Singular Super-Match** occurs—either `(best_k >= 7 && true_consensus_hits >= 2)` or `best_k >= 10` (a 10–12 token exact context match)—we activate **Stockfish Singular Horizon Extension** up to `max_m = 6..7` tokens, requiring every extended token $i \ge \text{base\_m}$ to be actively confirmed by `RouteCrack` (`rc_agree >= req_agree`) or Stockfish Zobrist TT (`tt5`/`tt4`) and unrefuted.
 - **Measured Oracle Precision (`77,456` Nemotron tokens)**: On steps `6` and `7` gated by `true_consensus_hits >= 2` + Stockfish TT, marginal token acceptance is **`98.18% – 98.74%`**!
 
 ---

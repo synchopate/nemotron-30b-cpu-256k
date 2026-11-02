@@ -66,9 +66,9 @@ cmd_start() {
 
     if [[ "$(uname -s)" == "Darwin" ]]; then
         echo -e "${CYAN}[*] macOS detected — delegating to apple-silicon/ scripts...${RESET}"
-        "${REPO_ROOT}/apple-silicon/start_server.sh" &
+        "${REPO_ROOT}/apple-silicon/run-server.sh" > "${WORKSPACE_DIR}/logs/server.log" 2>&1 &
         echo $! > "$SERVER_PID_FILE"
-        "${REPO_ROOT}/apple-silicon/start_gateway.sh" &
+        "${REPO_ROOT}/apple-silicon/run-gateway.sh" > "${WORKSPACE_DIR}/logs/gateway.log" 2>&1 &
         echo $! > "$GATEWAY_PID_FILE"
         return 0
     fi

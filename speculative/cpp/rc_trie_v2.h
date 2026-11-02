@@ -41,7 +41,7 @@ struct RCTrie {
 
     RCTrieNode* alloc_node_ptr(int32_t token, RCTrieNode* parent) {
         if (used >= capacity) {
-            evict(capacity / 10);
+            return nullptr;
         }
         RCTrieNode* n = &pool[used++];
         n->token = token;
@@ -51,11 +51,10 @@ struct RCTrie {
         return n;
     }
 
-    void evict(uint32_t count) {
-        uint32_t evicted = 0;
+    void evict_leaf_pass(uint32_t count, uint32_t& evicted, bool require_low_freq) {
         for (uint32_t i = used - 1; i > 0 && evicted < count; i--) {
             RCTrieNode* n = &pool[i];
-            if (n->children.empty() && n->freq <= 1 && n->parent) {
+            if (n->children.empty() && (!require_low_freq || n->freq <= 1) && n->parent) {
                 n->parent->children.erase(n->token);
                 if (i < used - 1) {
                     RCTrieNode* last = &pool[used - 1];
@@ -73,15 +72,30 @@ struct RCTrie {
         }
     }
 
+    void evict(uint32_t count) {
+        if (used <= 1 || count == 0) return;
+        uint32_t evicted = 0;
+        evict_leaf_pass(count, evicted, true);
+        if (evicted == 0) {
+            // Fallback pass when all leaves have freq > 1 so capacity is always reclaimed
+            evict_leaf_pass(count, evicted, false);
+        }
+    }
+
     // Insert suffixes of length >= 2 (skip unigrams = noise)
     void insert(const int32_t* tokens, int len) {
         for (int start = 0; start < len - 1; start++) {  // -1: skip length-1 suffix
+            // Reclaim capacity BEFORE holding any node pointer into pool[]
+            if (used + (uint32_t)max_depth >= capacity) {
+                evict(std::max<uint32_t>(capacity / 10, (uint32_t)max_depth));
+            }
             int end = std::min(start + max_depth, len);
             RCTrieNode* cursor = root_ptr;
             for (int j = start; j < end; j++) {
                 auto it = cursor->children.find(tokens[j]);
                 if (it == cursor->children.end()) {
                     RCTrieNode* child = alloc_node_ptr(tokens[j], cursor);
+                    if (!child) break;
                     cursor->children[tokens[j]] = child;
                     child->freq = 1;
                     cursor = child;

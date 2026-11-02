@@ -5,8 +5,13 @@ Requires=nemotron-256k.service
 
 [Service]
 Type=simple
-User=root
+User=llama
+Group=llama
+Environment="GATEWAY_HOST=127.0.0.1" "GATEWAY_PORT=8787" "LLAMA_BACKEND_URL=http://127.0.0.1:8789"
 ExecStart=/usr/bin/python3 -u /opt/nemotron-256k/gateway/sse_gateway.py 8787
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
 Restart=always
 RestartSec=2
 

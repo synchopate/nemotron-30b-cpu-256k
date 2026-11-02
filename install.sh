@@ -39,8 +39,11 @@ USER_CORPUS_DIR=""
 SERVER_PORT="${SERVER_PORT:-8789}"
 GATEWAY_PORT="${GATEWAY_PORT:-8787}"
 
-HF_MODEL_URL="https://huggingface.co/bartowski/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF/resolve/main/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0.gguf"
+MODEL_REPO="ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF"
+MODEL_REV="8cd082170ed313484be1cf44f256a5caa2cfdad3"
 DEFAULT_MODEL_NAME="NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0.gguf"
+MODEL_SHA256="61f87e75974e4b535dcdf9aad056541a9514f1dfa4538b463b081d19b7a00e3c"
+HF_MODEL_URL="https://huggingface.co/${MODEL_REPO}/resolve/${MODEL_REV}/${DEFAULT_MODEL_NAME}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -91,38 +94,33 @@ for cmd in git cmake g++ curl python3; do
 done
 
 if [[ ${#MISSING_CMDS[@]} -gt 0 ]]; then
-    echo "[*] Missing build tools detected: ${MISSING_CMDS[*]}"
-    if command -v apt-get >/dev/null 2>&1; then
-        echo "[*] Installing build dependencies via apt-get..."
-        sudo apt-get update && sudo apt-get install -y build-essential cmake git curl python3 libomp-dev
-    elif command -v dnf >/dev/null 2>&1; then
-        echo "[*] Installing build dependencies via dnf..."
-        sudo dnf install -y gcc-c++ cmake git curl python3 libomp-devel
-    elif command -v pacman >/dev/null 2>&1; then
-        echo "[*] Installing build dependencies via pacman..."
-        sudo pacman -Sy --noconfirm base-devel cmake git curl python openmp
+    echo "[!] Missing build tools detected: ${MISSING_CMDS[*]}"
+    if [[ "${INSTALL_DEPS:-0}" == "1" ]]; then
+        if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y build-essential cmake git curl python3 libomp-dev
+        elif command -v dnf >/dev/null 2>&1; then
+            sudo dnf install -y gcc-c++ cmake git curl python3 libomp-devel
+        elif command -v pacman >/dev/null 2>&1; then
+            sudo pacman -Sy --noconfirm base-devel cmake git curl python openmp
+        fi
     else
-        echo "[!] Please install: ${MISSING_CMDS[*]} and re-run ./install.sh"
+        echo "    Install them with your package manager (or re-run with INSTALL_DEPS=1 ./install.sh):"
+        echo "      Debian/Ubuntu : sudo apt-get install -y build-essential cmake git curl python3 libomp-dev"
+        echo "      Fedora/RHEL   : sudo dnf install -y gcc-c++ cmake git curl python3 libomp-devel"
+        echo "      Arch Linux    : sudo pacman -S base-devel cmake git curl python openmp"
         exit 1
     fi
 fi
 
-# Configure 2MB Transparent HugePages on Linux if possible
+# Check 2MB Transparent HugePages on Linux (our patch uses madvise(MADV_HUGEPAGE), so [madvise] or [always] is sufficient)
 if [[ -f /sys/kernel/mm/transparent_hugepage/enabled ]]; then
     THP_STATE="$(cat /sys/kernel/mm/transparent_hugepage/enabled)"
-    if [[ "$THP_STATE" != *"[always]"* ]]; then
-        echo "[*] Enabling 2MB Transparent HugePages (THP) to eliminate TLB misses..."
-        if sudo -n true 2>/dev/null; then
-            echo always | sudo tee /sys/kernel/mm/transparent_hugepage/enabled >/dev/null || true
-            echo defer+madvise | sudo tee /sys/kernel/mm/transparent_hugepage/defrag >/dev/null || true
-            echo "[+] THP set to [always] / [defer+madvise]."
-        else
-            echo "[i] Tip: Run the following commands as root for +15-20% lower TLB overhead:"
-            echo "    echo always | sudo tee /sys/kernel/mm/transparent_hugepage/enabled"
-            echo "    echo defer+madvise | sudo tee /sys/kernel/mm/transparent_hugepage/defrag"
-        fi
+    if [[ "$THP_STATE" == *"[madvise]"* ]] || [[ "$THP_STATE" == *"[always]"* ]]; then
+        echo "[+] 2MB Transparent HugePages (THP) active: ${THP_STATE}"
     else
-        echo "[+] 2MB Transparent HugePages (THP) already set to [always]."
+        echo "[i] Tip: Enable madvise Transparent HugePages for lower TLB overhead:"
+        echo "    echo madvise | sudo tee /sys/kernel/mm/transparent_hugepage/enabled"
+        echo "    echo defer+madvise | sudo tee /sys/kernel/mm/transparent_hugepage/defrag"
     fi
 fi
 
@@ -164,15 +162,24 @@ fi
 if [[ -f "$MODEL_PATH" ]]; then
     echo "[+] Found existing GGUF model: $MODEL_PATH"
 elif [[ "$SKIP_MODEL" == "1" ]]; then
-    echo "[i] --skip-model specified. Skipping 17.1 GB download."
+    echo "[i] --skip-model specified. Skipping 18.9 GB download."
     echo "    Place your GGUF at: $MODEL_PATH"
 else
-    echo "[*] Downloading ${DEFAULT_MODEL_NAME} from Hugging Face (resumable)..."
-    echo "    URL:  ${HF_MODEL_URL}"
-    echo "    Dest: ${MODEL_PATH}"
-    curl -L -C - --progress-bar -o "${MODEL_PATH}.part" "$HF_MODEL_URL"
+    echo "[*] Downloading ${DEFAULT_MODEL_NAME} from Hugging Face (pinned revision ${MODEL_REV:0:12})..."
+    echo "    URL:    ${HF_MODEL_URL}"
+    echo "    SHA256: ${MODEL_SHA256}"
+    echo "    Dest:   ${MODEL_PATH}"
+    curl -fL -C - --progress-bar -o "${MODEL_PATH}.part" "$HF_MODEL_URL"
+    echo "[*] Verifying SHA-256 checksum..."
+    ACTUAL_SHA256="$(sha256sum "${MODEL_PATH}.part" | awk '{print $1}')"
+    if [[ "$ACTUAL_SHA256" != "$MODEL_SHA256" ]]; then
+        echo "[!] ERROR: SHA-256 mismatch for ${MODEL_PATH}.part!" >&2
+        echo "    Expected: $MODEL_SHA256" >&2
+        echo "    Got:      $ACTUAL_SHA256" >&2
+        exit 1
+    fi
     mv "${MODEL_PATH}.part" "$MODEL_PATH"
-    echo "[+] Model download complete: $MODEL_PATH"
+    echo "[+] Model download & SHA-256 verification complete: $MODEL_PATH"
 fi
 
 echo ""
@@ -203,12 +210,6 @@ if [[ -f "$MODEL_PATH" ]]; then
     echo "[*] Building 8-level FNV-64 Hash Cascade, 300 Hot Rules & Macro Codebook..."
     "${WORKSPACE_DIR}/bin/rc_build_tables" "$CORPUS_BIN" "${WORKSPACE_DIR}/routecrack"
     echo "[+] RouteCrack tables ready in ${WORKSPACE_DIR}/routecrack/"
-    if [[ -d "/opt/models/nemotron" && -w "/opt/models/nemotron" ]]; then
-        ln -sfn "${WORKSPACE_DIR}/routecrack" "/opt/models/nemotron/routecrack" 2>/dev/null || true
-    elif sudo -n true 2>/dev/null; then
-        sudo mkdir -p /opt/models/nemotron 2>/dev/null || true
-        sudo ln -sfn "${WORKSPACE_DIR}/routecrack" "/opt/models/nemotron/routecrack" 2>/dev/null || true
-    fi
 else
     echo "[i] GGUF model not downloaded yet — RouteCrack will use its zero-setup online Trie/PPM/Two-Zone engine until tables are generated."
 fi

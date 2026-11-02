@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-test_eakv_compression.py - Verification & Validation Suite for EAKV Engine
-Measures attention vector cosine similarity, reconstruction loss, and memory compression.
+test_eakv_compression.py — Standalone Simulation Test for eakv_quantizer.py
+===========================================================================
+NOTE: Runs offline synthetic cosine-similarity and compression simulations against
+the standalone `eakv_quantizer.py` prototype.
 """
 
 import math

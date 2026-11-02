@@ -5,5 +5,7 @@ start_server.sh
 start_gateway.sh
 *.gguf
 *.part
+*.bin
+*warmup*
 __pycache__/
 *.pyc

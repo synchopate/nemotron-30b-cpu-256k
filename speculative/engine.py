@@ -1,13 +1,14 @@
 """
-RouteCrack Engine — Speculative Decoding with C++ BFS Tree Builder
-
-Standalone engine: loads model (HuggingFace), uses our C++ predictor
-for tree drafting, verifies with custom attention mask.
-
-Usage:
-    from routecrack.engine import Engine
-    engine = Engine("Qwen/Qwen2.5-7B-Instruct")
-    text = engine.generate("Write a Python function...")
+RouteCrack Engine — Standalone Research Prototype (PyTorch / HuggingFace)
+=========================================================================
+NOTE: This file is an offline PyTorch research prototype from the initial
+RouteCrack design campaign (tested on Qwen2.5-7B-Instruct).
+The active production speculative engine for llama-server is implemented
+natively in C++ inside:
+  - speculative/cpp/ngram-map.cpp
+  - speculative/cpp/rc_stockfish.h
+  - speculative/cpp/rc_predictor.h
+  - speculative/cpp/rc_trie_v2.h
 """
 import torch
 import time

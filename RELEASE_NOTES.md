@@ -18,10 +18,9 @@ $$\text{WallGain} = A - 0.30 \times D = 0.70 \times A - 0.30 \times W_{\text{was
 
 During the `RouteCrack` research campaign (**96+ techniques** documented in **[`speculative/ROUTECRACK_TECHNIQUES.md`](speculative/ROUTECRACK_TECHNIQUES.md)**), several high-recall predictors could not be enabled in production because static predictors trained on the same corpus make *correlated errors* when confidence drops below `84%`.
 
-**`StockfishDrafter` (`speculative/cpp/rc_stockfish.h`)** solves this by maintaining a **`1.64 MB` L2/L3-resident (`2.5%` of 64 MB L3), zero-allocation Chess-Engine Search state** updated continuously on the live session stream:
-- **4-Way Bucketed Zobrist Transposition Tables (`tt5`, `tt4`, `tt3` = `384 KB`)** with 16-bit verification signatures (`sig16`), Top-2 candidate tracking (`tok1/cnt1`, `tok2/cnt2`), and **Stockfish age-based generational replacement**.
-- **Countermove Table (`1,024 KB`, `65,536 × 4`)** & **Continuation History Table (`256 KB`)** capturing immediate `(t_{-2}, t_{-1}) \to t_0$ and $t_{-1} \to t_0$ live session dynamics.
-- **Principal Variation Search (PVS) with Late Move Reductions (LMR)**: Searches the principal candidate at full horizon depth while applying LMR depth reductions and stronger certainty gates to secondary moves (`m > 0`).
+**`StockfishDrafter` (`speculative/cpp/rc_stockfish.h`) + `ngram-map.cpp`** solve this by maintaining a **`192 KB` L2-resident (`3 × 64 KB` Zobrist Transposition Tables `tt5`, `tt4`, `tt3`, `< 19%` of Core 0's 1 MB L2 cache on Zen 5), zero-allocation search state** updated continuously on the live session stream:
+- **Multi-Order Lockless Zobrist Transposition & Refutation Tables (`tt5`, `tt4`, `tt3` = `192 KB`)** with 32-bit verification keys (`key32`), verified `best_move`, explicit `refuted_move` tracking, and **Stockfish History Gravity (`[-512, +512]`)**.
+- **1-Ply Quiescence Lookahead & Multi-Branch Conflict Disambiguation (in `ngram-map.cpp`)**: Queries `StockfishDrafter::query()` at each rollout step $d=0..6$ (`M=7`) to resolve 1-ply horizon choices and disambiguate conflicting in-context suffix matches.
 
 #### The 4 `RouteCrack` Techniques Unlocked by `Stockfish-PVS v2`:
 1. **Technique #1 — Online Session Trie Rescue (`rc_trie_v2.h` + `Stockfish-PVS` Gate)**:
@@ -68,7 +67,7 @@ During the `RouteCrack` research campaign (**96+ techniques** documented in **[`
 
 Integrated community contributions from **Oleksandr Nazar (`@jarorosFork`)** (`commits 9509f4c, 93b6381, d740063 -> 6694b0b`):
 - **[`apple-silicon/`](apple-silicon/README.md) — Apple Silicon (`M4 Pro 24 GB` Unified Memory) Metal Stack**:
-  - Dedicated setup scripts ([`apple-silicon/setup.sh`](apple-silicon/setup.sh), [`apple-silicon/start_server.sh`](apple-silicon/start_server.sh), [`apple-silicon/start_gateway.sh`](apple-silicon/start_gateway.sh), [`apple-silicon/chat.py`](apple-silicon/chat.py), [`apple-silicon/bench_128k.py`](apple-silicon/bench_128k.py)) running `Nemotron-3.5-30B-A3B` at **`47–49 tok/s` decode** and **`256–549 tok/s` prefill** up to **128K context** (`384 MB` KV cache, `0` swap).
+  - Dedicated setup & benchmark scripts ([`apple-silicon/setup.sh`](apple-silicon/setup.sh), [`apple-silicon/run-server.sh`](apple-silicon/run-server.sh), [`apple-silicon/run-gateway.sh`](apple-silicon/run-gateway.sh), [`apple-silicon/bench.sh`](apple-silicon/bench.sh), [`apple-silicon/bench_spec.sh`](apple-silicon/bench_spec.sh), [`apple-silicon/bench_server.py`](apple-silicon/bench_server.py), [`apple-silicon/agent_loop_test.py`](apple-silicon/agent_loop_test.py)) running `Nemotron-3.5-30B-A3B` at **`47–49 tok/s` decode** and **`256–549 tok/s` prefill** up to **128K context** (`384 MB` KV cache, `0` swap).
 - **[`fedora/`](fedora/README.md) — Fedora 44 / AMD Ryzen 7 8745HS (`GEEKOM A8`, 8C/16T Zen 4, 64 GB DDR5)**:
   - All-in-one setup, server, gateway, and browser web chat UI ([`fedora/nemotron.sh`](fedora/nemotron.sh)).
 - **[`gateway/sse_gateway.py`](gateway/sse_gateway.py) — Tool-Call Resilience & Cross-Platform Portability**:

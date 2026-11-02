@@ -5,6 +5,7 @@ import json
 import re
 import shlex
 import shutil
+import struct
 import sys
 import time
 import threading
@@ -15,8 +16,16 @@ from collections import OrderedDict
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 UPSTREAM_BASE = os.environ.get("LLAMA_BACKEND_URL", os.environ.get("UPSTREAM_BASE", "http://127.0.0.1:8789"))
-GATEWAY_HOST = os.environ.get("GATEWAY_HOST", "0.0.0.0")
-GATEWAY_CORS_ORIGIN = os.environ.get("GATEWAY_CORS_ORIGIN", "*")
+GATEWAY_HOST = os.environ.get("GATEWAY_HOST", "127.0.0.1")
+GATEWAY_CORS_ORIGIN = os.environ.get("GATEWAY_CORS_ORIGIN", "http://127.0.0.1:8787")
+ALLOWED_UPSTREAM_PATHS = (
+    "/v1/messages",
+    "/v1/chat/completions",
+    "/v1/models",
+    "/v1/complete",
+    "/health",
+    "/tokenize",
+)
 _GATEWAY_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_GATEWAY_DIR)
 _KV_CACHE_DIR = os.path.join(_REPO_ROOT, "kv_cache")
@@ -804,26 +813,32 @@ def _build_modchip_telemetry_json() -> dict:
         "rc_enabled": 1,
         "rc_gates": "84/92/96",
     }
-    shm_path = "/dev/shm/llama_modchip.bin"
-    if os.path.exists(shm_path):
-        try:
-            with open(shm_path, "rb") as f:
-                buf = f.read(48)
-            if len(buf) >= 48:
-                vals = struct.unpack("<IIiiiiiiiiii", buf[:48])
-                if vals[0] == 0x4D434850:
-                    shm_info = {
-                        "active": True,
-                        "l3_window": vals[2],
-                        "attn_window": vals[3],
-                        "attn_sinks": vals[4],
-                        "swa_stride": vals[5],
-                        "rc_enabled": vals[7],
-                        "rc_gates": f"{vals[8]}/{vals[9]}/{vals[10]}",
-                        "moe_top_k": vals[11],
-                    }
-        except Exception:
-            pass
+    shm_candidates = []
+    xdg_dir = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if xdg_dir:
+        shm_candidates.append(os.path.join(xdg_dir, "llama_modchip.bin"))
+    shm_candidates.append("/dev/shm/llama_modchip.bin")
+    for shm_path in shm_candidates:
+        if os.path.exists(shm_path):
+            try:
+                with open(shm_path, "rb") as f:
+                    buf = f.read(48)
+                if len(buf) >= 48:
+                    vals = struct.unpack("<IIiiiiiiiiii", buf[:48])
+                    if vals[0] in (0x4D4F4443, 0x4D434850):
+                        shm_info = {
+                            "active": True,
+                            "l3_window": vals[2],
+                            "attn_window": vals[3],
+                            "attn_sinks": vals[4],
+                            "swa_stride": vals[5],
+                            "rc_enabled": vals[7],
+                            "rc_gates": f"{vals[8]}/{vals[9]}/{vals[10]}",
+                            "moe_top_k": vals[11],
+                        }
+                        break
+            except Exception:
+                pass
 
     slot_tokens = 0
     slot_state = "OFFLINE"
@@ -1570,12 +1585,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 except Exception:
                     master_system_prompt = "You are Claude Code, Anthropic's official CLI for Claude."
 
-                # Keep data["system"] 100% invariant (billing header + master_system_prompt) BEFORE <tools>
-                # so tokens 0..17968 NEVER diverge at token 832 regardless of working directory or CLAUDE.md!
-                unified_system = [
-                    {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.283.49b; cc_entrypoint=cli;"},
-                    {"type": "text", "text": master_system_prompt},
-                ]
+                # Keep data["system"] invariant BEFORE <tools> so Slot 0 prefix tokens never diverge.
+                # Preserve x-anthropic-billing-header ONLY when the incoming request came from Claude Code CLI.
+                raw_in_sys = json.dumps(data.get("system", ""))
+                unified_system = []
+                if "x-anthropic-billing-header" in raw_in_sys:
+                    m_bh = re.search(r"(x-anthropic-billing-header:[^\"\\]+)", raw_in_sys)
+                    bh_str = m_bh.group(1) if m_bh else "x-anthropic-billing-header: cc_version=2.1.283.49b; cc_entrypoint=cli;"
+                    unified_system.append({"type": "text", "text": bh_str})
+                unified_system.append({"type": "text", "text": master_system_prompt})
                 data["system"] = unified_system
 
                 # Place centralized directive + extracted MEMORY.md/CLAUDE.md immediately after </tools></IMPORTANT>
@@ -1586,12 +1604,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 if messages:
                     messages.insert(0, {"role": "system", "content": post_tools_system})
 
-                # RouteCrack-KV: Auto-capture bit-exact Claude Code base prefix
+                # RouteCrack-KV: Opt-in capture of Claude Code base prefix (CAPTURE_WARMUP_PAYLOAD=1, mode 0600)
                 _warmup_path = os.environ.get("WARMUP_PAYLOAD_PATH", os.path.join(_REPO_ROOT, "workspace", "cache", "claude_warmup_payload.json"))
-                if "system" in data and "tools" in data and len(data["tools"]) >= 40 and not os.path.exists(_warmup_path):
+                if (
+                    os.environ.get("CAPTURE_WARMUP_PAYLOAD") == "1"
+                    and "system" in data
+                    and "tools" in data
+                    and len(data["tools"]) >= 40
+                    and not os.path.exists(_warmup_path)
+                ):
                     try:
-                        os.makedirs(os.path.dirname(_warmup_path), exist_ok=True)
-                        with open(_warmup_path, "w") as _wf:
+                        os.makedirs(os.path.dirname(_warmup_path), mode=0o700, exist_ok=True)
+                        _wfd = os.open(_warmup_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                        with os.fdopen(_wfd, "w", encoding="utf-8") as _wf:
                             json.dump({
                                 "model": "nemotron-30b",
                                 "system": data["system"],
@@ -1600,7 +1625,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                 "messages": [{"role": "user", "content": "ping"}],
                                 "max_tokens": 1
                             }, _wf)
-                        print(f"[Gateway] [HARP-Prewarm] Captured raw Claude Code base payload to {_warmup_path}", flush=True)
+                        print(f"[Gateway] [HARP-Prewarm] Captured raw Claude Code base payload to {_warmup_path} (mode 0600)", flush=True)
                     except Exception as _werr:
                         print(f"[Gateway] [HARP-Prewarm] Notice: {_werr}", flush=True)
 
@@ -1683,6 +1708,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self._forward_request("POST", body_bytes, active_mode=active_mode, target_upstream=target_upstream, harp_meta=harp_meta, tool_schemas=tool_schemas)
 
     def _forward_request(self, method, body_bytes=None, active_mode="med", target_upstream=UPSTREAM_BASE, harp_meta=None, tool_schemas=None):
+        clean_path = self.path.split("?", 1)[0]
+        if not any(clean_path == p or clean_path.startswith(p + "/") for p in ALLOWED_UPSTREAM_PATHS):
+            self.send_error(403, f"Path '{clean_path}' is not in the gateway allow-list.")
+            return
         url = target_upstream + self.path
         req_headers = {}
         for k, v in self.headers.items():

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-dram_kv_profiler.py - Empirical & Analytical DRAM KV Cache Profiler for MoE on AMD Ryzen Zen 5
-Evaluates memory bandwidth saturation, KV scaling, and the 10.8k crossover point.
+dram_kv_profiler.py — Standalone Analytical & Microbenchmark DRAM KV Cache Profiler
+===================================================================================
+NOTE: Standalone analytical model & NumPy sequential-read microbenchmark for evaluating
+48-layer Pure GQA vs 6-layer Hybrid SSM KV bandwidth scaling across context lengths.
 """
 
 import time

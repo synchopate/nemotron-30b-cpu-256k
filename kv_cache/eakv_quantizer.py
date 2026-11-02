@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-eakv_quantizer.py - Entropy-Guided Asymmetric KV Quantization & Virtual Positional Indexing Engine
-Phase 3 of the RouteCrack-KV Zero-FLOP Optimization Suite.
-
-Implements:
-1. RouteCrack 6-Level FNV-64 Entropy Classifier with 2-Token Lookahead Guard Band
-2. Dual-Format Cell Allocation: Q4_0 (4-bit) for low-entropy syntactic clutter, FP16 for semantic anchors
-3. Virtual Positional Indexing (VPI): Strict preservation of continuous RoPE phase angles R_{theta, m}
-4. Vectorized Dot-Product Attention Verification & Reconstruction Loss Profiler
+eakv_quantizer.py — Standalone Analytical Simulator for Entropy-Guided Asymmetric KV Quantization
+=================================================================================================
+NOTE: This file is an offline analytical simulator used to evaluate per-cell Q8_0/Q4_0/FP16
+quantization error prior to production deployment.
+In the active production llama-server path, asymmetric KV quantization is applied natively via
+llama.cpp's `--cache-type-k q8_0 --cache-type-v q4_0` flags combined with the `_MM_HINT_NTA`
+L3 isolation patch in `patches/zen5-nemotron-256k-optimizations.patch`.
 """
 
 import math

@@ -1,4 +1,11 @@
 #pragma once
+/*
+ * llama_kv_cell_rc.h — Standalone Research Prototype Header for Per-Cell Asymmetric KV Layout
+ *
+ * NOTE: This header is a standalone C++ research prototype exploring per-token mixed FP16/Q4_0
+ * KV cells with AVX-512 dequantization. It is not included by the production llama.cpp patch
+ * (which instead uses native `--cache-type-k q8_0 --cache-type-v q4_0` + `_MM_HINT_NTA` L3 isolation).
+ */
 
 #include <cstdint>
 #include <cstddef>

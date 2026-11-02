@@ -13,14 +13,24 @@ if [[ ! -d "$LLAMA_DIR" ]]; then
     echo "[*] Cloning llama.cpp into $LLAMA_DIR..."
     git clone https://github.com/ggml-org/llama.cpp.git "$LLAMA_DIR"
     git -C "$LLAMA_DIR" checkout "$LLAMA_COMMIT"
+else
+    CUR_COMMIT="$(git -C "$LLAMA_DIR" rev-parse HEAD 2>/dev/null || true)"
+    if [[ "$CUR_COMMIT" != "$LLAMA_COMMIT" ]]; then
+        echo "[*] Existing $LLAMA_DIR is at ${CUR_COMMIT:-unknown}; checking out pinned commit $LLAMA_COMMIT..."
+        git -C "$LLAMA_DIR" fetch --depth=1 origin "$LLAMA_COMMIT"
+        git -C "$LLAMA_DIR" checkout "$LLAMA_COMMIT"
+    fi
 fi
 
 echo "[*] Applying 256K Hybrid SWA + Bidirectional L3 NTA + 2MB HugePages patch..."
-if git -C "$LLAMA_DIR" apply --check "$PATCH_FILE" 2>/dev/null; then
+if git -C "$LLAMA_DIR" apply --reverse --check "$PATCH_FILE" 2>/dev/null; then
+    echo "[i] Patch already applied cleanly in $LLAMA_DIR."
+elif git -C "$LLAMA_DIR" apply --check "$PATCH_FILE"; then
     git -C "$LLAMA_DIR" apply "$PATCH_FILE"
     echo "[+] Kernel & KV patches applied cleanly."
 else
-    echo "[i] Patch already applied or working tree modified."
+    echo "[!] ERROR: Failed to apply $PATCH_FILE onto $LLAMA_DIR (expected commit $LLAMA_COMMIT)." >&2
+    exit 1
 fi
 
 echo "[*] Installing native RouteCrack + Stockfish-PVS C++ speculative engine into $LLAMA_DIR/common/..."

@@ -336,9 +336,17 @@ struct RCHashTable {
 
         // Read first 8 bytes to detect format
         uint32_t header[4] = {0};
-        fread(header, 4, 2, f);
+        if (fread(header, 4, 2, f) != 2) {
+            fclose(f);
+            return false;
+        }
         n_entries = header[0];
         ctx_len = (int)header[1];
+        if (n_entries == 0 || n_entries > (1u << 24) || ctx_len <= 0 || ctx_len > 64) {
+            n_entries = 0;
+            fclose(f);
+            return false;
+        }
 
         // Detect v2 format: 16-byte header with n_candidates field
         // v1: header=8 bytes, entry=16 bytes → filesize = 8 + n*16
@@ -351,27 +359,47 @@ struct RCHashTable {
         if (filesz == 16L + (long)n_entries * 40L) {
             // v2 format: read remaining header
             fseek(f, 8, SEEK_SET);
-            fread(header + 2, 4, 2, f);
+            if (fread(header + 2, 4, 2, f) != 2) {
+                n_entries = 0;
+                fclose(f);
+                return false;
+            }
             n_cands = (int)header[2];
+            if (n_cands <= 0 || n_cands > 16) {
+                n_entries = 0;
+                fclose(f);
+                return false;
+            }
             is_v2 = true;
-        } else {
+        } else if (filesz == 8L + (long)n_entries * 16L) {
             // v1 format: seek past 8-byte header
             fseek(f, 8, SEEK_SET);
+        } else {
+            n_entries = 0;
+            fclose(f);
+            return false;
         }
 
         entries = (RCHashEntry*)calloc(n_entries, sizeof(RCHashEntry));
+        if (!entries) {
+            n_entries = 0;
+            fclose(f);
+            return false;
+        }
 
         if (is_v2) {
             // v2: hash + pred[4] + conf[4]
             for (uint32_t i = 0; i < n_entries; i++) {
-                fread(&entries[i].hash, 8, 1, f);
+                if (fread(&entries[i].hash, 8, 1, f) != 1) break;
                 int nc = std::min(n_cands, (int)RC_CASCADE_TOPK);
                 for (int j = 0; j < n_cands; j++) {
-                    int32_t p; fread(&p, 4, 1, f);
+                    int32_t p = -1;
+                    if (fread(&p, 4, 1, f) != 1) break;
                     if (j < RC_CASCADE_TOPK) entries[i].pred[j] = p;
                 }
                 for (int j = 0; j < n_cands; j++) {
-                    int32_t c; fread(&c, 4, 1, f);
+                    int32_t c = 0;
+                    if (fread(&c, 4, 1, f) != 1) break;
                     if (j < RC_CASCADE_TOPK) entries[i].conf[j] = c;
                 }
                 entries[i].n_preds = 0;
@@ -382,10 +410,8 @@ struct RCHashTable {
         } else {
             // v1: hash + pred + conf (single candidate)
             for (uint32_t i = 0; i < n_entries; i++) {
-                uint64_t h; uint32_t p, c;
-                fread(&h, 8, 1, f);
-                fread(&p, 4, 1, f);
-                fread(&c, 4, 1, f);
+                uint64_t h = 0; uint32_t p = 0, c = 0;
+                if (fread(&h, 8, 1, f) != 1 || fread(&p, 4, 1, f) != 1 || fread(&c, 4, 1, f) != 1) break;
                 entries[i].hash = h;
                 entries[i].pred[0] = (int32_t)p;
                 entries[i].conf[0] = (int32_t)c;
@@ -695,23 +721,38 @@ struct RCMacroCodebook {
     bool load(const char* path) {
         FILE* f = fopen(path, "rb");
         if (!f) return false;
-        uint32_t header[2];
-        fread(header, 4, 2, f);
+        uint32_t header[2] = {0};
+        if (fread(header, 4, 2, f) != 2) {
+            fclose(f);
+            return false;
+        }
         n_entries = header[0];
-        max_cont = (int)header[1];
-        if (max_cont > RC_MACRO_MAX_CONT) max_cont = RC_MACRO_MAX_CONT;
+        int file_max_cont = (int)header[1];
+        if (n_entries == 0 || n_entries > (1u << 22) || file_max_cont <= 0 || file_max_cont > 64) {
+            n_entries = 0;
+            fclose(f);
+            return false;
+        }
+        max_cont = std::min(file_max_cont, (int)RC_MACRO_MAX_CONT);
 
         entries = (RCMacroEntry*)calloc(n_entries, sizeof(RCMacroEntry));
+        if (!entries) {
+            n_entries = 0;
+            fclose(f);
+            return false;
+        }
         for (uint32_t i = 0; i < n_entries; i++) {
-            fread(&entries[i].hash, 8, 1, f);
-            fread(&entries[i].cont_len, 2, 1, f);
-            fread(&entries[i].conf, 2, 1, f);
-            int32_t buf[RC_MACRO_MAX_CONT] = {0};
-            fread(buf, 4, max_cont, f);
-            int cl = std::min((int)entries[i].cont_len, RC_MACRO_MAX_CONT);
-            for (int j = 0; j < cl; j++)
-                entries[i].continuation[j] = buf[j];
-            entries[i].cont_len = cl;
+            if (fread(&entries[i].hash, 8, 1, f) != 1 ||
+                fread(&entries[i].cont_len, 2, 1, f) != 1 ||
+                fread(&entries[i].conf, 2, 1, f) != 1) {
+                break;
+            }
+            for (int j = 0; j < file_max_cont; j++) {
+                int32_t tok = 0;
+                if (fread(&tok, 4, 1, f) != 1) break;
+                if (j < RC_MACRO_MAX_CONT) entries[i].continuation[j] = tok;
+            }
+            entries[i].cont_len = (uint16_t)std::min((int)entries[i].cont_len, (int)RC_MACRO_MAX_CONT);
         }
         fclose(f);
         printf("[MACRO] Loaded %u entries (max_cont=%d) from %s\n",
@@ -825,11 +866,30 @@ struct RCHotRules {
     bool load(const char* path) {
         FILE* f = fopen(path, "rb");
         if (!f) return false;
-        uint32_t header[4];
-        fread(header, 4, 4, f);
+        uint32_t header[4] = {0};
+        if (fread(header, 4, 4, f) != 4) {
+            fclose(f);
+            return false;
+        }
         n_rules = header[0];
-        rules = (RCHotRule*)malloc(n_rules * sizeof(RCHotRule));
-        fread(rules, sizeof(RCHotRule), n_rules, f);
+        if (n_rules == 0 || n_rules > (1u << 22)) {
+            n_rules = 0;
+            fclose(f);
+            return false;
+        }
+        rules = (RCHotRule*)calloc(n_rules, sizeof(RCHotRule));
+        if (!rules) {
+            n_rules = 0;
+            fclose(f);
+            return false;
+        }
+        if (fread(rules, sizeof(RCHotRule), n_rules, f) != n_rules) {
+            free(rules);
+            rules = nullptr;
+            n_rules = 0;
+            fclose(f);
+            return false;
+        }
         fclose(f);
         return true;
     }
