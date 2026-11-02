@@ -144,9 +144,10 @@ git clone https://github.com/ggerganov/llama.cpp.git
 cd llama.cpp
 git apply /path/to/nemotron-30b-cpu-256k/patches/zen5-nemotron-256k-optimizations.patch
 
-# Integrate the native RouteCrack C++ predictor into common/
+# Integrate the native RouteCrack + Stockfish-PVS C++ predictor into common/
 cp /path/to/nemotron-30b-cpu-256k/speculative/cpp/rc_predictor.h common/
 cp /path/to/nemotron-30b-cpu-256k/speculative/cpp/rc_trie_v2.h common/
+cp /path/to/nemotron-30b-cpu-256k/speculative/cpp/rc_stockfish.h common/
 cp /path/to/nemotron-30b-cpu-256k/speculative/cpp/ngram-map.cpp common/
 
 cmake -B build \

@@ -1,5 +1,6 @@
 #include "ngram-map.h"
 #include "rc_predictor.h"
+#include "rc_stockfish.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -76,6 +77,7 @@ struct RouteCrackNemotronEngine {
     std::mutex mtx;
     bool initialized = false;
     RCPredictor pred;
+    StockfishDrafter sf;
 
     // Track last context size to only feed newly added tokens incrementally
     size_t last_inp_size = 0;
@@ -85,11 +87,9 @@ struct RouteCrackNemotronEngine {
         initialized = true;
 
         pred.init();
+        sf.init();
 
         const char * base_dir = std::getenv("RC_TABLES_DIR");
-        if (!base_dir || !base_dir[0]) {
-            base_dir = std::getenv("VEX_RC_DIR");
-        }
         if (!base_dir || !base_dir[0]) {
             base_dir = "./workspace/routecrack";
         }
@@ -112,7 +112,7 @@ struct RouteCrackNemotronEngine {
             pred.macro.load(path);
         }
 
-        // Pre-warm online Trie + PPM + Skipgram with recent Nemotron warm corpus (80K tokens)
+        // Pre-warm online Trie + PPM + Skipgram + Stockfish 192KB L2 Zobrist TT with recent Nemotron warm corpus (80K tokens)
         {
             char path[512];
             std::snprintf(path, sizeof(path), "%s/corpus_nemotron_warm.bin", base_dir);
@@ -127,6 +127,7 @@ struct RouteCrackNemotronEngine {
                 if (std::fread(buf.data(), 4, warm_n, f) == (size_t)warm_n) {
                     for (long j = 12; j < warm_n; ++j) {
                         learn_incremental_nolock(&buf[j - 11], 12);
+                        sf.observe(&buf[j - 11], 11, buf[j], -1);
                     }
                 }
                 std::fclose(f);
@@ -134,7 +135,7 @@ struct RouteCrackNemotronEngine {
         }
 
         std::fprintf(stderr,
-            "[RouteCrack-Nemotron] Initialized: %d cascade tables, %u hot rules, %u macro entries, %u warm trie nodes\n",
+            "[RouteCrack+Stockfish-PVS] Initialized: %d cascade tables, %u hot rules, %u macro entries, %u warm trie nodes, 192KB L2 Zobrist TT\n",
             pred.n_cascade, pred.hot_rules.n_rules, pred.macro.n_entries, pred.trie.used);
     }
 
@@ -229,7 +230,8 @@ struct RouteCrackNemotronEngine {
     // or verify an in-context candidate token (verify_cand >= 0).
     inline void query_rc_nolock(
         const int32_t * ctx_ptr, int ctx_len,
-        int32_t & out_tok, int & out_cert, int32_t verify_cand = -1) {
+        int32_t & out_tok, int & out_cert, int32_t verify_cand = -1,
+        int * out_casc_k = nullptr, int * out_agree = nullptr) {
 
         int32_t casc_tok = -1, casc_conf = 0, casc_k = 0;
         bool cand_in_casc = false;
@@ -281,6 +283,8 @@ struct RouteCrackNemotronEngine {
             }
         }
 
+        if (out_casc_k) *out_casc_k = casc_k;
+
         if (verify_cand >= 0) {
             int agree = 0;
             if (casc_tok == verify_cand || cand_in_casc) agree++;
@@ -290,11 +294,13 @@ struct RouteCrackNemotronEngine {
             if (hot_tok == verify_cand) agree++;
             out_tok  = verify_cand;
             out_cert = agree; // number of RC predictors backing the in-context candidate
+            if (out_agree) *out_agree = agree;
             return;
         }
 
         out_tok  = -1;
         out_cert = 0;
+        if (out_agree) *out_agree = 0;
         if (casc_tok >= 0) {
             int agree = 1;
             if (trie_tok == casc_tok && trie_depth >= 2) agree++;
@@ -304,12 +310,15 @@ struct RouteCrackNemotronEngine {
             out_cert = casc_conf + (casc_k >= 6 ? 4 : 0) + (agree >= 3 ? 6 : (agree == 2 ? 3 : 0));
             if (casc_k == 1 && casc_conf < 90) out_cert = 0;
             out_tok = casc_tok;
+            if (out_agree) *out_agree = agree;
         } else if (trie_tok >= 0 && trie_depth >= 4 && trie_obs >= 3 && trie_conf >= 0.88f) {
             out_tok  = trie_tok;
             out_cert = (int)(trie_conf * 100.0f);
+            if (out_agree) *out_agree = 1 + (ppm_tok == trie_tok ? 1 : 0) + (skip_tok == trie_tok ? 1 : 0);
         } else if (hot_tok >= 0 && hot_conf >= 90 && (ppm_tok == hot_tok || skip_tok == hot_tok)) {
             out_tok  = hot_tok;
             out_cert = hot_conf;
+            if (out_agree) *out_agree = 2;
         }
     }
 };
@@ -334,7 +343,7 @@ static RCPreheater g_rc_preheater;
 
 // ============================================================================
 // common_ngram_simple_draft:
-// Full RouteCrack + Two-Zone Context-Aware Speculative Drafting
+// Full RouteCrack + Stockfish-PVS (192KB L2 Zobrist TT + Quiescence Lookahead)
 // ============================================================================
 llama_tokens common_ngram_simple_draft(
     const common_ngram_simple_config & config,
@@ -388,13 +397,16 @@ llama_tokens common_ngram_simple_draft(
     }
     tail_win[win_n - 1] = (int32_t)sampled;
 
-    // Incrementally feed newly accepted/sampled tokens to online learners
+    // Incrementally feed newly accepted/sampled tokens to online learners + Stockfish Zobrist TT
     if (inp_size != rc.last_inp_size) {
         size_t delta = (inp_size > rc.last_inp_size && inp_size - rc.last_inp_size <= 8)
                        ? (inp_size - rc.last_inp_size) : 1;
-        for (size_t d = delta; d >= 1; --d) {
+        int step_idx = 0;
+        for (size_t d = delta; d >= 1; --d, ++step_idx) {
+            int32_t d_tok = (step_idx < rc.sf.last_draft_len) ? rc.sf.last_draft[step_idx] : -1;
             if (d == 1) {
                 rc.learn_incremental_nolock(tail_win, win_n);
+                rc.sf.observe(tail_win, win_n - 1, tail_win[win_n - 1], d_tok);
             } else if (inp_size + 1 - d >= 12) {
                 int32_t hist_win[12];
                 size_t end_pos = inp_size + 1 - d;
@@ -402,6 +414,7 @@ llama_tokens common_ngram_simple_draft(
                     hist_win[i] = (int32_t)inp[end_pos - 12 + i];
                 }
                 rc.learn_incremental_nolock(hist_win, 12);
+                rc.sf.observe(hist_win, 11, hist_win[11], d_tok);
             }
         }
         rc.last_inp_size = inp_size;
@@ -409,6 +422,7 @@ llama_tokens common_ngram_simple_draft(
 
     // ------------------------------------------------------------------------
     // Stage 1: In-Context Suffix Scan (Hot Zone 16384 + Prefix Zone 24576)
+    //          + Stockfish Multi-Branch Conflict Disambiguation
     // ------------------------------------------------------------------------
     const size_t hot_start = (inp_size > 16384) ? (inp_size - 16384) : 3;
     const int32_t p0 = (int32_t)sampled;
@@ -416,11 +430,11 @@ llama_tokens common_ngram_simple_draft(
     const int32_t p2 = (int32_t)inp[inp_size - 2];
 
     size_t best_j = 0, best_k = 0, hits = 0, consensus_len = 5;
+    size_t second_j = 0, second_k = 0;
 
     // Helper lambda to check a match ending at inp[j] == p0, inp[j-1] == p1, inp[j-2] == p2
     auto eval_match = [&](size_t j, bool is_hot_zone) {
         size_t k = 3;
-        // At current end, token at offset 0 is `sampled`, offset m>=1 is `inp[inp_size - m]`
         while (k < 12 && j >= k && inp_size >= k && inp[j - k] == inp[inp_size - k]) {
             k++;
         }
@@ -444,6 +458,10 @@ llama_tokens common_ngram_simple_draft(
                 best_k = k;
                 consensus_len = agree;
             } else if (k + 1 >= best_k) {
+                if (agree == 0 && second_j == 0) {
+                    second_j = j;
+                    second_k = k;
+                }
                 consensus_len = std::min(consensus_len, agree);
             }
         }
@@ -472,6 +490,26 @@ llama_tokens common_ngram_simple_draft(
 
     int cur_win_len = win_n;
 
+    // Stockfish Multi-Branch Disambiguation when two context matches conflict (consensus_len == 0)
+    if (best_j > 0 && consensus_len == 0 && second_j > 0 && best_j + 1 < inp_size && second_j + 1 < inp_size) {
+        int32_t c1 = (int32_t)inp[best_j + 1];
+        int32_t c2 = (int32_t)inp[second_j + 1];
+        int32_t dummy_t = -1;
+        int agree1 = 0, agree2 = 0;
+        rc.query_rc_nolock(tail_win, cur_win_len, dummy_t, agree1, c1);
+        rc.query_rc_nolock(tail_win, cur_win_len, dummy_t, agree2, c2);
+        const SFTTBucket * b4 = rc.sf.probe4(tail_win, cur_win_len);
+        bool c1_tt = (b4 && b4->best_move == c1 && b4->wins >= 2);
+        bool c2_tt = (b4 && b4->best_move == c2 && b4->wins >= 2);
+        if (agree1 >= 3 && agree2 == 0 && c1_tt) {
+            consensus_len = 1;
+        } else if (agree2 >= 3 && agree1 == 0 && c2_tt) {
+            best_j = second_j;
+            best_k = second_k;
+            consensus_len = 1;
+        }
+    }
+
     if (best_j > 0 && consensus_len > 0) {
         size_t max_m = 0;
         if (best_k >= 8)      max_m = 5;
@@ -483,13 +521,22 @@ llama_tokens common_ngram_simple_draft(
 
         for (size_t i = 0; i < max_m && best_j + 1 + i < inp_size; ++i) {
             int32_t cand = (int32_t)inp[best_j + 1 + i];
-            // If best_k <= 5 and hits == 1, require RouteCrack backing to avoid Mamba-2 rollback
+            // Stockfish 3-gram Zobrist Refutation Guard on single-hit matches
+            const SFTTBucket * b3 = rc.sf.probe3(tail_win, cur_win_len);
+            if (b3 && b3->refuted_move == cand && b3->best_move != cand && b3->history <= -64 && best_k <= 5 && hits == 1) {
+                break;
+            }
+            // If best_k <= 5 and hits == 1, require RouteCrack or Zobrist TT backing to avoid Mamba-2 rollback
             if (hits == 1 && best_k <= 5) {
                 int32_t rc_t = -1;
                 int rc_agree = 0;
                 rc.query_rc_nolock(tail_win, cur_win_len, rc_t, rc_agree, cand);
-                if (best_k == 4 && i == 0 && rc_agree == 0) break;
-                if (i >= 1 && rc_agree == 0) break;
+                const SFTTBucket * b5 = rc.sf.probe5(tail_win, cur_win_len);
+                const SFTTBucket * b4 = rc.sf.probe4(tail_win, cur_win_len);
+                bool tt_backed = (b5 && b5->best_move == cand && b5->wins >= 2) ||
+                                 (b4 && b4->best_move == cand && b4->wins >= 3);
+                if (best_k == 4 && i == 0 && rc_agree == 0 && !tt_backed) break;
+                if (i >= 1 && rc_agree == 0 && !tt_backed) break;
             }
             draft.push_back((llama_token)cand);
             tail_win[cur_win_len++] = cand;
@@ -497,20 +544,83 @@ llama_tokens common_ngram_simple_draft(
     }
 
     // ------------------------------------------------------------------------
-    // Stage 2: Extend or Generate with RouteCrack High-Certainty Predictor
+    // Stage 2: Stockfish PVS + Multi-Order Zobrist TT + 1-Ply Quiescence Lookahead
     // ------------------------------------------------------------------------
     const int max_rc_draft = std::min<int>((int)size_mgram, 3);
     for (int d = (int)draft.size(); d < max_rc_draft; ++d) {
         int32_t chosen = -1;
-        int cert = 0;
-        rc.query_rc_nolock(tail_win, cur_win_len, chosen, cert, -1);
+        int cert = 0, casc_k = 0, agree = 0;
+        rc.query_rc_nolock(tail_win, cur_win_len, chosen, cert, -1, &casc_k, &agree);
+
+        const SFTTBucket * b5 = rc.sf.probe5(tail_win, cur_win_len);
+        const SFTTBucket * b4 = rc.sf.probe4(tail_win, cur_win_len);
+        const SFTTBucket * b3 = rc.sf.probe3(tail_win, cur_win_len);
+
+        // 1. Zobrist 5-gram & 4-gram Exact Session TT (Killer Move & Refutation)
+        if (b5) {
+            if (chosen >= 0 && b5->refuted_move == chosen && b5->best_move != chosen && b5->history < 0) {
+                if (b5->wins >= 3 && b5->history >= 128) {
+                    chosen = b5->best_move;
+                    cert = 88 + std::min<int>(8, b5->wins);
+                } else {
+                    cert -= 12;
+                }
+            } else if (chosen == b5->best_move && b5->wins >= 2) {
+                cert += 4;
+            } else if (chosen < 0 && b5->best_move >= 0 && b5->wins >= 3 && b5->history >= 160) {
+                int32_t kt = -1; int k_agree = 0;
+                rc.query_rc_nolock(tail_win, cur_win_len, kt, k_agree, b5->best_move);
+                if (k_agree >= 1) {
+                    chosen = b5->best_move;
+                    cert = 86 + std::min<int>(8, b5->wins);
+                }
+            }
+        } else if (b4) {
+            if (chosen >= 0 && b4->refuted_move == chosen && b4->best_move != chosen && b4->history <= -64) {
+                cert -= 10;
+            } else if (chosen == b4->best_move && b4->wins >= 3 && b4->history >= 160) {
+                cert += 4;
+            } else if (chosen < 0 && b4->best_move >= 0 && b4->wins >= 4 && b4->history >= 200) {
+                int32_t kt = -1; int k_agree = 0;
+                rc.query_rc_nolock(tail_win, cur_win_len, kt, k_agree, b4->best_move);
+                if (k_agree >= 2) {
+                    chosen = b4->best_move;
+                    cert = 86;
+                }
+            }
+        }
+        if (b3 && chosen >= 0 && casc_k <= 3) {
+            if (b3->refuted_move == chosen && b3->best_move != chosen && b3->history <= -64) {
+                cert -= 10;
+            } else if (b3->best_move == chosen && b3->wins >= 3 && b3->history >= 192) {
+                cert += 3;
+            }
+        }
+
+        // 2. Stockfish 1-Ply Quiescence Lookahead (resolve 1-ply Horizon Effect)
         const int min_req = (d == 0) ? cert_d0 : (d == 1 ? cert_d1 : cert_d2);
+        if (chosen >= 0 && cert >= min_req - 2 && cert < min_req) {
+            tail_win[cur_win_len] = chosen;
+            int32_t next_tok = -1; int next_cert = 0, next_k = 0, next_agree = 0;
+            rc.query_rc_nolock(tail_win, cur_win_len + 1, next_tok, next_cert, -1, &next_k, &next_agree);
+            const SFTTBucket * nb5 = rc.sf.probe5(tail_win, cur_win_len + 1);
+            if (next_tok >= 0 && next_k >= 6 && next_cert >= 95 && next_agree >= 3 &&
+                nb5 && nb5->best_move == next_tok && nb5->wins >= 2) {
+                cert = min_req;
+            }
+        }
+
         if (chosen >= 0 && cert >= min_req) {
             draft.push_back((llama_token)chosen);
             tail_win[cur_win_len++] = chosen;
         } else {
             break;
         }
+    }
+
+    rc.sf.last_draft_len = std::min<int>((int)draft.size(), 8);
+    for (int i = 0; i < rc.sf.last_draft_len; ++i) {
+        rc.sf.last_draft[i] = (int32_t)draft[i];
     }
 
     return draft;

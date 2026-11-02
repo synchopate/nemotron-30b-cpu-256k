@@ -23,9 +23,10 @@ else
     echo "[i] Patch already applied or working tree modified."
 fi
 
-echo "[*] Installing native RouteCrack C++ speculative engine into $LLAMA_DIR/common/..."
+echo "[*] Installing native RouteCrack + Stockfish-PVS C++ speculative engine into $LLAMA_DIR/common/..."
 cp -f "${SPEC_CPP_DIR}/rc_predictor.h" "$LLAMA_DIR/common/"
 cp -f "${SPEC_CPP_DIR}/rc_trie_v2.h" "$LLAMA_DIR/common/"
+cp -f "${SPEC_CPP_DIR}/rc_stockfish.h" "$LLAMA_DIR/common/"
 cp -f "${SPEC_CPP_DIR}/ngram-map.cpp" "$LLAMA_DIR/common/"
 
 # Auto-detect CPU SIMD ISA extensions so both Zen 4/5 (AVX-512) and Zen 2/3 / Intel (AVX2) build safely
