@@ -158,11 +158,29 @@ cmd_status() {
     fi
 }
 
+ensure_ready_and_running() {
+    if find_any_active_port >/dev/null; then
+        return 0
+    fi
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        if [[ ! -f "${REPO_ROOT}/apple-silicon/.setup_done" ]] && ! command -v llama-server >/dev/null 2>&1; then
+            echo -e "${CYAN}[*] First run on macOS — running apple-silicon/setup.sh...${RESET}"
+            "${REPO_ROOT}/apple-silicon/setup.sh"
+        fi
+        cmd_start "$@"
+        return 0
+    fi
+    if [[ ! -f "$DEFAULT_MODEL" ]] || [[ ! -x "${WORKSPACE_DIR}/bin/llama-server-nemotron" ]]; then
+        echo -e "${CYAN}[*] First run detected — building patched engine & downloading model automatically...${RESET}"
+        "${REPO_ROOT}/install.sh"
+    fi
+    cmd_start "$DEFAULT_MODEL"
+}
+
 cmd_web() {
     local url="http://127.0.0.1:${GATEWAY_PORT}"
     if ! is_port_up "$GATEWAY_PORT"; then
-        echo -e "${YELLOW}[i] Gateway not running on :${GATEWAY_PORT} — starting services now...${RESET}"
-        cmd_start "$@"
+        ensure_ready_and_running "$@"
     fi
     echo -e "${GREEN}[*] Opening Live Web Chat & Telemetry HUD at ${CYAN}${url}${RESET}"
     if command -v xdg-open >/dev/null 2>&1; then
@@ -173,30 +191,18 @@ cmd_web() {
 }
 
 cmd_chat() {
-    if ! find_any_active_port >/dev/null; then
-        echo -e "${YELLOW}[i] No running server detected on ports ${GATEWAY_PORT}/${SERVER_PORT}/8080/8001.${RESET}"
-        if [[ -f "$DEFAULT_MODEL" ]]; then
-            cmd_start "$DEFAULT_MODEL"
-        fi
-    fi
+    ensure_ready_and_running
     exec python3 "${REPO_ROOT}/scripts/chat.py" "$@"
 }
 
 cmd_bench() {
-    if ! find_any_active_port >/dev/null; then
-        echo -e "${YELLOW}[i] No running server detected — checking if model is available to auto-start...${RESET}"
-        if [[ -f "$DEFAULT_MODEL" ]]; then
-            cmd_start "$DEFAULT_MODEL"
-        fi
-    fi
+    ensure_ready_and_running
     exec python3 "${REPO_ROOT}/scripts/chat.py" --bench "$@"
 }
 
 cmd_claude() {
     if ! is_port_up "$GATEWAY_PORT"; then
-        if [[ -f "$DEFAULT_MODEL" ]]; then
-            cmd_start "$DEFAULT_MODEL"
-        fi
+        ensure_ready_and_running
     fi
     export ANTHROPIC_BASE_URL="http://127.0.0.1:${GATEWAY_PORT}"
     echo -e "${GREEN}[*] Launching Claude Code wired to ${CYAN}${ANTHROPIC_BASE_URL}${RESET}..."
