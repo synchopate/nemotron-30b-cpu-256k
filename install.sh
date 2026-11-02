@@ -318,7 +318,7 @@ exec taskset -c "\${TASKSET_MASK}" "${WORKSPACE_DIR}/bin/llama-server-nemotron" 
   --checkpoint-min-step 128 \\
   --spec-type ngram-simple \\
   --spec-ngram-simple-size-n 4 \\
-  --spec-ngram-simple-size-m 5 \\
+  --spec-ngram-simple-size-m 7 \\
   --spec-ngram-simple-min-hits 1 \\
   --reasoning-format deepseek \\
   --reasoning-budget 0

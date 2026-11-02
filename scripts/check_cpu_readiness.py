@@ -531,7 +531,7 @@ def main():
     print(f"    -c 262144 -np 1 -t {cpu['physical_cores']} -tb {cpu['physical_cores']} -b 2048 -ub 2048 \\")
     print(f"    --cache-type-k q8_0 --cache-type-v q4_0 --repack --flash-attn auto --cache-reuse 256 --slot-save-path /dev/shm \\")
     print(f"    --ctx-checkpoints 64 --checkpoint-min-step 128 \\")
-    print(f"    --spec-type ngram-simple --spec-ngram-simple-size-n 4 --spec-ngram-simple-size-m 5 --spec-ngram-simple-min-hits 1")
+    print(f"    --spec-type ngram-simple --spec-ngram-simple-size-n 4 --spec-ngram-simple-size-m 7 --spec-ngram-simple-min-hits 1")
     if cpu["numa_nodes"] > 1 or cpu["sockets"] > 1:
         cores_per_node = max(1, cpu["physical_cores"] // max(1, cpu["numa_nodes"]))
         print(f"\n  [!] Multi-NUMA / Multi-Socket Server Detected ({cpu['numa_nodes']} NUMA nodes):")

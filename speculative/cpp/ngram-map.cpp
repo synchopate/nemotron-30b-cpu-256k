@@ -234,6 +234,7 @@ struct RouteCrackNemotronEngine {
         int * out_casc_k = nullptr, int * out_agree = nullptr) {
 
         int32_t casc_tok = -1, casc_conf = 0, casc_k = 0;
+        const RCHashEntry * casc_ent = nullptr;
         bool cand_in_casc = false;
         for (int c = 0; c < pred.n_cascade; ++c) {
             int ck = pred.cascade_k[c];
@@ -242,6 +243,7 @@ struct RouteCrackNemotronEngine {
                 int idx = pred.cascade[c].find_idx(h);
                 if (idx >= 0) {
                     const auto & ent = pred.cascade[c].entries[idx];
+                    casc_ent  = &ent;
                     casc_tok  = ent.pred[0];
                     casc_conf = ent.conf[0];
                     casc_k    = ck;
@@ -283,6 +285,29 @@ struct RouteCrackNemotronEngine {
             }
         }
 
+        // RouteCrack Technique #2: Top-4 Cascade Candidate Disambiguation via Stockfish Orthogonal Session TT
+        if (casc_ent && casc_ent->n_preds > 1) {
+            const SFTTBucket * b5 = sf.probe5(ctx_ptr, ctx_len);
+            const SFTTBucket * b4 = sf.probe4(ctx_ptr, ctx_len);
+            bool top1_refuted = (b5 && b5->refuted_move == casc_tok && b5->best_move != casc_tok && b5->history < 0) ||
+                                (b4 && b4->refuted_move == casc_tok && b4->best_move != casc_tok && b4->history <= -64);
+            if (top1_refuted || casc_conf < 80) {
+                for (int p = 1; p < casc_ent->n_preds; ++p) {
+                    int32_t alt = casc_ent->pred[p];
+                    int alt_c   = casc_ent->conf[p];
+                    if (alt < 0 || alt_c < 20) continue;
+                    bool tt5_match = (b5 && b5->best_move == alt && b5->wins >= 3 && b5->history >= 160);
+                    bool tt4_match = (b4 && b4->best_move == alt && b4->wins >= 4 && b4->history >= 200);
+                    bool session_match = (trie_tok == alt && trie_depth >= 4 && trie_conf >= 0.80f) && (ppm_tok == alt);
+                    if ((tt5_match || tt4_match) && session_match) {
+                        casc_tok  = alt;
+                        casc_conf = 84;
+                        break;
+                    }
+                }
+            }
+        }
+
         if (out_casc_k) *out_casc_k = casc_k;
 
         if (verify_cand >= 0) {
@@ -320,6 +345,25 @@ struct RouteCrackNemotronEngine {
             out_cert = hot_conf;
             if (out_agree) *out_agree = 2;
         }
+
+        // RouteCrack Technique #1: Online Session Trie v2 Rescue gated by Stockfish Zobrist TT
+        // Fixes shadowing where a low-confidence k=1..3 cascade match prevented deep session trie matches from firing.
+        if (out_cert < 84 && trie_tok >= 0 && trie_depth >= 4 && trie_obs >= 4 && trie_conf >= 0.92f) {
+            const SFTTBucket * b5 = sf.probe5(ctx_ptr, ctx_len);
+            const SFTTBucket * b4 = sf.probe4(ctx_ptr, ctx_len);
+            const SFTTBucket * b3 = sf.probe3(ctx_ptr, ctx_len);
+            bool refuted = (b5 && b5->refuted_move == trie_tok && b5->best_move != trie_tok) ||
+                           (b4 && b4->refuted_move == trie_tok && b4->best_move != trie_tok) ||
+                           (b3 && b3->refuted_move == trie_tok && b3->best_move != trie_tok && b3->history <= -64);
+            bool tt_confirmed = (b5 && b5->best_move == trie_tok && b5->wins >= 2) ||
+                                (b4 && b4->best_move == trie_tok && b4->wins >= 3);
+            int t_agree = 1 + (ppm_tok == trie_tok ? 1 : 0) + (skip_tok == trie_tok ? 1 : 0) + (cand_in_casc || casc_tok == trie_tok ? 1 : 0);
+            if (!refuted && ((tt_confirmed && t_agree >= 2) || (trie_depth >= 6 && trie_obs >= 5 && t_agree >= 3))) {
+                out_tok  = trie_tok;
+                out_cert = std::min(95, (int)(trie_conf * 92.0f) + (tt_confirmed ? 4 : 0));
+                if (out_agree) *out_agree = t_agree;
+            }
+        }
     }
 };
 
@@ -343,7 +387,8 @@ static RCPreheater g_rc_preheater;
 
 // ============================================================================
 // common_ngram_simple_draft:
-// Full RouteCrack + Stockfish-PVS (192KB L2 Zobrist TT + Quiescence Lookahead)
+// Full RouteCrack + Stockfish-PVS v2 Sweet Spot (192KB L2 Zobrist TT +
+// Quiescence Lookahead + MacroCodebook 4-tok Chains + Singular Horizon M=7)
 // ============================================================================
 llama_tokens common_ngram_simple_draft(
     const common_ngram_simple_config & config,
@@ -390,7 +435,7 @@ llama_tokens common_ngram_simple_draft(
     }
 
     // Build contiguous tail window ending with `sampled`
-    int32_t tail_win[24];
+    int32_t tail_win[28];
     const int win_n = 12;
     for (int i = 0; i < win_n - 1; ++i) {
         tail_win[i] = (int32_t)inp[inp_size - (win_n - 1) + i];
@@ -423,14 +468,15 @@ llama_tokens common_ngram_simple_draft(
     // ------------------------------------------------------------------------
     // Stage 1: In-Context Suffix Scan (Hot Zone 16384 + Prefix Zone 24576)
     //          + Stockfish Multi-Branch Conflict Disambiguation
+    //          + Singular Horizon Extension (Sweet Spot up to M=7)
     // ------------------------------------------------------------------------
     const size_t hot_start = (inp_size > 16384) ? (inp_size - 16384) : 3;
     const int32_t p0 = (int32_t)sampled;
     const int32_t p1 = (int32_t)inp[inp_size - 1];
     const int32_t p2 = (int32_t)inp[inp_size - 2];
 
-    size_t best_j = 0, best_k = 0, hits = 0, consensus_len = 5;
-    size_t second_j = 0, second_k = 0;
+    size_t best_j = 0, best_k = 0, hits = 0, consensus_len = 7;
+    size_t second_j = 0, second_k = 0, true_consensus_hits = 0;
 
     // Helper lambda to check a match ending at inp[j] == p0, inp[j-1] == p1, inp[j-2] == p2
     auto eval_match = [&](size_t j, bool is_hot_zone) {
@@ -445,6 +491,7 @@ llama_tokens common_ngram_simple_draft(
         if (best_j == 0) {
             best_j = j;
             best_k = k;
+            true_consensus_hits = 1;
         } else {
             size_t agree = 0;
             while (agree < consensus_len &&
@@ -456,12 +503,14 @@ llama_tokens common_ngram_simple_draft(
             if (k >= best_k && agree > 0) {
                 best_j = j;
                 best_k = k;
-                consensus_len = agree;
+                consensus_len = std::min(consensus_len, agree);
+                true_consensus_hits++;
             } else if (k + 1 >= best_k) {
                 if (agree == 0 && second_j == 0) {
                     second_j = j;
                     second_k = k;
                 }
+                if (agree > 0) true_consensus_hits++;
                 consensus_len = std::min(consensus_len, agree);
             }
         }
@@ -511,13 +560,24 @@ llama_tokens common_ngram_simple_draft(
     }
 
     if (best_j > 0 && consensus_len > 0) {
-        size_t max_m = 0;
-        if (best_k >= 8)      max_m = 5;
-        else if (best_k >= 7) max_m = (hits >= 2) ? 5 : 4;
-        else if (best_k >= 5) max_m = (hits >= 2) ? 4 : 3;
-        else if (best_k == 4) max_m = (hits >= 2) ? 2 : 1;
-        else if (best_k == 3 && hits >= 2) max_m = 1;
-        max_m = std::min<size_t>(max_m, std::min<size_t>(consensus_len, size_mgram));
+        size_t base_m = 0;
+        if (best_k >= 8)      base_m = 5;
+        else if (best_k >= 7) base_m = (hits >= 2) ? 5 : 4;
+        else if (best_k >= 5) base_m = (hits >= 2) ? 4 : 3;
+        else if (best_k == 4) base_m = (hits >= 2) ? 2 : 1;
+        else if (best_k == 3) {
+            if (hits >= 2) base_m = 1;
+            else if (best_j + 128 >= inp_size) {
+                int32_t cand = (int32_t)inp[best_j + 1];
+                const SFTTBucket * b5 = rc.sf.probe5(tail_win, cur_win_len);
+                if (b5 && b5->best_move == cand && b5->wins >= 2 && b5->history >= 128) base_m = 1;
+            }
+        }
+
+        // RouteCrack Technique #17 + Stockfish Singular Horizon Extension (up to M=7 when consensus or k>=10 + TT/RC confirmed)
+        size_t ext_cap = (best_k >= 10 || (best_k >= 8 && true_consensus_hits >= 2)) ? 7 :
+                         (best_k >= 7  && true_consensus_hits >= 2) ? 6 : base_m;
+        size_t max_m = std::min<size_t>(ext_cap, std::min<size_t>(consensus_len, size_mgram));
 
         for (size_t i = 0; i < max_m && best_j + 1 + i < inp_size; ++i) {
             int32_t cand = (int32_t)inp[best_j + 1 + i];
@@ -538,6 +598,20 @@ llama_tokens common_ngram_simple_draft(
                 if (best_k == 4 && i == 0 && rc_agree == 0 && !tt_backed) break;
                 if (i >= 1 && rc_agree == 0 && !tt_backed) break;
             }
+            // For Singular Horizon Extension steps (i >= base_m), require active RouteCrack or Stockfish TT confirmation
+            if (i >= base_m) {
+                int32_t rc_t = -1;
+                int rc_agree = 0;
+                rc.query_rc_nolock(tail_win, cur_win_len, rc_t, rc_agree, cand);
+                const SFTTBucket * b5 = rc.sf.probe5(tail_win, cur_win_len);
+                const SFTTBucket * b4 = rc.sf.probe4(tail_win, cur_win_len);
+                bool refuted = (b5 && b5->refuted_move == cand && b5->best_move != cand) ||
+                               (b4 && b4->refuted_move == cand && b4->best_move != cand);
+                bool tt_ok = (b5 && b5->best_move == cand && b5->wins >= 2) ||
+                             (b4 && b4->best_move == cand && b4->wins >= 2);
+                int req_agree = (best_k >= 11) ? 1 : 2;
+                if (refuted || (rc_agree < req_agree && !tt_ok)) break;
+            }
             draft.push_back((llama_token)cand);
             tail_win[cur_win_len++] = cand;
         }
@@ -545,12 +619,37 @@ llama_tokens common_ngram_simple_draft(
 
     // ------------------------------------------------------------------------
     // Stage 2: Stockfish PVS + Multi-Order Zobrist TT + 1-Ply Quiescence Lookahead
+    //          + RouteCrack Technique #5/#89 (4-Token Macro Codebook Chains)
     // ------------------------------------------------------------------------
-    const int max_rc_draft = std::min<int>((int)size_mgram, 3);
+    const RCMacroEntry * active_macro = nullptr;
+    const int macro_start_d = (int)draft.size();
+    if (rc.pred.macro.entries && rc.pred.macro.n_entries > 0) {
+        for (int mk = std::min(cur_win_len, 6); mk >= 5; --mk) {
+            uint64_t mh = rc_fnv64(tail_win + cur_win_len - mk, mk);
+            int midx = rc.pred.macro.find(mh);
+            if (midx >= 0 && rc.pred.macro.entries[midx].conf >= 92 && rc.pred.macro.entries[midx].cont_len >= 3) {
+                active_macro = &rc.pred.macro.entries[midx];
+                break;
+            }
+        }
+    }
+
+    const int max_rc_draft = std::min<int>((int)size_mgram, active_macro ? std::min(4, macro_start_d + 4) : 3);
     for (int d = (int)draft.size(); d < max_rc_draft; ++d) {
         int32_t chosen = -1;
         int cert = 0, casc_k = 0, agree = 0;
         rc.query_rc_nolock(tail_win, cur_win_len, chosen, cert, -1, &casc_k, &agree);
+
+        if (active_macro) {
+            int m_step = d - macro_start_d;
+            if (m_step >= 0 && m_step < active_macro->cont_len) {
+                if (chosen == active_macro->continuation[m_step]) {
+                    cert = std::max(cert, (int)active_macro->conf + (m_step >= 1 ? 4 : 0));
+                } else {
+                    active_macro = nullptr;
+                }
+            }
+        }
 
         const SFTTBucket * b5 = rc.sf.probe5(tail_win, cur_win_len);
         const SFTTBucket * b4 = rc.sf.probe4(tail_win, cur_win_len);

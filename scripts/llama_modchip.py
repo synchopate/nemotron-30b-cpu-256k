@@ -620,7 +620,7 @@ def build_launch_command(
         cmd_parts.append(
             "--spec-type ngram-simple "
             "--spec-ngram-simple-size-n 4 "
-            "--spec-ngram-simple-size-m 5 "
+            "--spec-ngram-simple-size-m 7 "
             "--spec-ngram-simple-min-hits 1"
         )
     cmd_parts.append("--reasoning-format deepseek --reasoning-budget 0")
