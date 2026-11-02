@@ -273,7 +273,7 @@ def run_benchmark_suite(base_url: str) -> None:
     print(f"  Decode (New C++20)  : {s1['dec_tps']:.2f} tok/s (TTFT: {s1['ttft_ms']:.0f} ms)")
     print(f"  Decode (Refactor)   : {s2['dec_tps']:.2f} tok/s (Stockfish-PVS M=7 Acceptance: {s2_spec})")
     print(f"{BOLD}{GREEN}╚════════════════════════════════════════════════════════════════════════════════════╝{RESET}")
-    print(f"👉 Share your CPU scorecard: {CYAN}https://github.com/synchopate/nemotron-30b-cpu-256k/issues/1{RESET}\n")
+    print(f"👉 Share your CPU scorecard: {CYAN}https://github.com/synchopate/llama-modchip/issues/new?template=benchmark.yml{RESET}\n")
 
 
 def run_interactive_chat(base_url: str, one_shot_prompt: Optional[str] = None) -> None:

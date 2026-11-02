@@ -87,8 +87,8 @@
   <rect x="16" y="130" width="948" height="394" rx="8" fill="#090c12" stroke="#222c40"/>
 
   <!-- Prompt Line 1 -->
-  <text x="32" y="158" fill="#3fb950" font-size="13" font-weight="700" class="mono">paolo@zen5-9955hx:~/nemotron-30b-cpu-256k$</text>
-  <text x="382" y="158" fill="#e6edf3" font-size="13" font-weight="700" class="mono">./modchip bench</text>
+  <text x="32" y="158" fill="#3fb950" font-size="13" font-weight="700" class="mono">paolo@zen5-9955hx:~/llama-modchip$</text>
+  <text x="328" y="158" fill="#e6edf3" font-size="13" font-weight="700" class="mono">./modchip bench</text>
 
   <!-- Stage 1 Output -->
   <g class="reveal1">
@@ -119,8 +119,8 @@
 
   <!-- Bottom Prompt -->
   <g class="reveal4">
-    <text x="32" y="504" fill="#3fb950" font-size="13" font-weight="700" class="mono">paolo@zen5-9955hx:~/nemotron-30b-cpu-256k$</text>
-    <text x="382" y="504" fill="#e6edf3" font-size="13" font-weight="700" class="mono">./modchip chat</text>
-    <rect x="498" y="491" width="9" height="16" fill="#3fb950" class="pulse"/>
+    <text x="32" y="504" fill="#3fb950" font-size="13" font-weight="700" class="mono">paolo@zen5-9955hx:~/llama-modchip$</text>
+    <text x="328" y="504" fill="#e6edf3" font-size="13" font-weight="700" class="mono">./modchip chat</text>
+    <rect x="444" y="491" width="9" height="16" fill="#3fb950" class="pulse"/>
   </g>
 </svg>

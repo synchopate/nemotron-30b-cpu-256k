@@ -4,7 +4,7 @@
 # ==============================================================================
 # Usage:
 #   One-liner (from scratch):
-#     curl -sL https://raw.githubusercontent.com/synchopate/nemotron-30b-cpu-256k/main/install.sh | bash
+#     curl -sL https://raw.githubusercontent.com/synchopate/llama-modchip/main/install.sh | bash
 #
 #   From cloned repo:
 #     ./install.sh [options]
@@ -22,12 +22,12 @@ set -euo pipefail
 SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
 if [[ -z "$SCRIPT_SOURCE" ]] || [[ ! -f "$(dirname "$SCRIPT_SOURCE")/patches/zen5-nemotron-256k-optimizations.patch" ]]; then
     echo "=============================================================================="
-    echo " [*] Bootstrapping nemotron-30b-cpu-256k repository..."
+    echo " [*] Bootstrapping llama-modchip repository..."
     echo "=============================================================================="
-    if [[ ! -d "./nemotron-30b-cpu-256k" ]]; then
-        git clone https://github.com/synchopate/nemotron-30b-cpu-256k.git ./nemotron-30b-cpu-256k
+    if [[ ! -d "./llama-modchip" ]]; then
+        git clone https://github.com/synchopate/llama-modchip.git ./llama-modchip
     fi
-    cd ./nemotron-30b-cpu-256k
+    cd ./llama-modchip
     exec bash ./install.sh "$@"
 fi
 

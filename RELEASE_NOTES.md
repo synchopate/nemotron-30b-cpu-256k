@@ -1,4 +1,4 @@
-# Release Notes — `nemotron-30b-cpu-256k` & `llama-modchip`
+# Release Notes — `llama-modchip` (`v2.1.0`)
 
 > 📄 **Quick Links:** [Overview (`README.md`)](README.md) · [Technical Paper (`ARCHITECTURE.md`)](ARCHITECTURE.md) · [96+ `RouteCrack + Stockfish-PVS` Techniques (`speculative/ROUTECRACK_TECHNIQUES.md`)](speculative/ROUTECRACK_TECHNIQUES.md) · [Engineering FAQ (`FAQ.md`)](FAQ.md)
 

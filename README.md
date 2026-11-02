@@ -8,7 +8,7 @@
 [![License](https://img.shields.io/badge/license-Apache%202.0-58a6ff?style=flat-square)](LICENSE)
 [![Technical Paper](https://img.shields.io/badge/paper-ARCHITECTURE.md-bc8cff?style=flat-square)](ARCHITECTURE.md)
 [![RouteCrack + Stockfish](https://img.shields.io/badge/drafter-Stockfish--PVS%20v2%20(1.64MB%20L3)-d29922?style=flat-square)](speculative/ROUTECRACK_TECHNIQUES.md)
-[![Submit Benchmark](https://img.shields.io/badge/leaderboard-Submit%20Your%20CPU-2ea043?style=flat-square)](https://github.com/synchopate/nemotron-30b-cpu-256k/issues/new?template=benchmark.yml)
+[![Submit Benchmark](https://img.shields.io/badge/leaderboard-Submit%20Your%20CPU-2ea043?style=flat-square)](https://github.com/synchopate/llama-modchip/issues/new?template=benchmark.yml)
 
 [**⚡ Quickstart**](#-quickstart) · [**📊 Benchmarks**](#-benchmarks-pure-cpu--zero-gpus) · [**🧠 How It Works**](#-how-it-works) · [**🏆 CPU Leaderboard**](#-community-cpu-leaderboard) · [**📄 Technical Paper**](ARCHITECTURE.md) · [**❓ FAQ**](FAQ.md)
 
@@ -25,8 +25,8 @@
 Clone the repository and run **`./modchip chat`**. On first run, it automatically builds the patched `llama.cpp` engine (`AVX-512` / `AVX2` / `Apple Metal`), downloads `Nemotron-3.5-30B-A3B (Q4_0)`, launches the background server + Web UI, and opens an interactive chat with live `tok/s` telemetry:
 
 ```bash
-git clone https://github.com/synchopate/nemotron-30b-cpu-256k.git
-cd nemotron-30b-cpu-256k
+git clone https://github.com/synchopate/llama-modchip.git
+cd llama-modchip
 ./modchip chat
 ```
 
@@ -43,7 +43,7 @@ cd nemotron-30b-cpu-256k
 
 > 💡 **Want to estimate your CPU's speed in 2 seconds without downloading anything?**  
 > ```bash
-> curl -sL https://raw.githubusercontent.com/synchopate/nemotron-30b-cpu-256k/main/scripts/check_cpu_readiness.py | python3
+> curl -sL https://raw.githubusercontent.com/synchopate/llama-modchip/main/scripts/check_cpu_readiness.py | python3
 > ```
 
 ---
@@ -125,8 +125,8 @@ echo defer+madvise | sudo tee /sys/kernel/mm/transparent_hugepage/defrag
 
 # 2. Clone llama.cpp, apply Zen 5 / AVX-512 patch & copy RouteCrack + Stockfish-PVS into common/
 git clone https://github.com/ggerganov/llama.cpp.git && cd llama.cpp
-git apply /path/to/nemotron-30b-cpu-256k/patches/zen5-nemotron-256k-optimizations.patch
-cp /path/to/nemotron-30b-cpu-256k/speculative/cpp/{rc_predictor.h,rc_trie_v2.h,rc_stockfish.h,ngram-map.cpp} common/
+git apply /path/to/llama-modchip/patches/zen5-nemotron-256k-optimizations.patch
+cp /path/to/llama-modchip/speculative/cpp/{rc_predictor.h,rc_trie_v2.h,rc_stockfish.h,ngram-map.cpp} common/
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON -DGGML_AVX512=ON \
   -DGGML_AVX512_VNNI=ON -DGGML_AVX512_VBMI=ON -DGGML_AVX512_BF16=ON -DGGML_OPENMP=ON
@@ -135,7 +135,7 @@ cmake --build build --config Release -j $(nproc) --target llama-server
 
 ### Repository Structure
 ```text
-nemotron-30b-cpu-256k/
+llama-modchip/
 ├── modchip                                    # Unified CLI (setup | start | chat | bench | web | claude | stop)
 ├── install.sh                                 # 1-Command Automated Installer (Linux)
 ├── README.md / ARCHITECTURE.md / FAQ.md       # Overview, Full Mathematical Paper & Engineering FAQ
@@ -157,15 +157,15 @@ nemotron-30b-cpu-256k/
 
 ## 🏆 Community CPU Leaderboard
 
-Run **`./modchip bench`** on your machine and **[➕ Submit Your CPU Scorecard (1-Click GitHub Issue)](https://github.com/synchopate/nemotron-30b-cpu-256k/issues/new?template=benchmark.yml)** to be added below!
+Run **`./modchip bench`** on your machine and **[➕ Submit Your CPU Scorecard (1-Click GitHub Issue)](https://github.com/synchopate/llama-modchip/issues/new?template=benchmark.yml)** to be added below!
 
 | Hardware Platform (`CPU / SoC`) | Cores / Cache | Memory | Prefill (`tok/s`) | Decode — Prose / Agent | Decode — `Stockfish M=7` Burst | Config & Contributor |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
 | **AMD Ryzen 9 9955HX (`Zen 5`)** | `16C/32T` (`64 MB` L3) | `64 GB` DDR5 (`0 GPU`) | **`241.0`** *(Peak **`306.8`**)* | **`20.7 – 34.5 tok/s`** | **`48.39 avg / 60.40 peak`** *(`len 6.90`)* | `@synchopate` ([`systemd/`](systemd/nemotron-256k.service)) |
 | **Apple M4 Pro (`14-Core SoC`)** | `14C CPU + 20C Metal` | `24 GB` Unified (`0 Swap`) | **`256.0 – 549.0`** | **`47.0 – 48.0 tok/s`** *(128K)* | **`49.0+ tok/s`** | `@jarorosFork` ([`apple-silicon/`](apple-silicon/README.md)) |
 | **AMD Ryzen 7 8745HS (`GEEKOM A8`)** | `8C/16T` (`16 MB` L3) | `64 GB` DDR5-5600 | *Verified Fedora 44* | *Verified (`ngram`)* | *Verified (`CPU` & `780M`)* | `@jarorosFork` ([`fedora/`](fedora/README.md)) |
-| **AMD Threadripper PRO 7985WX** | `64C/128T` (`256 MB` L3) | `256 GB` 8-Ch DDR5-6000 | *Testing in [#1](https://github.com/synchopate/nemotron-30b-cpu-256k/issues/1)* | *Auto `-t 32 -tb 64`* | *Run `./modchip bench`!* | `@aifartist` ([Issue #1](https://github.com/synchopate/nemotron-30b-cpu-256k/issues/1)) |
-| **Your CPU (`Ryzen / EPYC / Xeon / M-Series`)** | *Run `./modchip bench`* | *`>= 24 GB` RAM* | *?* | *?* | **[➕ Submit Scorecard](https://github.com/synchopate/nemotron-30b-cpu-256k/issues/new?template=benchmark.yml)** | *You!* |
+| **AMD Threadripper PRO 7985WX** | `64C/128T` (`256 MB` L3) | `256 GB` 8-Ch DDR5-6000 | *Testing in [#1](https://github.com/synchopate/llama-modchip/issues/1)* | *Auto `-t 32 -tb 64`* | *Run `./modchip bench`!* | `@aifartist` ([Issue #1](https://github.com/synchopate/llama-modchip/issues/1)) |
+| **Your CPU (`Ryzen / EPYC / Xeon / M-Series`)** | *Run `./modchip bench`* | *`>= 24 GB` RAM* | *?* | *?* | **[➕ Submit Scorecard](https://github.com/synchopate/llama-modchip/issues/new?template=benchmark.yml)** | *You!* |
 
 ---
 

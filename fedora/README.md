@@ -15,11 +15,11 @@ The script uses:
 On the Fedora PC:
 
 ```bash
-git clone https://github.com/synchopate/nemotron-30b-cpu-256k.git
+git clone https://github.com/synchopate/llama-modchip.git
 ```
 
 ```bash
-cd nemotron-30b-cpu-256k/fedora
+cd llama-modchip/fedora
 ```
 
 ```bash
