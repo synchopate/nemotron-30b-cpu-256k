@@ -33,6 +33,23 @@
 | **Decode — Mixed Code & Architecture Refactor (`26.4K` ctx)** | ~4.5 tok/s | **`28.61 tok/s` avg / `48.47 tok/s` peak** *(`86.1%` draft acceptance, `mean len = 4.66`)* | **~7x Faster** |
 | **Decode — In-Context Refactoring & Macro Burst (`M=7`)** | ~4.5 tok/s | **`48.39 tok/s` avg / `60.40–65.0 tok/s` peak** *(`96.4%–98.0%` acceptance, **`mean len = 6.90` tok/step**)* | **>11x Faster** |
 
+### ⚡ 60-Second Quickstart (`./modchip` Unified CLI, Live Web HUD & Terminal Chat)
+
+```bash
+# 1. Clone & run the automated installer (builds patched llama.cpp + Stockfish-PVS & downloads GGUF):
+git clone https://github.com/synchopate/nemotron-30b-cpu-256k.git && cd nemotron-30b-cpu-256k
+./modchip setup                  # Or Bring-Your-Own-GGUF: ./modchip setup --skip-model --model /path/to/any.gguf
+
+# 2. Start the 256K CPU Engine + Live Web Telemetry HUD in the background:
+./modchip start                  # Or pass any GGUF: ./modchip start /path/to/model.gguf
+
+# 3. Pick how you want to interact & verify your tok/s immediately:
+./modchip chat                   # 💬 Interactive terminal chat with live tok/s & Stockfish-PVS telemetry
+./modchip bench                  # 📊 30s automated 2-stage benchmark + shareable CPU scorecard
+./modchip web                    # 🌐 Open Live Web Chat & Telemetry HUD at http://127.0.0.1:8787
+./modchip claude                 # 🤖 Launch Claude Code CLI wired to the local 256K CPU engine
+```
+
 ---
 
 ## 2. `llama-modchip` (`v0.9 Public Beta`): "Priiloader for CPU GGUF Inference" & Verified Hardware/Software Matrix
@@ -120,14 +137,20 @@ If you are starting from a fresh Linux machine, [`install.sh`](install.sh) autom
 # One-liner from scratch:
 curl -sL https://raw.githubusercontent.com/synchopate/nemotron-30b-cpu-256k/main/install.sh | bash
 
-# Or clone and customize (e.g. pre-train RouteCrack n-grams on your own repo):
+# Or clone and use the unified ./modchip CLI:
 git clone https://github.com/synchopate/nemotron-30b-cpu-256k.git
 cd nemotron-30b-cpu-256k
-./install.sh --corpus /path/to/your/codebase
+./modchip setup                       # Or custom corpus: ./modchip setup --corpus /path/to/codebase
+./modchip start                       # Starts server (8789) + Web UI & SSE Gateway (8787) in background
 
-# Launch the 256K CPU server & Claude Code gateway:
-./start_server.sh
-./start_gateway.sh
+# Verify speed & chat immediately (Terminal, Browser Web HUD, Benchmark, or curl):
+./modchip chat                        # Interactive terminal chat with live tok/s footer
+./modchip bench                       # Automated 2-stage benchmark + shareable CPU scorecard
+./modchip web                         # Opens http://127.0.0.1:8787 (Dark-Mode Web Chat + Live Telemetry HUD)
+./modchip claude                      # Launches Claude Code CLI wired to local 256K CPU engine
+
+# Or test directly with a 1-line curl smoke test:
+./modchip chat -p "Write a cache-aligned C++20 spinlock in 15 lines."
 ```
 
 ---
@@ -186,6 +209,7 @@ See [`systemd/nemotron-256k.service`](systemd/nemotron-256k.service) and [`scrip
 ```text
 nemotron-30b-cpu-256k/
 ├── LICENSE                                           # Apache 2.0 License
+├── modchip                                           # Unified CLI (setup | start | chat | bench | web | claude | stop)
 ├── install.sh                                        # 1-Command Zero-to-Running Automated Installer
 ├── README.md                                         # Executive Overview, Quickstart & Hardware Check
 ├── ARCHITECTURE.md                                   # Full Technical Paper, Proofs & Kernel Benchmarks
@@ -206,8 +230,9 @@ nemotron-30b-cpu-256k/
 │   │   └── rc_engine.cpp                             # Standalone C++ Speculative Engine with BFS Tree Verification
 │   └── tools/                                        # Linear & Hot-Logit Probe trainers and distillation scripts
 ├── kv_cache/                                         # HARP-Cache (/dev/shm) & EAKV + VPI Asymmetric Quantization
-├── gateway/                                          # Agentic SSE Reverse Proxy (sse_gateway.py)
+├── gateway/                                          # Agentic SSE Reverse Proxy + Live Web Chat & Telemetry HUD (sse_gateway.py)
 ├── scripts/
+│   ├── chat.py                                       # Zero-dependency Interactive Terminal Chat & 2-Stage Benchmark Scorecard
 │   ├── llama_modchip.py                              # "Priiloader for CPU LLM" (GGUF Inspector, Safety Lock & Live SHM TUI)
 │   ├── check_cpu_readiness.py                        # Zero-dependency CPU compatibility & tok/s estimator script
 │   ├── prewarm_agent_prefix.py                       # 18.9ms Slot 0 disk snapshot restore & prefix pre-warmer

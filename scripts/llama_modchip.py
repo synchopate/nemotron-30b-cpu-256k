@@ -251,6 +251,26 @@ class HardwareInfo:
     def taskset_mask(self) -> str:
         return ",".join(str(c) for c in self.physical_core_cpus)
 
+    @property
+    def batch_threads(self) -> int:
+        return max(1, len(self.physical_core_cpus))
+
+    @property
+    def decode_threads(self) -> int:
+        n_phys = max(1, len(self.physical_core_cpus))
+        # Multi-CCD / Threadripper / EPYC Guard:
+        # On >2 CCDs (e.g. 64-core 8-CCD Threadripper PRO), running 64 decode threads across 8 CCDs
+        # incurs 100+ cross-CCD OpenMP barrier synchronizations per token over the I/O die.
+        # Capping decode threads to 4 cores/CCD (16-32 threads with OMP_PROC_BIND=spread) saturates
+        # 8-channel DDR5 while halving cross-CCD barrier latency, keeping -tb at full physical cores.
+        if self.num_ccds > 2 and n_phys > 24:
+            return min(n_phys, max(16, self.num_ccds * 4))
+        return n_phys
+
+    @property
+    def omp_proc_bind(self) -> str:
+        return "spread" if (self.num_ccds > 2 and len(self.physical_core_cpus) > 24) else "close"
+
 
 def probe_hardware() -> HardwareInfo:
     cpu_model = "Generic Linux CPU"
@@ -474,10 +494,18 @@ def compute_modchip_profile(hw: HardwareInfo, model: GGUFModelInfo) -> ModchipPr
             "Eliminates 4KB L2-STLB misses across 4.6-24GB model weights (+24% decode)."
         ),
         HackItem(
-            2, "ccd_pinning", "1:1 Physical Core Pinning + Static GQA Partition",
+            2, "ccd_pinning", "1:1 Physical Core Pinning + Multi-CCD Topology Guard",
             "UNIVERSAL", "SAFE", True,
-            f"ON ({len(hw.physical_core_cpus)} phys cores: {hw.taskset_mask}, {hw.num_ccds} CCDs)",
-            "Prevents SMT sibling contention & cross-CCD Infinity Fabric L3 thrashing (+52% prefill)."
+            (
+                f"ON (-t {hw.decode_threads} decode / -tb {hw.batch_threads} prefill, OMP_PROC_BIND={hw.omp_proc_bind}, {hw.num_ccds} CCDs)"
+                if hw.decode_threads != hw.batch_threads
+                else f"ON ({hw.batch_threads} phys cores: {hw.taskset_mask[:36]}, {hw.num_ccds} CCDs, OMP_PROC_BIND={hw.omp_proc_bind})"
+            ),
+            (
+                f"Multi-CCD Guard ({hw.num_ccds} CCDs): caps decode to {hw.decode_threads} threads ({hw.omp_proc_bind}) to cut Infinity Fabric barrier overhead, full {hw.batch_threads}T prefill."
+                if hw.decode_threads != hw.batch_threads
+                else "Prevents SMT sibling contention & cross-CCD Infinity Fabric L3 thrashing (+52% prefill)."
+            )
         ),
         HackItem(
             3, "vnni_repack", "ISA-Adaptive In-Memory Weight Tile Repacking (--repack)",
@@ -596,8 +624,11 @@ def build_launch_command(
     ]
     if prof.moe_top_k > 0:
         env_parts.insert(0, f"LLAMA_MOE_TOP_K={prof.moe_top_k}")
+    env_parts.append(f"OMP_PROC_BIND={prof.hw.omp_proc_bind}")
+    env_parts.append("OMP_PLACES=cores")
 
-    n_threads = len(prof.hw.physical_core_cpus)
+    t_dec = prof.hw.decode_threads
+    t_bat = prof.hw.batch_threads
     ctx_target = min(prof.model.context_length, 262144) if prof.model.context_length > 0 else 262144
     cmd_parts = [
         " ".join(env_parts),
@@ -606,7 +637,7 @@ def build_launch_command(
         f"--model {prof.model.path}",
         f"--host 127.0.0.1 --port {port} --no-webui --offline",
         f"-c {ctx_target} -np 1",
-        f"-t {n_threads} -tb {n_threads}",
+        f"-t {t_dec} -tb {t_bat}",
         "-cb -ub 2048 -b 2048 --flash-attn auto",
     ]
     if prof.use_eakv:

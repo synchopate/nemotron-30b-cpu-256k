@@ -772,6 +772,527 @@ def sanitize_non_streaming_response(resp_dict, schemas=None):
     resp_dict["content"] = new_content
     return resp_dict
 
+
+def _build_modchip_telemetry_json() -> dict:
+    """Collects live hardware, /dev/shm/llama_modchip.bin, and llama-server /slots telemetry."""
+    import struct
+    cpu_model = "CPU"
+    try:
+        with open("/proc/cpuinfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("model name"):
+                    cpu_model = line.split(":", 1)[1].strip()
+                    break
+    except Exception:
+        pass
+
+    anon_hp_gib = 0.0
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("AnonHugePages:"):
+                    anon_hp_gib = round(int(line.split()[1]) / (1024 * 1024), 2)
+                    break
+    except Exception:
+        pass
+
+    shm_info = {
+        "active": False,
+        "l3_window": 2048,
+        "attn_window": 0,
+        "moe_top_k": 4,
+        "rc_enabled": 1,
+        "rc_gates": "84/92/96",
+    }
+    shm_path = "/dev/shm/llama_modchip.bin"
+    if os.path.exists(shm_path):
+        try:
+            with open(shm_path, "rb") as f:
+                buf = f.read(48)
+            if len(buf) >= 48:
+                vals = struct.unpack("<IIiiiiiiiiii", buf[:48])
+                if vals[0] == 0x4D434850:
+                    shm_info = {
+                        "active": True,
+                        "l3_window": vals[2],
+                        "attn_window": vals[3],
+                        "attn_sinks": vals[4],
+                        "swa_stride": vals[5],
+                        "rc_enabled": vals[7],
+                        "rc_gates": f"{vals[8]}/{vals[9]}/{vals[10]}",
+                        "moe_top_k": vals[11],
+                    }
+        except Exception:
+            pass
+
+    slot_tokens = 0
+    slot_state = "OFFLINE"
+    backend_up = False
+    try:
+        req = urllib.request.Request(f"{UPSTREAM_BASE}/slots", method="GET")
+        with urllib.request.urlopen(req, timeout=0.6) as resp:
+            slots = json.loads(resp.read().decode("utf-8"))
+            backend_up = True
+            if isinstance(slots, list) and slots:
+                s0 = slots[0]
+                slot_tokens = int(s0.get("n_past", s0.get("n_prompt_tokens", s0.get("n_decoded", 0))) or 0)
+                slot_state = "GENERATING" if s0.get("is_processing") else "READY"
+    except Exception:
+        pass
+
+    return {
+        "cpu_model": cpu_model,
+        "anon_hugepages_gib": anon_hp_gib,
+        "shm": shm_info,
+        "slot0_tokens": slot_tokens,
+        "slot0_state": slot_state,
+        "backend_up": backend_up,
+        "upstream": UPSTREAM_BASE,
+    }
+
+
+WEB_UI_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llama-modchip v2.1 — 256K CPU Co-Design + Stockfish-PVS HUD</title>
+<style>
+  :root {
+    --bg: #0b0e14;
+    --panel: #121722;
+    --panel-alt: #171e2c;
+    --border: #253047;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #3fb950;
+    --accent-cyan: #58a6ff;
+    --accent-gold: #d29922;
+    --accent-purple: #bc8cff;
+    --font-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+  }
+  header {
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    padding: 10px 18px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-size: 15px;
+    color: var(--text);
+  }
+  .badge {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 99px;
+    background: rgba(63, 185, 80, 0.15);
+    color: var(--accent);
+    border: 1px solid rgba(63, 185, 80, 0.4);
+    font-family: var(--font-mono);
+  }
+  .hud {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(155px, 1fr));
+    gap: 8px;
+    background: #0d121b;
+    border-bottom: 1px solid var(--border);
+    padding: 8px 18px;
+    font-family: var(--font-mono);
+  }
+  .hud-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+  }
+  .hud-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+  .hud-val { font-size: 15px; font-weight: 700; margin-top: 2px; color: var(--accent); }
+  .hud-val.cyan { color: var(--accent-cyan); }
+  .hud-val.gold { color: var(--accent-gold); }
+  .hud-val.purple { color: var(--accent-purple); }
+  .hud-sub { font-size: 10px; color: var(--muted); margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .presets {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 8px 18px;
+    background: var(--panel-alt);
+    border-bottom: 1px solid var(--border);
+    align-items: center;
+  }
+  .presets span { font-size: 12px; color: var(--muted); font-family: var(--font-mono); }
+  .preset-btn {
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 4px 10px;
+    font-size: 12px;
+    font-family: var(--font-mono);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .preset-btn:hover { border-color: var(--accent-cyan); color: var(--accent-cyan); }
+  #chat {
+    flex: 1;
+    overflow-y: auto;
+    padding: 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .msg {
+    max-width: 900px;
+    width: 100%;
+    margin: 0 auto;
+    padding: 12px 16px;
+    border-radius: 8px;
+    line-height: 1.55;
+    font-size: 14px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .msg.user {
+    background: #1b2538;
+    border: 1px solid #2e4063;
+    align-self: flex-end;
+  }
+  .msg.assistant {
+    background: var(--panel);
+    border: 1px solid var(--border);
+  }
+  .msg-meta {
+    margin-top: 8px;
+    padding-top: 6px;
+    border-top: 1px dashed var(--border);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--accent);
+  }
+  details.think-box {
+    background: #0d121a;
+    border: 1px solid #232d42;
+    border-radius: 6px;
+    padding: 6px 10px;
+    margin-bottom: 8px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--muted);
+  }
+  details.think-box summary { cursor: pointer; color: var(--accent-purple); font-weight: 600; }
+  footer {
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+    padding: 12px 18px;
+  }
+  .input-row {
+    max-width: 900px;
+    margin: 0 auto;
+    display: flex;
+    gap: 8px;
+  }
+  textarea {
+    flex: 1;
+    background: #0b0e14;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    font-family: inherit;
+    font-size: 14px;
+    resize: none;
+    height: 46px;
+  }
+  textarea:focus { outline: none; border-color: var(--accent-cyan); }
+  select, button.send-btn {
+    background: var(--accent);
+    color: #061108;
+    font-weight: 700;
+    font-family: var(--font-mono);
+    border: none;
+    border-radius: 6px;
+    padding: 0 16px;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  select {
+    background: var(--panel-alt);
+    color: var(--text);
+    border: 1px solid var(--border);
+    font-weight: 500;
+  }
+  button.send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span>♟️ llama-modchip v2.1</span>
+    <span class="badge" id="status-badge">CONNECTING...</span>
+  </div>
+  <div style="font-family: var(--font-mono); font-size: 12px; color: var(--muted);" id="cpu-banner">
+    Probing CPU &amp; /dev/shm/llama_modchip.bin...
+  </div>
+</header>
+
+<section class="hud">
+  <div class="hud-card">
+    <div class="hud-label">⚡ Decode Speed</div>
+    <div class="hud-val" id="hud-tps">-- tok/s</div>
+    <div class="hud-sub" id="hud-peak">Peak burst: -- tok/s</div>
+  </div>
+  <div class="hud-card">
+    <div class="hud-label">⏱️ TTFT &amp; Prefill</div>
+    <div class="hud-val cyan" id="hud-ttft">-- ms</div>
+    <div class="hud-sub" id="hud-pp">Prefill: -- tok/s</div>
+  </div>
+  <div class="hud-card">
+    <div class="hud-label">♟️ Stockfish-PVS (M=7)</div>
+    <div class="hud-val purple" id="hud-spec">Active (84/92/96)</div>
+    <div class="hud-sub" id="hud-spec-sub">Zobrist TT + RouteCrack</div>
+  </div>
+  <div class="hud-card">
+    <div class="hud-label">💾 KV &amp; Mamba-2 Slot 0</div>
+    <div class="hud-val gold" id="hud-slot">0 tok</div>
+    <div class="hud-sub" id="hud-hp">2MB THP: -- GiB</div>
+  </div>
+  <div class="hud-card">
+    <div class="hud-label">🔧 Modchip Locks</div>
+    <div class="hud-val cyan" id="hud-locks">MoE Top-K=4</div>
+    <div class="hud-sub" id="hud-l3">L3 Win: 2048t | Full 256K</div>
+  </div>
+</section>
+
+<div class="presets">
+  <span>1-Click Benchmarks:</span>
+  <button class="preset-btn" onclick="runPreset('Write a high-performance C++20 lock-free ring buffer using std::atomic with cache-line alignment (alignas(64)) to prevent false sharing, and include a brief usage example.')">⚡ C++20 Lock-Free Ring Buffer</button>
+  <button class="preset-btn" onclick="runPreset('Refactor the code above to add batch push_bulk() and pop_bulk() methods with zero-copy span views, preserving the exact class structure and comments.')">♟️ In-Context Refactor (Stockfish M=7 Burst)</button>
+  <button class="preset-btn" onclick="runPreset('Explain in 5 concise bullet points why 2MB Transparent HugePages, AVX-512 VNNI tile repacking, and Stockfish Zobrist Transposition Tables accelerate 30B Sparse MoE inference on CPU.')">🧠 Systems Architecture Summary</button>
+  <button class="preset-btn" onclick="clearChat()" style="margin-left:auto;">🗑️ Clear Context</button>
+</div>
+
+<main id="chat">
+  <div class="msg assistant">👋 <b>Welcome to the llama-modchip v2.1 Live Console!</b>
+Send any prompt below or click one of the <b>1-Click Benchmarks</b> above to watch real-time token streaming and measure your CPU's <b>Prefill tok/s</b>, <b>Decode tok/s</b>, and <b>Stockfish-PVS (M=7) draft acceptance</b>.</div>
+</main>
+
+<footer>
+  <div class="input-row">
+    <select id="think-mode" title="Reasoning Budget">
+      <option value="0" selected>⚡ No Think (Fastest)</option>
+      <option value="1024">🧠 Med Think (1K)</option>
+      <option value="-1">🔬 Max Think</option>
+    </select>
+    <textarea id="prompt" placeholder="Ask anything or paste code to refactor... (Enter to send, Shift+Enter for newline)"></textarea>
+    <button class="send-btn" id="send-btn" onclick="sendMessage()">Send ↵</button>
+  </div>
+</footer>
+
+<script>
+let historyMsgs = [];
+let peakTps = 0.0;
+
+async function pollTelemetry() {
+  try {
+    const r = await fetch('/api/modchip');
+    if (!r.ok) return;
+    const d = await r.json();
+    const badge = document.getElementById('status-badge');
+    if (d.backend_up) {
+      badge.textContent = d.slot0_state || 'ONLINE';
+      badge.style.color = '#3fb950';
+    } else {
+      badge.textContent = 'WAITING FOR LLAMA-SERVER';
+      badge.style.color = '#d29922';
+    }
+    document.getElementById('cpu-banner').textContent = `${d.cpu_model} | Upstream: ${d.upstream}`;
+    document.getElementById('hud-slot').textContent = `${(d.slot0_tokens || 0).toLocaleString()} tok`;
+    document.getElementById('hud-hp').textContent = `2MB THP: ${d.anon_hugepages_gib} GiB`;
+    if (d.shm) {
+      document.getElementById('hud-locks').textContent = `MoE Top-K=${d.shm.moe_top_k} | Gates ${d.shm.rc_gates}`;
+      const swaMode = d.shm.attn_window === 0 ? 'Full 256K GQA' : `SWA ${d.shm.attn_window}t`;
+      document.getElementById('hud-l3').textContent = `L3 NTA: ${d.shm.l3_window}t | ${swaMode}`;
+    }
+  } catch (e) {}
+}
+setInterval(pollTelemetry, 2500);
+pollTelemetry();
+
+function clearChat() {
+  historyMsgs = [];
+  document.getElementById('chat').innerHTML = '<div class="msg assistant">Context cleared. Ready for new benchmark or prompt.</div>';
+}
+
+function runPreset(text) {
+  document.getElementById('prompt').value = text;
+  sendMessage();
+}
+
+document.getElementById('prompt').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+
+async function sendMessage() {
+  const input = document.getElementById('prompt');
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+  const btn = document.getElementById('send-btn');
+  btn.disabled = true;
+
+  const chat = document.getElementById('chat');
+  const uDiv = document.createElement('div');
+  uDiv.className = 'msg user';
+  uDiv.textContent = text;
+  chat.appendChild(uDiv);
+
+  const aDiv = document.createElement('div');
+  aDiv.className = 'msg assistant';
+  const contentSpan = document.createElement('div');
+  const metaDiv = document.createElement('div');
+  metaDiv.className = 'msg-meta';
+  metaDiv.textContent = '⏳ Evaluating prompt...';
+  aDiv.appendChild(contentSpan);
+  aDiv.appendChild(metaDiv);
+  chat.appendChild(aDiv);
+  chat.scrollTop = chat.scrollHeight;
+
+  historyMsgs.push({role: 'user', content: text});
+  const budget = parseInt(document.getElementById('think-mode').value, 10);
+
+  const tStart = performance.now();
+  let tFirst = null;
+  let tokCount = 0;
+  let fullText = '';
+  let thinkText = '';
+
+  try {
+    const resp = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        model: 'nemotron-30b',
+        messages: historyMsgs,
+        stream: true,
+        temperature: 0.0,
+        max_tokens: 1024,
+        reasoning_budget: budget,
+        chat_template_kwargs: {enable_thinking: budget !== 0},
+        timings_per_token: true
+      })
+    });
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let finalTimings = null;
+
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {stream: true});
+      const lines = buffer.split('\\n');
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const payload = line.slice(6).trim();
+        if (payload === '[DONE]') continue;
+        try {
+          const ev = JSON.parse(payload);
+          if (ev.timings) finalTimings = ev.timings;
+          const delta = (ev.choices && ev.choices[0] && ev.choices[0].delta) || {};
+          const rc = delta.reasoning_content || '';
+          const cc = delta.content || '';
+          if (rc || cc) {
+            const now = performance.now();
+            if (!tFirst) {
+              tFirst = now;
+              document.getElementById('hud-ttft').textContent = `${Math.round(tFirst - tStart)} ms`;
+            }
+            tokCount++;
+            if (rc) thinkText += rc;
+            if (cc) fullText += cc;
+
+            const elapsedSec = Math.max(0.05, (now - tFirst) / 1000.0);
+            if (tokCount > 2) {
+              const liveTps = tokCount / elapsedSec;
+              if (liveTps > peakTps && tokCount >= 5) peakTps = liveTps;
+              document.getElementById('hud-tps').textContent = `${liveTps.toFixed(1)} tok/s`;
+              document.getElementById('hud-peak').textContent = `Peak burst: ${peakTps.toFixed(1)} tok/s`;
+              metaDiv.textContent = `⚡ Streaming: ${liveTps.toFixed(1)} tok/s (${tokCount} chunks)`;
+            }
+
+            let html = '';
+            if (thinkText) {
+              html += `<details class="think-box"><summary>🧠 Reasoning Trace (${thinkText.length} chars)</summary>${thinkText.replace(/</g, '&lt;')}</details>`;
+            }
+            html += fullText.replace(/</g, '&lt;');
+            contentSpan.innerHTML = html;
+            chat.scrollTop = chat.scrollHeight;
+          }
+        } catch (e) {}
+      }
+    }
+
+    historyMsgs.push({role: 'assistant', content: fullText || thinkText});
+    if (finalTimings) {
+      const decTps = finalTimings.predicted_per_second || 0;
+      const ppTps = finalTimings.prompt_per_second || 0;
+      const nPred = finalTimings.predicted_n || tokCount;
+      if (decTps > peakTps) peakTps = decTps;
+      document.getElementById('hud-tps').textContent = `${decTps.toFixed(2)} tok/s`;
+      document.getElementById('hud-peak').textContent = `Peak burst: ${peakTps.toFixed(2)} tok/s`;
+      if (ppTps > 0) document.getElementById('hud-pp').textContent = `Prefill: ${ppTps.toFixed(1)} tok/s`;
+
+      let specStr = '';
+      if (finalTimings.draft_n && finalTimings.draft_n > 0) {
+        const accPct = (100.0 * (finalTimings.draft_n_accepted || 0) / finalTimings.draft_n).toFixed(1);
+        document.getElementById('hud-spec').textContent = `${accPct}% Accepted`;
+        document.getElementById('hud-spec-sub').textContent = `${finalTimings.draft_n_accepted}/${finalTimings.draft_n} draft tokens`;
+        specStr = ` | ♟️ Stockfish-PVS: ${finalTimings.draft_n_accepted}/${finalTimings.draft_n} (${accPct}% accepted)`;
+      }
+      metaDiv.textContent = `⚡ Decode: ${decTps.toFixed(2)} tok/s (${nPred} tok) | 🧠 Prefill: ${ppTps.toFixed(1)} tok/s | ⏱️ TTFT: ${Math.round((tFirst || performance.now()) - tStart)} ms${specStr}`;
+    } else {
+      const totalSec = Math.max(0.05, (performance.now() - (tFirst || tStart)) / 1000.0);
+      const avgTps = tokCount / totalSec;
+      metaDiv.textContent = `⚡ Decode: ~${avgTps.toFixed(1)} tok/s (${tokCount} chunks) | ⏱️ TTFT: ${Math.round((tFirst || performance.now()) - tStart)} ms`;
+    }
+    pollTelemetry();
+  } catch (err) {
+    metaDiv.textContent = `❌ Error contacting backend: ${err}`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+</script>
+</body>
+</html>
+"""
+
+
 class GatewayHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
@@ -789,6 +1310,25 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        clean_path = self.path.split("?", 1)[0]
+        if clean_path in ("/", "/index.html", "/ui"):
+            body = WEB_UI_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_cors_headers()
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if clean_path == "/api/modchip":
+            body = json.dumps(_build_modchip_telemetry_json()).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_cors_headers()
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self._forward_request("GET")
 
     def _send_anthropic_text_response(self, text, is_stream=False):
@@ -1168,7 +1708,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 headers_sent = True
 
-                if is_event_stream:
+                if is_event_stream and self.path.startswith("/v1/messages"):
                     stream_filter = ThinkBlockFilter(mode=active_mode, schemas=tool_schemas)
                     utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
                     last_event_time = time.time()
@@ -1202,6 +1742,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
                             self.wfile.flush()
                         except BrokenPipeError:
                             pass
+                elif is_event_stream:
+                    while True:
+                        chunk = upstream.read1(4096) if hasattr(upstream, "read1") else upstream.read(256)
+                        if not chunk:
+                            break
+                        try:
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                        except BrokenPipeError:
+                            return
                 else:
                     full_body = upstream.read()
                     try:

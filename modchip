@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# ♟️ ./modchip — Unified CLI for 256K CPU Co-Design, RouteCrack & Stockfish-PVS v2
+# ==============================================================================
+# Usage:
+#   ./modchip setup [args]          # Build patched llama.cpp + Stockfish-PVS & download GGUF
+#   ./modchip start [model.gguf]    # Start 256K CPU Server + Web UI Gateway in background
+#   ./modchip chat [-p "prompt"]    # Interactive terminal chat with live tok/s telemetry
+#   ./modchip bench                 # Run 2-stage speed test & print shareable CPU scorecard
+#   ./modchip web                   # Open Live Web Chat & Telemetry HUD (http://127.0.0.1:8787)
+#   ./modchip claude [args]         # Launch Claude Code CLI wired to local CPU engine
+#   ./modchip status                # Inspect live server, HugePages & /dev/shm/llama_modchip.bin
+#   ./modchip tui                   # Launch interactive Curses TUI controller
+#   ./modchip stop                  # Stop background server & gateway
+# ==============================================================================
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE_DIR="${WORKSPACE_DIR:-${REPO_ROOT}/workspace}"
+SERVER_PORT="${SERVER_PORT:-8789}"
+GATEWAY_PORT="${GATEWAY_PORT:-8787}"
+PID_DIR="${WORKSPACE_DIR}/run"
+SERVER_PID_FILE="${PID_DIR}/server.pid"
+GATEWAY_PID_FILE="${PID_DIR}/gateway.pid"
+DEFAULT_MODEL="${WORKSPACE_DIR}/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0.gguf"
+
+BOLD="\033[1m"
+GREEN="\033[92m"
+CYAN="\033[96m"
+YELLOW="\033[93m"
+RESET="\033[0m"
+
+is_port_up() {
+    local port="$1"
+    python3 - "$port" <<'PYEOF' 2>/dev/null
+import sys, socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(0.4)
+rc = s.connect_ex(("127.0.0.1", int(sys.argv[1])))
+s.close()
+sys.exit(0 if rc == 0 else 1)
+PYEOF
+}
+
+find_any_active_port() {
+    for p in "$GATEWAY_PORT" "$SERVER_PORT" 8080 8001; do
+        if is_port_up "$p"; then
+            echo "$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+cmd_setup() {
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        exec "${REPO_ROOT}/apple-silicon/setup.sh" "$@"
+    else
+        exec "${REPO_ROOT}/install.sh" "$@"
+    fi
+}
+
+cmd_start() {
+    local model="${1:-$DEFAULT_MODEL}"
+    mkdir -p "$PID_DIR" "${WORKSPACE_DIR}/logs"
+
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        echo -e "${CYAN}[*] macOS detected — delegating to apple-silicon/ scripts...${RESET}"
+        "${REPO_ROOT}/apple-silicon/start_server.sh" &
+        echo $! > "$SERVER_PID_FILE"
+        "${REPO_ROOT}/apple-silicon/start_gateway.sh" &
+        echo $! > "$GATEWAY_PID_FILE"
+        return 0
+    fi
+
+    if [[ ! -f "$model" ]]; then
+        echo -e "${YELLOW}[!] Model file not found at: ${model}${RESET}"
+        echo -e "    • Run ${BOLD}./modchip setup${RESET} to build & download Nemotron-3.5-30B-A3B automatically,"
+        echo -e "    • Or bring your own GGUF: ${BOLD}./modchip start /path/to/your_model.gguf${RESET}"
+        exit 1
+    fi
+
+    if is_port_up "$SERVER_PORT"; then
+        echo -e "${GREEN}[✓] llama-server is already listening on 127.0.0.1:${SERVER_PORT}${RESET}"
+    else
+        if [[ ! -x "${REPO_ROOT}/start_server.sh" ]]; then
+            echo -e "${YELLOW}[!] start_server.sh not found. Running './modchip setup --skip-model --model $model' first...${RESET}"
+            "${REPO_ROOT}/install.sh" --skip-model --model "$model"
+        fi
+        echo -e "${CYAN}[*] Starting 256K CPU Engine + Stockfish-PVS v2 (M=7) in background...${RESET}"
+        nohup "${REPO_ROOT}/start_server.sh" "$model" > "${WORKSPACE_DIR}/logs/server.log" 2>&1 &
+        echo $! > "$SERVER_PID_FILE"
+    fi
+
+    if is_port_up "$GATEWAY_PORT"; then
+        echo -e "${GREEN}[✓] Agentic SSE Gateway & Web HUD already listening on http://127.0.0.1:${GATEWAY_PORT}${RESET}"
+    else
+        export LLAMA_BACKEND_URL="http://127.0.0.1:${SERVER_PORT}"
+        export GATEWAY_PORT="${GATEWAY_PORT}"
+        nohup python3 "${REPO_ROOT}/gateway/sse_gateway.py" "${GATEWAY_PORT}" > "${WORKSPACE_DIR}/logs/gateway.log" 2>&1 &
+        echo $! > "$GATEWAY_PID_FILE"
+    fi
+
+    echo -ne "${CYAN}[*] Waiting for model weights to load & AVX-512/AVX2 repacking (logs: workspace/logs/server.log)...${RESET}"
+    for _ in $(seq 1 90); do
+        if curl -sf "http://127.0.0.1:${SERVER_PORT}/health" >/dev/null 2>&1; then
+            echo -e " ${GREEN}${BOLD}READY!${RESET}"
+            break
+        fi
+        echo -n "."
+        sleep 1
+    done
+    echo ""
+
+    echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════════════════════════════════════╗${RESET}"
+    echo -e "${BOLD}${GREEN}║ ♟️  llama-modchip v2.1 is LIVE! Choose how you want to interact:             ║${RESET}"
+    echo -e "${BOLD}${GREEN}╠══════════════════════════════════════════════════════════════════════════════╣${RESET}"
+    echo -e "  🌐 ${BOLD}Live Web Chat & Telemetry HUD${RESET} : ${CYAN}http://127.0.0.1:${GATEWAY_PORT}${RESET}"
+    echo -e "  💬 ${BOLD}Interactive Terminal Chat${RESET}     : ${GREEN}./modchip chat${RESET}"
+    echo -e "  📊 ${BOLD}Run 2-Stage Speed Benchmark${RESET}   : ${GREEN}./modchip bench${RESET}"
+    echo -e "  🤖 ${BOLD}Launch Claude Code Agent CLI${RESET}  : ${GREEN}./modchip claude${RESET}"
+    echo -e "  🛑 ${BOLD}Stop Background Services${RESET}      : ${YELLOW}./modchip stop${RESET}"
+    echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════════════════════════════════════╝${RESET}"
+}
+
+cmd_stop() {
+    local stopped=0
+    for pf in "$GATEWAY_PID_FILE" "$SERVER_PID_FILE"; do
+        if [[ -f "$pf" ]]; then
+            local pid
+            pid="$(cat "$pf" 2>/dev/null || true)"
+            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                kill "$pid" 2>/dev/null || true
+                stopped=1
+            fi
+            rm -f "$pf"
+        fi
+    done
+    pkill -f "llama-server-nemotron" 2>/dev/null && stopped=1 || true
+    pkill -f "gateway/sse_gateway.py" 2>/dev/null && stopped=1 || true
+    if [[ "$stopped" -eq 1 ]]; then
+        echo -e "${GREEN}[✓] Stopped llama-server and sse_gateway.${RESET}"
+    else
+        echo -e "${YELLOW}[i] No running background instances found.${RESET}"
+    fi
+}
+
+cmd_status() {
+    python3 "${REPO_ROOT}/scripts/check_cpu_readiness.py"
+    echo ""
+    if p="$(find_any_active_port)"; then
+        echo -e "${GREEN}${BOLD}[ONLINE]${RESET} Active inference endpoint detected on ${CYAN}http://127.0.0.1:${p}${RESET}"
+        if is_port_up "$GATEWAY_PORT"; then
+            echo -e "${GREEN}${BOLD}[WEB UI]${RESET} Live Web Chat & Telemetry HUD: ${CYAN}http://127.0.0.1:${GATEWAY_PORT}${RESET}"
+        fi
+    else
+        echo -e "${YELLOW}[OFFLINE]${RESET} No active server detected. Run ${BOLD}./modchip start${RESET} to launch."
+    fi
+}
+
+cmd_web() {
+    local url="http://127.0.0.1:${GATEWAY_PORT}"
+    if ! is_port_up "$GATEWAY_PORT"; then
+        echo -e "${YELLOW}[i] Gateway not running on :${GATEWAY_PORT} — starting services now...${RESET}"
+        cmd_start "$@"
+    fi
+    echo -e "${GREEN}[*] Opening Live Web Chat & Telemetry HUD at ${CYAN}${url}${RESET}"
+    if command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$url" >/dev/null 2>&1 || true
+    elif command -v open >/dev/null 2>&1; then
+        open "$url" >/dev/null 2>&1 || true
+    fi
+}
+
+cmd_chat() {
+    if ! find_any_active_port >/dev/null; then
+        echo -e "${YELLOW}[i] No running server detected on ports ${GATEWAY_PORT}/${SERVER_PORT}/8080/8001.${RESET}"
+        if [[ -f "$DEFAULT_MODEL" ]]; then
+            cmd_start "$DEFAULT_MODEL"
+        fi
+    fi
+    exec python3 "${REPO_ROOT}/scripts/chat.py" "$@"
+}
+
+cmd_bench() {
+    if ! find_any_active_port >/dev/null; then
+        echo -e "${YELLOW}[i] No running server detected — checking if model is available to auto-start...${RESET}"
+        if [[ -f "$DEFAULT_MODEL" ]]; then
+            cmd_start "$DEFAULT_MODEL"
+        fi
+    fi
+    exec python3 "${REPO_ROOT}/scripts/chat.py" --bench "$@"
+}
+
+cmd_claude() {
+    if ! is_port_up "$GATEWAY_PORT"; then
+        if [[ -f "$DEFAULT_MODEL" ]]; then
+            cmd_start "$DEFAULT_MODEL"
+        fi
+    fi
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:${GATEWAY_PORT}"
+    echo -e "${GREEN}[*] Launching Claude Code wired to ${CYAN}${ANTHROPIC_BASE_URL}${RESET}..."
+    exec claude "$@"
+}
+
+cmd_tui() {
+    local model="${1:-$DEFAULT_MODEL}"
+    exec python3 "${REPO_ROOT}/scripts/llama_modchip.py" --model "$model" --tui
+}
+
+cmd_help() {
+    awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
+}
+
+SUBCMD="${1:-help}"
+[[ $# -gt 0 ]] && shift || true
+
+case "$SUBCMD" in
+    setup|install)   cmd_setup "$@" ;;
+    start|up|run)    cmd_start "$@" ;;
+    stop|down)       cmd_stop ;;
+    restart)         cmd_stop; cmd_start "$@" ;;
+    chat|ask)        cmd_chat "$@" ;;
+    bench|benchmark) cmd_bench "$@" ;;
+    web|ui)          cmd_web "$@" ;;
+    claude)          cmd_claude "$@" ;;
+    status|info)     cmd_status ;;
+    tui)             cmd_tui "$@" ;;
+    -h|--help|help)  cmd_help ;;
+    *)
+        echo -e "${YELLOW}[!] Unknown command: ${SUBCMD}${RESET}"
+        cmd_help
+        exit 1
+        ;;
+esac
