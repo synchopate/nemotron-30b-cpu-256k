@@ -93,22 +93,23 @@ Because **Mamba-2 layers compress arbitrarily long history into a fixed-size rec
 
 ---
 
-## 3. Nine Microarchitectural & Engine Optimizations
+## 3. Ten Microarchitectural & Engine Optimizations
 
-Even with Nemotron 3.5's tiny KV footprint, scaling to 256K tokens at 30–50+ tok/s—and generalizing the stack across pure GQA MoE models via `llama-modchip`—required solving **nine** deep systems bottlenecks across `ggml-cpu`, the Linux kernel, and the speculative decoding pipeline.
+Even with Nemotron 3.5's tiny KV footprint, scaling to 256K tokens at 30–80+ tok/s—and generalizing the stack across pure GQA MoE models via `llama-modchip`—required solving **ten** deep systems bottlenecks across `ggml-cpu`, `ggml-quants`, the Linux kernel, and the speculative decoding pipeline.
 
 ```mermaid
 flowchart LR
     subgraph Engine["1. Attention, L3 & MoE Bandwidth Control"]
-        O1["Arch-Aware SWA (4096 Win + Stride Lock)"] --> O2["Bidirectional _MM_HINT_NTA (KV + Weights)"]
+        O1["Exact 256K Attn Default + Opt-In SWA"] --> O2["Bidirectional _MM_HINT_NTA (KV + Weights)"]
         O2 --> O9["Norm-Preserving MoE Top-K=4 Pruning"]
+        O9 --> O10["Block-64 2-Level Fractal-MoE (3.75 bpw)"]
     end
     subgraph Compute["2. Vector Pipeline & Virtual Memory"]
         O3["AVX-512 VNNI 8x8 Tile Repacking"] --> O4["2MB Transparent HugePages (6.14GB STLB)"]
-        O4 --> O5["Dual-CCD OpenMP 1:1 Core Pinning"]
+        O4 --> O5["Per-CCD OpenMP 1:1 Core Pinning"]
     end
     subgraph Spec["3. Draftless Linear Speculation & Zero-Prefill"]
-        O6["RouteCrack Cascade + Online Trie/PPM"] --> O7["EAKV Asymmetric Quant + VPI RoPE"]
+        O6["RouteCrack Cascade + Stockfish-PVS (M=7)"] --> O7["EAKV Asymmetric Quant + VPI RoPE"]
         O7 --> O8["HARP /dev/shm Cache + Slot 0 Disk Restore"]
     end
     Engine --> Compute --> Spec
@@ -116,7 +117,7 @@ flowchart LR
 
 ---
 
-### 3.1. Optimization 1: Hybrid & Interleaved Sliding Window Attention (SWA) + Attention Sinks
+### 3.1. Optimization 1: Exact Full-Context Attention Default (`LLAMA_ATTN_WINDOW=0`) & Opt-In Sliding Window (`4096` + 16 Sinks)
 When initially pushing Nemotron 3.5 from 4K to 28K tokens using full dense attention on its 6 GQA layers, a subtle bottleneck emerged: while Mamba-2 scaled linearly, the 6 GQA layers still executed $O(N^2)$ dot products during prefill and swept the growing KV buffer during decode:
 - Slice 1 ($0 \rightarrow 4.8\text{K}$): **178.6 tok/s**
 - Slice 2 ($4.8\text{K} \rightarrow 9.7\text{K}$): **100.9 tok/s**
@@ -124,14 +125,17 @@ When initially pushing Nemotron 3.5 from 4K to 28K tokens using full dense atten
 - Slice 4 ($14.6\text{K} \rightarrow 19.5\text{K}$): **55.0 tok/s**
 - Slice 5 ($19.5\text{K} \rightarrow 28.2\text{K}$): **45.0 tok/s**
 
-**The Co-Design Insight**: Why force the 6 GQA layers to compute dense attention over 256,000 tokens when the **46 Mamba-2 SSM layers already carry the global long-range state**? In hybrid Mamba-Attention architectures, Attention layers specialize in **high-resolution local token routing and induction heads**, while SSM layers handle **global semantic persistence**.
+**Exact Full-Context Default vs. Opt-In Approximate SWA**:
+While the 46 Mamba-2 SSM layers carry a compressed recurrent summary of the full 256K context, **exact verbatim retrieval of arbitrary tokens outside the local window** (such as an alphanumeric passkey or port number defined $>4,096$ tokens earlier) requires the 6 GQA attention layers to attend over the full sequence.
+- **Empirical Verification (`benchmarks/eval_quality_and_tools.py` Suite `3.1`, `8,512`-token haystack with needle at `37%` depth = `~5,360` tokens from the end)**:
+  - **`LLAMA_ATTN_WINDOW=0` (Default — Exact Full-Context Attention)**: Scores **`10.0 / 10.0`**, retrieving both `MODCHIP-E8-9472-OMEGA` and port `49183` verbatim at `19.54–26.08 tok/s` while `_MM_HINT_NTA` (`LLAMA_KV_L3_WINDOW=2048`) streams older KV cells without polluting L3.
+  - **`LLAMA_ATTN_WINDOW=4096` (Opt-In Approximate Throughput Mode)**: Scores **`0.0 / 10.0`** on exact out-of-window passkey recall (the compressed Mamba-2 state preserves semantic topic continuity but cannot reconstruct random digits 5,360 tokens back), while keeping prefill throughput flat across long streaming sessions.
 
-By patching `ggml_compute_forward_flash_attn_ext_f16_one_chunk` in `ggml/src/ggml-cpu/ops.cpp` to support a runtime-configurable **4,096-token Sliding Window + 16 initial Attention Sinks** (`LLAMA_ATTN_WINDOW=4096`, `LLAMA_SWA_STRIDE=1` on Hybrid SSM models, `LLAMA_SWA_STRIDE=4` Interleaved 3:1 SWA on Pure GQA models, or `LLAMA_ATTN_WINDOW=0` for full 256K global attention):
-1. The 46 Mamba-2 layers process the full 256K context with zero truncation.
-2. When `LLAMA_ATTN_WINDOW=4096` is enabled on Nemotron 3.5 (`LLAMA_SWA_STRIDE=1`), the 6 GQA layers attend strictly to `[0 .. 15] U [cur_pos - 4096 .. cur_pos]`, capping the active KV working set at:
+Therefore, `ggml_compute_forward_flash_attn_ext_f16_one_chunk` in `ggml/src/ggml-cpu/ops.cpp` and `llama_modchip.py` **default to exact full-context attention (`LLAMA_ATTN_WINDOW=0`)**, while providing `LLAMA_ATTN_WINDOW=4096` (+ `16` sinks) as an explicit opt-in approximate mode:
+1. By default (`LLAMA_ATTN_WINDOW=0`), all 6 GQA layers attend to the full 256K context (`432 MB` total KV cache), with `_MM_HINT_NTA` cache-bypass streaming (`§3.2`) protecting the 64 MB L3 cache.
+2. When `LLAMA_ATTN_WINDOW=4096` is explicitly opted in on Nemotron 3.5 (`LLAMA_SWA_STRIDE=1`), the 6 GQA layers attend to `[0 .. 15] U [cur_pos - 4096 .. cur_pos]`, capping the active KV working set at:
    $$4,112 \text{ tokens} \times 1.536\text{–}1.728\text{ KB/token} = \mathbf{6.31\text{–}6.94\text{ MB}}$$
-   **6.31 MB fits nearly 10 times over inside the 64 MB L3 cache of the Ryzen 9 9955HX!**
-3. When loaded on a **Pure GQA Transformer** (e.g., `Qwen3-30B-A3B` with 48 GQA layers and 0 SSM layers), `llama_modchip.py` sets `LLAMA_SWA_STRIDE=4`: `ops.cpp` (`parse_tensor_layer_id(k)`) keeps every 4th layer (`layer_id % 4 == 3`, 12 layers) at full 256K global attention while applying L3 SWA to the remaining 36 layers (`75%` KV bandwidth reduction without losing >4K memory).
+3. When approximate SWA is opted in on a **Pure GQA Transformer** (e.g., `Qwen3-30B-A3B` with 48 GQA layers and 0 SSM layers), `llama_modchip.py` sets `LLAMA_SWA_STRIDE=4`: `ops.cpp` (`parse_tensor_layer_id(k)`) keeps every 4th layer (`layer_id % 4 == 3`, 12 layers) at full 256K global attention while applying L3 SWA to the remaining 36 layers.
 
 #### C++ Implementation (`ggml/src/ggml-cpu/ops.cpp`):
 ```cpp
@@ -149,7 +153,7 @@ struct kv_l3_policy_config {
         const char * env_p  = getenv("LLAMA_KV_L3_NTA_PREFIX");
         kv_nta_prefix       = env_p ? atoll(env_p) : -1;
         const char * env_aw = getenv("LLAMA_ATTN_WINDOW");
-        attn_window         = env_aw ? atoll(env_aw) : 4096;
+        attn_window         = env_aw ? atoll(env_aw) : 0; // Exact full-context attention by default
         const char * env_as = getenv("LLAMA_ATTN_SINKS");
         attn_sinks          = env_as ? atoll(env_as) : 16;
         const char * env_st = getenv("LLAMA_SWA_STRIDE");
@@ -416,7 +420,7 @@ Integrating **`StockfishDrafter`** ([`speculative/cpp/rc_stockfish.h`](speculati
 > [!IMPORTANT]
 > **Key Breakthrough**: **`Stockfish-PVS v2 (Sweet Spot, M=7)` yields `+223` additional accepted tokens (`5,440 -> 5,663`) with ZERO additional wasted tokens (`892 -> 892`, marginal precision = `100.0%` net!) and `-32` fewer Mamba-2 recurrent state rollbacks (`482 -> 450`)!**
 
-##### Live Production 5-Stage Telemetry on `CT 100` (`Ryzen 9 9955HX`, `22.2K -> 27.7K` Context)
+##### Live Production 5-Stage Telemetry (`AMD Ryzen 9 9955HX`, `22.2K -> 27.7K` Context)
 
 | Stage & Workload (`Nemotron-3.5-30B-A3B-Q4_0`, `0 GPUs`) | Active Context | `M=5` Speed (`Avg / Peak`) | **`Stockfish-PVS v2 (M=7)` Speed (`Avg / Peak`)** | Draft Acceptance (`Acc / Drafted`) | Mean Spec Length (`tok/step`) |
 | :--- | :---: | :---: | :---: | :---: | :---: |
@@ -478,27 +482,76 @@ By hooking `hparams.n_expert_used` in `src/llama-model.cpp` via `LLAMA_MOE_TOP_K
 
 ---
 
-### 3.10. Generalizing Across Models & CPUs: `llama_modchip.py` ("Priiloader for CPU LLM") & Interleaved 3:1 SWA (`LLAMA_SWA_STRIDE=4`)
+### 3.10. Optimization 10: Block-64 2-Level Hierarchical Non-Linear MoE Quantization (`Fractal-64` `3.75 bpw` & `MXFP4` `4.25 bpw`)
 
-Not all optimizations are safe on every GGUF architecture. Inspired by console modchips / Priiloader (`hacks.ini`), [`scripts/llama_modchip.py`](scripts/llama_modchip.py) inspects any `.gguf` binary header and the host Linux CPU/cache topology in `<5 ms`, classifies all 9 microarchitectural hacks into three safety tiers (`🟢 SAFE / UNIVERSAL`, `🔵 AUTO-ADAPTIVE`, `🟡/⚪ ARCH-CONDITIONAL WITH SAFETY LOCK`), and operates at two complementary levels:
-- **Startup & Graph-Construction Profile**: Injects load-time parameters (`LLAMA_MOE_TOP_K`, `--repack`, `MADV_HUGEPAGE`, `1:1 Core Pinning`, `-ctk q8_0 -ctv q4_0`).
+In `NVIDIA-Nemotron-3.5-Lightning-30B-A3B`, the 46 routed MoE expert tensors (`blk.*.ffn_up_exps.weight` and `blk.*.ffn_down_exps.weight`, `128` experts per layer) contain **26.77 billion parameters (`90.1%` of total model weights)**. However, their inner dimensions are `n_ff_exp = 1856` (`29 × 64`) and `n_embd = 2688` (`42 × 64`). Because neither `1856` nor `2688` is divisible by `QK_K = 256`, **all standard 256-element sub-4-bit K-quants and I-quants in `llama.cpp` (`Q3_K`, `IQ3_S`, `IQ3_XXS`) fail alignment and fall back to `Q4_0`**.
+
+Furthermore, in the official `NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0.gguf` (`17.59 GiB`), only the routed MoE experts are `Q4_0` (`4.50 bpw`), while 118 other tensors (`ssm_in`, `ssm_out`, `ffn_up_shexp`, `ffn_down_shexp`, `token_embd`) remain at `Q8_0` (`8.50 bpw`).
+
+#### 1. What Builds on Known Quantization Literature vs. What Is New Here
+- **Foundations from existing literature (`K-quants`, `QLoRA`, `NF4` / `IQ4_NL`)**: Two-level hierarchical block scaling (a floating-point super-block scale combined with integer sub-block scales) and non-uniform lookup tables decoded via `VPSHUFB` (`_mm256_shuffle_epi8`) are established techniques in `Q3_K`/`Q4_K` and `IQ4_NL`/`MXFP4`.
+- **What is new in `Fractal-64` (`block_q2_0`, `QK2_0 = 64`, `30 bytes` = `3.75 bpw`)**:
+  1. **Breaking the `QK_K = 256` Geometry Trap via an `8×8` Micro-Block Hierarchy (`QK2_0 = 64`, 8 sub-blocks of 8 weights)**: By shrinking the super-block from `256` to `64` (dividing `1856` into `29` blocks and `2688` into `42` blocks with **zero fallback tensors**) and shrinking each sub-block to **8 weights** (`1` sub-scale every `8` weights vs every `16` or `32` weights in `Q3_K`/`MXFP4`), local outlier variance is captured at twice the spatial resolution.
+  2. **Shifted Positive 4-Bit Sub-Scale Window (`mult[b] = 4 + sc[b] ∈ {4..19}`)**: Across 8 sub-blocks of 8 weights, the ratio between the largest and smallest 8-weight sub-block scale rarely drops below `4/19`, making raw 4-bit codes `{0..3}` dead codes. Shifting the 4-bit nibble `sc[b] ∈ {0..15}` to `mult[b] = 4 + sc[b] ∈ {4..19}` boosts sub-scale resolution by **`+31%`** at zero bit overhead.
+  3. **Zero-Instruction Sub-Scale Multiplication Fused Inside `vpmaddwd` (`_mm256_madd_epi16(p01, vmult01)`)**: In standard `llama.cpp` AVX2 kernels (`MXFP4`, `Q4_0`), after `_mm256_maddubs_epi16` produces `16 × int16_t` pairwise products, `_mm256_madd_epi16(p01, ones)` multiplies by `1` merely to widen and sum pairs into `8 × int32_t`. Because an 8-weight sub-block maps to **4 consecutive `int16_t` lanes** after `maddubs`, we replace `ones` with `vmult01` (`{4..19}`), fusing sub-block rescaling and `int16 -> int32` horizontal accumulation into a single 1-cycle `vpmaddwd` instruction!
+  4. **Interleaved Bit-Plane Unpacking + `_MM_HINT_NTA` Streaming**: The 64 upper bits (`qh[8]`) are interleaved across even/odd 8-byte halves so `_mm_unpacklo_epi64(qh_lo, _mm_srli_epi16(qh_lo, 1))` aligns all 64 3-bit indices for `_mm256_shuffle_epi8(lut256, idx)` (`lut = {-14, -8, -4, -1, +1, +4, +8, +14}`), while `_MM_HINT_NTA` bypasses the 64 MB L3 cache.
+
+#### 2. Struct Layout (`ggml/src/ggml-common.h`) & SQNR on True `BF16` Nemotron Weights
+```c
+#define QK2_0 64
+typedef struct {
+    ggml_half d;          // master FP16 super-block scale (2 bytes)
+    uint8_t   scales[4];  // 8 x 4-bit shifted sub-scales (low/high nibbles) for 8x8 sub-blocks, mult = (4 + s) in {4..19}
+    uint8_t   qs[16];     // lower 2 bits for 64 3-bit non-linear indices
+    uint8_t   qh[8];      // upper 1 bit for 64 3-bit non-linear indices
+} block_q2_0;
+static_assert(sizeof(block_q2_0) == 30, "wrong q2_0 block size/padding");
+```
+Measured on true unquantized `BF16` expert weights from `NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16.gguf` (`58.84 GiB`):
+- **`Q4_0` (`4.50 bpw`, block 32)**: `21.02 dB` SQNR
+- **`MXFP4` (`4.25 bpw`, block 32)**: `18.51 dB` SQNR
+- **`Fractal-64` (`3.75 bpw`, block 64 / `8×8` sub-blocks)**: **`17.78 dB` SQNR** (**`+1.53 dB` higher than `Q3_K` at `16.25 dB`** and **`+2.91 dB` higher than `IQ3_S` at `14.87 dB`**)
+
+#### 3. Three-Way Live Hardware Verification (`benchmarks/eval_quality_and_tools.py`, AMD Zen 5)
+
+Built via [`scripts/build_fractal_moe_gguf.sh`](scripts/build_fractal_moe_gguf.sh) (`--profile fractal64` from `BF16`, or `--profile mxfp4` when re-quantizing from `Q4_0`), keeping the 6 GQA attention layers (`attn_q`, `attn_k`, `attn_v`, `attn_output`), `ssm_out`, and `output.weight` at `Q8_0` (full report and raw JSON outputs in [`benchmarks/FRACTAL_MOE_QUALITY_GATE.md`](benchmarks/FRACTAL_MOE_QUALITY_GATE.md) and [`benchmarks/results/`](benchmarks/results/)):
+
+| Metric / Suite | `Baseline-Q4_0` (Official GGUF) | `Fractal-MXFP4` (from `Q4_0`) | **`Fractal-64-BF16` (from `BF16` `58.84 GiB`)** | `Fractal-64-BF16` vs Baseline |
+| :--- | :---: | :---: | :---: | :---: |
+| **GGUF File Size on Disk** | `17.59 GiB` (`18,015 MiB`) | `15.95 GiB` (`16,328 MiB`) | **`14.35 GiB` (`14,698 MiB`)** | **`-3.24 GiB` (`-18.4%`)** |
+| **1. Agentic Tool-Calling (`30` pts)** | `30.0 / 30.0` | `30.0 / 30.0` | **`30.0 / 30.0`** | `100.0%` parity |
+| **2. Executable Code Gen (`30` pts)** | `30.0 / 30.0` | `30.0 / 30.0` | **`30.0 / 30.0`** | `100.0%` parity |
+| **3. Long-Context Needle (`8.5K`) & Math (`20` pts)** | `20.0 / 20.0` | `20.0 / 20.0` | **`20.0 / 20.0`** | `100.0%` parity |
+| **Quality & Tool-Use Subtotal (`80` pts)** | `80.0 / 80.0` | `80.0 / 80.0` | **`80.0 / 80.0`** | **`100.0%` parity (`100/100` Total)** |
+| **Single-Turn Decode Throughput (`tok/s`)** | `19.54 tok/s` | **`26.08 tok/s`** | **`25.02 tok/s`** | **`+28.0%` (`+33.5%` on MXFP4)** |
+| **Idle Resident RAM (`VmRSS`, 256K Context)** | `21.41 GiB` | `17.46 GiB` | **`15.40 GiB`** | **`-6.01 GiB` (`-28.1%` RAM saved)** |
+| **Post-Benchmark Peak `VmRSS` (`256K` Context)** | `21.71 GiB` | `18.86 GiB` | **`17.27 GiB`** | **`-4.44 GiB` (`-20.5%` RAM saved)** |
+
+---
+
+### 3.11. Generalizing Across Models & CPUs: `llama_modchip.py` ("Priiloader for CPU LLM") & Interleaved 3:1 SWA (`LLAMA_SWA_STRIDE=4`)
+
+Not all optimizations are safe on every GGUF architecture. Inspired by console modchips / Priiloader (`hacks.ini`), [`scripts/llama_modchip.py`](scripts/llama_modchip.py) inspects any `.gguf` binary header and the host Linux CPU/cache topology in `<5 ms`, classifies all microarchitectural hacks into safety tiers (`🟢 SAFE / UNIVERSAL`, `🔵 AUTO-ADAPTIVE`, `🟡 EXPERIMENTAL`, `⚪ LOCKED`), and operates at two complementary levels:
+- **Startup & Graph-Construction Profile**: Injects load-time parameters (`LLAMA_MOE_TOP_K`, `--repack`, `MADV_HUGEPAGE`, deterministic per-CCD `taskset -c` core pinning, `-ctk q8_0 -ctv q4_0`).
 - **Live Per-Forward-Pass `/dev/shm/llama_modchip.bin` Control**: Writes a 48-byte POSIX shared-memory struct read on every forward/draft pass by `ggml-cpu/ops.cpp` and `common/ngram-map.cpp` (`attn_window`, `attn_sinks`, `swa_stride`, `l3_window`, `rc_enabled`, `rc_cert_d0/d1/d2`).
 
 1. **Dynamic L3 Window Sizing (`LLAMA_KV_L3_WINDOW`)**:
    Reads `attention.head_count_kv`, `key_length`, and `value_length` from the GGUF header and sizes `LLAMA_KV_L3_WINDOW` so hot KV cells occupy $\le 25\%$ of detected L3 cache capacity:
    $$\text{LLAMA\_KV\_L3\_WINDOW} = \left\lfloor \frac{0.25 \times \text{L3\_Bytes}}{\text{KV\_Bytes\_Per\_Token}} \right\rfloor$$
-2. **Pure-GQA Fail-Closed Safety Lock & Interleaved 3:1 SWA (`LLAMA_SWA_STRIDE=4`)**:
-   - On **Hybrid SSM + Attention** models (`ssm_layers > 0`, e.g., `Nemotron-3.5-30B-A3B`, `Nemotron-H-8B`), the Mamba-2 state carries 100% of the 256K global context, so full SWA (`LLAMA_SWA_STRIDE=1`) across all GQA layers is lossless.
-   - On **Pure GQA Transformers** (`ssm_layers == 0`, e.g., `Qwen3-30B-A3B`, `Llama-3-70B/8B`), applying SWA (`W=4096`) to all layers would erase memory beyond 4K tokens. `llama_modchip.py` engages a **Fail-Closed Safety Lock** and sets `LLAMA_SWA_STRIDE=4`: `ggml-cpu/ops.cpp` (`parse_tensor_layer_id(k)`) applies L3 SWA (`4096 + 16 sinks`) to **3 out of every 4 layers (`75%`)** while keeping **every 4th layer (`25%`)—and any layer with an unrecognized tensor name (`lid < 0`)—at full 256K global attention**!
+2. **Exact Attention Default (`LLAMA_ATTN_WINDOW=0`) & Opt-In SWA Safety Lock (`LLAMA_SWA_STRIDE=4`)**:
+   - By default (`LLAMA_ATTN_WINDOW=0`), `llama_modchip.py` preserves **exact full-context attention** on all architectures so verbatim long-range needle retrieval is never truncated.
+   - When approximate Sliding Window Attention (`LLAMA_ATTN_WINDOW=4096`) is explicitly opted in: on **Hybrid SSM + Attention** models (`ssm_layers > 0`), `LLAMA_SWA_STRIDE=1` applies the window across the GQA layers while Mamba-2 maintains semantic continuity; on **Pure GQA Transformers** (`ssm_layers == 0`, e.g., `Qwen3-30B-A3B`, `Llama-3`), `llama_modchip.py` sets `LLAMA_SWA_STRIDE=4` so `ggml-cpu/ops.cpp` (`parse_tensor_layer_id(k)`) applies L3 SWA (`4096 + 16 sinks`) to **3 out of every 4 layers (`75%`)** while keeping **every 4th layer (`25%`)—and any layer with an unrecognized tensor name (`lid < 0`)—at full 256K global attention**.
 
-#### Live Multi-Model Audit Across 4 Distinct GGUF Architectures (`scripts/llama_modchip.py --audit`)
+#### Live Multi-Model Audit Across 6 GGUF Configurations (`scripts/llama_modchip.py --audit`)
 
-| Model GGUF | Architecture & Layers | KV / Token (`Q8_0/Q4_0` EAKV) | Auto `L3_WINDOW` | SWA Policy (`LLAMA_SWA_STRIDE`) | `RouteCrack` Gate | MoE `Top-K` Pruning |
+| Model GGUF | Architecture & Layers | KV / Token (`Q8_0/Q4_0` EAKV) | Auto `L3_WINDOW` | Default Attention Policy | `RouteCrack` Gate | MoE `Top-K` Pruning |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`Nemotron-3.5-30B-A3B-Q4_0`** | `nemotron_h_moe` (`46 SSM + 6 GQA`) | **`2.44 KB/tok`** *(`1.73 KB` in `Q4/Q4`)* | `2048` (`4.88 MiB`) | `🟢 Full SWA (stride=1)` | `Strict (84/92/96)` | `🟢 6 -> 4 (norm=True)` |
-| **`Qwen3-30B-A3B-Q4_K_M`** | `qwen3moe` (`0 SSM + 48 GQA`) | `39.00 KB/tok` *(`27.65 KB` in `Q4/Q4`)* | `384` (`14.62 MiB`) | `🟡 Interleaved 3:1 (stride=4)` | `CPU-MoE (80/90/95)` | `🟢 8 -> 4 (norm=True in qwen3moe.cpp:144)` |
-| **`Nemotron-H-8B-Reasoning-128K`** | `nemotron_h` (`48 SSM + 4 GQA`) | `6.50 KB/tok` | `2048` (`13.00 MiB`) | `🟢 Full SWA (stride=1)` | `Strict (84/92/96)` | `⚪ LOCKED (Dense)` |
-| **`Llama-3-Security-40L-Q8_0`** | `llama` (`0 SSM + 40 GQA`) | `65.00 KB/tok` | `256` (`16.25 MiB`) | `🟡 Interleaved 3:1 (stride=4)` | `Balanced (78/88/94)` | `⚪ LOCKED (Dense)` |
+| **`Nemotron-3.5-30B-A3B-Fractal-64`** (`14.35 GiB`) | `nemotron_h_moe` (`46 SSM + 6 GQA`) | **`2.44 KB/tok`** *(`1.73 KB` in `Q4/Q4`)* | `2048` (`4.88 MiB`) | `🟢 Exact 256K (window=0)` | `Strict (84/92/96)` | `🟡 6 -> 4 (norm=True)` |
+| **`Nemotron-3.5-30B-A3B-Fractal-MXFP4`** (`15.95 GiB`) | `nemotron_h_moe` (`46 SSM + 6 GQA`) | **`2.44 KB/tok`** *(`1.73 KB` in `Q4/Q4`)* | `2048` (`4.88 MiB`) | `🟢 Exact 256K (window=0)` | `Strict (84/92/96)` | `🟡 6 -> 4 (norm=True)` |
+| **`Nemotron-3.5-30B-A3B-Q4_0`** (`17.59 GiB`) | `nemotron_h_moe` (`46 SSM + 6 GQA`) | **`2.44 KB/tok`** *(`1.73 KB` in `Q4/Q4`)* | `2048` (`4.88 MiB`) | `🟢 Exact 256K (window=0)` | `Strict (84/92/96)` | `🟡 6 -> 4 (norm=True)` |
+| **`Qwen3-30B-A3B-Q4_K_M`** (`17.28 GiB`) | `qwen3moe` (`0 SSM + 48 GQA`) | `39.00 KB/tok` *(`27.65 KB` in `Q4/Q4`)* | `384` (`14.62 MiB`) | `🟢 Exact (0) / 🟡 3:1 SWA (stride=4)` | `CPU-MoE (80/90/95)` | `🟡 8 -> 4 (norm=True)` |
+| **`Nemotron-H-8B-Reasoning-128K`** (`4.6 GiB`) | `nemotron_h` (`48 SSM + 4 GQA`) | `6.50 KB/tok` | `2048` (`13.00 MiB`) | `🟢 Exact (window=0)` | `Strict (84/92/96)` | `⚪ LOCKED (Dense)` |
+| **`Llama-3-Security-40L-Q8_0`** (`23.3 GiB`) | `llama` (`0 SSM + 40 GQA`) | `65.00 KB/tok` | `256` (`16.25 MiB`) | `🟢 Exact (0) / 🟡 3:1 SWA (stride=4)` | `Balanced (78/88/94)` | `⚪ LOCKED (Dense)` |
 
 Measured directly on `Qwen3-30B-A3B-Q4_K_M` (`17.28 GiB`) on the `Ryzen 9 9955HX`, applying the `llama_modchip.py` profile (`LLAMA_MOE_TOP_K=4` `8->4` + `LLAMA_SWA_STRIDE=4` Interleaved 3:1 SWA + `LLAMA_KV_L3_WINDOW=384` + `-ctk q8_0 -ctv q4_0`) accelerates `pp512` prefill from **`209.04` to `224.05 tok/s` (`+7.2%`)** and boosts base non-speculative `tg64` decode from **`25.12` to `34.80 tok/s` (`+38.5%`)**!
 

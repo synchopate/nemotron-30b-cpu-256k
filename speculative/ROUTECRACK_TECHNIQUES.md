@@ -76,7 +76,7 @@ Integrating `StockfishDrafter` unlocked **4 major techniques** in [`speculative/
 
 ---
 
-## 4. Verification Benchmarks: Held-Out `77,456`-Token Ablation & Live `CT 100` Telemetry
+## 4. Verification Benchmarks: Held-Out `77,456`-Token Ablation & Live Production Telemetry
 
 ### A. Held-Out Benchmark Ablation (`speculative/cpp/test_synergy.cpp`, `77,456` Nemotron-3.5 Tokens)
 

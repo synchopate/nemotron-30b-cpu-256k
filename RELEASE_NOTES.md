@@ -1,6 +1,27 @@
-# Release Notes — `llama-modchip` (`v2.1.0`)
+# Release Notes — `llama-modchip` (`v2.2.0`)
 
-> 📄 **Quick Links:** [Overview (`README.md`)](README.md) · [Technical Paper (`ARCHITECTURE.md`)](ARCHITECTURE.md) · [96+ `RouteCrack + Stockfish-PVS` Techniques (`speculative/ROUTECRACK_TECHNIQUES.md`)](speculative/ROUTECRACK_TECHNIQUES.md) · [Engineering FAQ (`FAQ.md`)](FAQ.md)
+> 📄 **Quick Links:** [Overview (`README.md`)](README.md) · [Technical Paper (`ARCHITECTURE.md`)](ARCHITECTURE.md) · [Fractal-MoE Quality Gate (`benchmarks/FRACTAL_MOE_QUALITY_GATE.md`)](benchmarks/FRACTAL_MOE_QUALITY_GATE.md) · [96+ `RouteCrack + Stockfish-PVS` Techniques (`speculative/ROUTECRACK_TECHNIQUES.md`)](speculative/ROUTECRACK_TECHNIQUES.md) · [Engineering FAQ (`FAQ.md`)](FAQ.md)
+
+---
+
+## 🗜️ `v2.2.0` — Block-64 2-Level Hierarchical Non-Linear MoE Quantization (`14.35 GiB` `Fractal-64` & `15.95 GiB` `Fractal-MXFP4`), `100/100` Quality Gate, & 8-CCD Threadripper PRO 7985WX (`80.14 tok/s`)
+
+**Release Date:** November 2026  
+**Highlights:**
+1. **Block-64 2-Level Hierarchical Non-Linear MoE Quantization (`Fractal-64`, `30 bytes` / 64 weights = `3.75 bpw`)**: Solves the `1856 × 2688` non-divisibility trap that causes all 256-block K-quants (`Q3_K`, `IQ3_S`) in `llama.cpp` to fall back to `Q4_0` on `Nemotron-3.5-30B-A3B`. Starting directly from the unquantized `58.84 GiB` `BF16` master weights, `Fractal-64` shrinks the model to **`14.35 GiB` (`14,698 MiB`)** on disk and **`15.40 GiB` idle `VmRSS` (`-6.01 GiB` RAM saved vs `Baseline-Q4_0`)**, achieves **`17.78 dB` SQNR** on real `BF16` expert weights (`+1.53 dB` above `Q3_K`), fuses 8-weight sub-block rescaling (`mult ∈ {4..19}`) directly into AVX2 `vpmaddwd` (`_mm256_madd_epi16`) at **zero extra SIMD instruction cost**, and scores **`100.0 / 100.0`** on [`benchmarks/eval_quality_and_tools.py`](benchmarks/eval_quality_and_tools.py) while running **`+28.0%` faster** (`25.02 tok/s` vs `19.54 tok/s`).
+2. **Asymmetric `Fractal-MXFP4` (`15.95 GiB` / `4.25 bpw` from `Q4_0`)**: For users re-quantizing an existing `Q4_0` GGUF via [`scripts/build_fractal_moe_gguf.sh --profile mxfp4`](scripts/build_fractal_moe_gguf.sh), shrinks the model to **`15.95 GiB`** (`17.46 GiB` idle `VmRSS`), adds `_MM_HINT_NTA` cache-bypass streaming to `ggml_vec_dot_mxfp4_q8_0`, runs **`+33.5%` faster** (`26.08 tok/s`), and scores **`100.0 / 100.0`** on the Quality & Tool-Calling Gate.
+3. **100-Point Reproducible Quality, Tool-Calling, Coding & Long-Context Needle Gate ([`benchmarks/eval_quality_and_tools.py`](benchmarks/eval_quality_and_tools.py))**: Ships an executable grader + raw JSON outputs ([`benchmarks/results/`](benchmarks/results/)) testing 5 multi-tool JSON schema calls (`30` pts), 3 sandbox-executed Python algorithms (`30` pts), an `8,512`-token Needle-in-a-Haystack passkey + symbolic math check (`20` pts), and live speed/RAM telemetry (`20` pts).
+4. **8-CCD AMD Threadripper PRO 7985WX Verification (`80.14 tok/s` decode / `386.00 tok/s` prefill)**: Community benchmark by `@aifartist` ([Issue #1](https://github.com/synchopate/llama-modchip/issues/1#issuecomment-6590413944)) + deterministic per-CCD `taskset -c` core mask generation in [`scripts/llama_modchip.py`](scripts/llama_modchip.py).
+5. **External Code Review Hardening (`commit 8191367` + `v2.2.0`)**: Minimal clean `llama.cpp` patch (`patches/zen5-nemotron-256k-optimizations.patch`) verified with `git apply --check` against `d2f83055`, exact full-context attention (`LLAMA_ATTN_WINDOW=0`) by default across all code paths, safe `O_NOFOLLOW` + owner/mode validation on `/dev/shm/llama_modchip.bin`, and gateway shell-quoting hardening.
+
+| Metric / Suite ([`benchmarks/eval_quality_and_tools.py`](benchmarks/eval_quality_and_tools.py)) | `Baseline-Q4_0` (`17.59 GiB`) | `Fractal-MXFP4` (`15.95 GiB`) | **`Fractal-64-BF16` (`14.35 GiB`)** | `Fractal-64-BF16` Delta |
+| :--- | :---: | :---: | :---: | :---: |
+| **1. Agentic Tool-Calling (`30` pts)** | `30.0 / 30.0` | `30.0 / 30.0` | **`30.0 / 30.0`** | `100.0%` parity |
+| **2. Executable Code Gen (`30` pts)** | `30.0 / 30.0` | `30.0 / 30.0` | **`30.0 / 30.0`** | `100.0%` parity |
+| **3. Long-Context Needle (`8.5K`) & Math (`20` pts)** | `20.0 / 20.0` | `20.0 / 20.0` | **`20.0 / 20.0`** | `100.0%` parity |
+| **Quality Subtotal (`80` pts) / Total (`100` pts)** | `80.0` / `100.0` | `80.0` / `100.0` | **`80.0` / `100.0`** | **`100.0%` parity** |
+| **Single-Turn Decode Throughput (`tok/s`)** | `19.54 tok/s` | **`26.08 tok/s`** | **`25.02 tok/s`** | **`+28.0%` (`+33.5%` MXFP4)** |
+| **Idle / Peak Resident RAM (`VmRSS`, 256K Context)** | `21.41` / `21.71 GiB` | `17.46` / `18.86 GiB` | **`15.40` / `17.27 GiB`** | **`-6.01 GiB` idle / `-4.44 GiB` peak** |
 
 ---
 
@@ -38,7 +59,7 @@ During the `RouteCrack` research campaign (**96+ techniques** documented in **[`
 
 ---
 
-### 2. 📊 Verified Benchmarks: Held-Out Ablation (`77,456` Tokens) & Live `CT 100` Telemetry
+### 2. 📊 Verified Benchmarks: Held-Out Ablation (`77,456` Tokens) & Live Production Telemetry
 
 #### A. Held-Out Corpus Ablation (`77,456` Nemotron-3.5 Tokens, `351` Contexts — [`speculative/cpp/test_synergy.cpp`](speculative/cpp/test_synergy.cpp))
 
@@ -50,7 +71,7 @@ During the `RouteCrack` research campaign (**96+ techniques** documented in **[`
 
 - **`+223` additional accepted tokens (`5,440 -> 5,663`) with ZERO additional wasted tokens (`892 -> 892`, `100.0%` net marginal precision)** and **`-32` fewer Mamba-2 rollbacks (`482 -> 450`)**.
 
-#### B. Live 5-Stage Production Benchmark on `CT 100` (`AMD Ryzen 9 9955HX`, `0 GPUs`, `22.2K -> 27.7K` Context)
+#### B. Live 5-Stage Production Benchmark (`AMD Ryzen 9 9955HX`, `0 GPUs`, `22.2K -> 27.7K` Context)
 
 | Stage & Workload (`Nemotron-3.5-30B-A3B-Q4_0`) | Active Context | `M=5` Speed (`Avg / Peak`) | **`Stockfish-PVS v2 (M=7)` Speed (`Avg / Peak`)** | Draft Acceptance (`Acc / Drafted`) | Mean Spec Length (`tok/step`) |
 | :--- | :---: | :---: | :---: | :---: | :---: |
@@ -79,7 +100,7 @@ Integrated community contributions from **Oleksandr Nazar (`@jarorosFork`)** (`c
 
 ### 4. 🛡️ Microarchitectural & Documentation Audit Fixes
 
-- **Bit-Exact C++ & Patch Verification**: Verified `0` diff between [`patches/zen5-nemotron-256k-optimizations.patch`](patches/zen5-nemotron-256k-optimizations.patch) / [`speculative/cpp/`](speculative/cpp/) and the live production engine on `CT 100`.
+- **Bit-Exact C++ & Patch Verification**: Verified `0` diff between [`patches/zen5-nemotron-256k-optimizations.patch`](patches/zen5-nemotron-256k-optimizations.patch) / [`speculative/cpp/`](speculative/cpp/) and the live production engine on our Zen 5 testbed.
 - **Transparent Layer & KV Accounting**: Clarified across [`README.md`](README.md), [`ARCHITECTURE.md`](ARCHITECTURE.md), and [`FAQ.md`](FAQ.md) the exact distinction between the `52` logical blocks (`23 Mamba-2 SSM + 23 Sparse MoE + 6 GQA`, `46` non-attention tensor blocks) and the exact 256K KV cache sizes (`384 MB` raw / `432 MB` symmetric `Q4_0` & dynamic EAKV `Q8_0/Q4_0` vs `624 MB` static `--cache-type-k q8_0 --cache-type-v q4_0`).
 - **Automated Build & Service Integration**: Updated [`install.sh`](install.sh), [`scripts/build_zen5_llama.sh`](scripts/build_zen5_llama.sh), [`systemd/nemotron-256k.service`](systemd/nemotron-256k.service), [`scripts/llama_modchip.py`](scripts/llama_modchip.py), and [`scripts/check_cpu_readiness.py`](scripts/check_cpu_readiness.py) to deploy [`speculative/cpp/rc_stockfish.h`](speculative/cpp/rc_stockfish.h) and `--spec-ngram-simple-size-m 7` out of the box.
 

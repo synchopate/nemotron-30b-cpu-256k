@@ -7,6 +7,8 @@
 #   ./modchip start [model.gguf]    # Start 256K CPU Server + Web UI Gateway in background
 #   ./modchip chat [-p "prompt"]    # Interactive terminal chat with live tok/s telemetry
 #   ./modchip bench                 # Run 2-stage speed test & print shareable CPU scorecard
+#   ./modchip eval [args]           # Run 100-pt Quality, Tool-Calling, Coding & Needle Gate
+#   ./modchip quantize [args]       # Build Fractal-64 (14.35 GiB) or MXFP4 (15.95 GiB) GGUF
 #   ./modchip web                   # Open Live Web Chat & Telemetry HUD (http://127.0.0.1:8787)
 #   ./modchip claude [args]         # Launch Claude Code CLI wired to local CPU engine
 #   ./modchip status                # Inspect live server, HugePages & /dev/shm/llama_modchip.bin
@@ -200,6 +202,15 @@ cmd_bench() {
     exec python3 "${REPO_ROOT}/scripts/chat.py" --bench "$@"
 }
 
+cmd_eval() {
+    ensure_ready_and_running
+    exec python3 "${REPO_ROOT}/benchmarks/eval_quality_and_tools.py" "$@"
+}
+
+cmd_quantize() {
+    exec "${REPO_ROOT}/scripts/build_fractal_moe_gguf.sh" "$@"
+}
+
 cmd_claude() {
     if ! is_port_up "$GATEWAY_PORT"; then
         ensure_ready_and_running
@@ -228,6 +239,8 @@ case "$SUBCMD" in
     restart)         cmd_stop; cmd_start "$@" ;;
     chat|ask)        cmd_chat "$@" ;;
     bench|benchmark) cmd_bench "$@" ;;
+    eval|gate)       cmd_eval "$@" ;;
+    quantize|fractal) cmd_quantize "$@" ;;
     web|ui)          cmd_web "$@" ;;
     claude)          cmd_claude "$@" ;;
     status|info)     cmd_status ;;

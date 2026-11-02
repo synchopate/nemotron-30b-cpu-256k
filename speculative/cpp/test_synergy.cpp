@@ -530,9 +530,9 @@ static void run_exp(const char * name, const std::vector<int32_t> & warm, const 
 }
 
 int old_main() {
-    const char * base_dir = "/opt/vex/routecrack";
-    auto warm = load_bin("/opt/vex/routecrack/corpus_nemotron_warm.bin");
-    auto test = load_bin("/opt/vex/routecrack/corpus_nemotron_test.bin");
+    const char * base_dir = "./workspace/routecrack";
+    auto warm = load_bin("./workspace/routecrack/corpus_nemotron_warm.bin");
+    auto test = load_bin("./workspace/routecrack/corpus_nemotron_test.bin");
     printf("%-34s | %-8s | %-8s | %-7s | %-11s | %-22s | %-16s | %-16s\n",
            "Configuration", "Drafted", "Accepted", "Wasted", "Accept %", "0-Rollback (Rollbacks)", "WallGain(A-.3D)", "MambaGain");
     printf("------------------------------------------------------------------------------------------------------------------------------------------------\n");

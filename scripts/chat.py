@@ -27,7 +27,10 @@ RESET = "\033[0m"
 def detect_endpoint(explicit_url: Optional[str] = None) -> str:
     if explicit_url:
         return explicit_url.rstrip("/")
-    env_url = os.environ.get("MODCHIP_URL") or os.environ.get("LLAMA_API_URL")
+    env_url = (
+        os.environ.get("MODCHIP_URL")
+        or os.environ.get("LLAMA_API_URL")
+    )
     if env_url:
         return env_url.rstrip("/")
     for port in (8787, 8789, 8080, 8001):

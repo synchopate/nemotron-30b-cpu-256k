@@ -1,0 +1,131 @@
+{
+  "label": "Baseline-Q4_0-18.9GB",
+  "timestamp": "2026-11-02T21:40:44+0100",
+  "total_score": 100.0,
+  "quality_score_80": 80.0,
+  "suites": {
+    "tools_30": 30.0,
+    "coding_30": 30.0,
+    "needle_math_20": 20.0,
+    "speed_ram_20": 20.0
+  },
+  "telemetry": {
+    "decode_tps": 19.54,
+    "prefill_tps": 46.88,
+    "draft_n": 36,
+    "draft_accepted": 24,
+    "draft_accept_pct": 66.67,
+    "rss_gib": 21.71,
+    "anon_hugepages_gib": 0.0,
+    "score": 20.0,
+    "max": 20.0
+  },
+  "details": {
+    "tools": [
+      {
+        "test": "1.1 Read + Integer Schema Coercion",
+        "score": 6.0,
+        "max": 6.0,
+        "call": {
+          "id": "ldMGU15mlIDi87FN0KvdG1JBQubycpA8",
+          "name": "Read",
+          "input": {
+            "file_path": "/opt/app/config.py",
+            "offset": 50,
+            "limit": 25
+          }
+        }
+      },
+      {
+        "test": "1.2 Grep Pattern + Path",
+        "score": 6.0,
+        "max": 6.0,
+        "call": {
+          "id": "kGF8wN5eCDJYnQ0aBX9ENHGkD5aLse6c",
+          "name": "Grep",
+          "input": {
+            "pattern": "def verify_token",
+            "path": "/src/auth"
+          }
+        }
+      },
+      {
+        "test": "1.3 Edit + Boolean Coercion",
+        "score": 6.0,
+        "max": 6.0,
+        "call": {
+          "id": "aq8e5Oz3X4YCOYhDFjbPOdtaygZt04qa",
+          "name": "Edit",
+          "input": {
+            "file_path": "/opt/app/settings.py",
+            "old_string": "DEBUG = True",
+            "new_string": "DEBUG = False",
+            "replace_all": true
+          }
+        }
+      },
+      {
+        "test": "1.4 Write Code Serialization",
+        "score": 6.0,
+        "max": 6.0,
+        "call": {
+          "id": "tsEpV3myZvYlh7MNaYvfF8fIE80fbJsT",
+          "name": "Write",
+          "input": {
+            "file_path": "/tmp/hello_test.py",
+            "content": "print(\"Hello, World!\")"
+          }
+        }
+      },
+      {
+        "test": "1.5 Multi-Turn Tool Result Consumption",
+        "score": 6.0,
+        "max": 6.0,
+        "call": {
+          "id": "OLACd6Wm9PHSusdw4YCf34XgmpCWqN0K",
+          "name": "Bash",
+          "input": {
+            "command": "curl http://127.0.0.1:9094/health"
+          }
+        }
+      }
+    ],
+    "coding": [
+      {
+        "test": "2.1 Thread-Safe LRU Cache",
+        "score": 10.0,
+        "max": 10.0,
+        "passed": true,
+        "error": ""
+      },
+      {
+        "test": "2.2 Merge Overlapping Intervals",
+        "score": 10.0,
+        "max": 10.0,
+        "passed": true,
+        "error": ""
+      },
+      {
+        "test": "2.3 Fix Binary Search Overflow & Boundary Bug",
+        "score": 10.0,
+        "max": 10.0,
+        "passed": true,
+        "error": ""
+      }
+    ],
+    "needle_math": [
+      {
+        "test": "3.1 Long-Context Needle Retrieval (Code + Port)",
+        "score": 10.0,
+        "max": 10.0,
+        "prompt_tokens": 4,
+        "prefill_tps": 36.47
+      },
+      {
+        "test": "3.2 Exact Hybrid KV Cache Arithmetic (1536 MiB)",
+        "score": 10.0,
+        "max": 10.0
+      }
+    ]
+  }
+}

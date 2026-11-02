@@ -259,28 +259,41 @@ class HardwareInfo:
     thp_mode: str
 
     @property
-    def taskset_mask(self) -> str:
-        return ",".join(str(c) for c in self.physical_core_cpus)
-
-    @property
-    def batch_threads(self) -> int:
-        return max(1, len(self.physical_core_cpus))
-
-    @property
     def decode_threads(self) -> int:
         n_phys = max(1, len(self.physical_core_cpus))
         # Multi-CCD / Threadripper / EPYC Guard:
-        # On >2 CCDs (e.g. 64-core 8-CCD Threadripper PRO), running 64 decode threads across 8 CCDs
+        # On >2 CCDs (e.g. 64-core 8-CCD Threadripper PRO 7985WX), running 64 decode threads across 8 CCDs
         # incurs 100+ cross-CCD OpenMP barrier synchronizations per token over the I/O die.
-        # Capping decode threads to 4 cores/CCD (16-32 threads with OMP_PROC_BIND=spread) saturates
-        # 8-channel DDR5 while halving cross-CCD barrier latency, keeping -tb at full physical cores.
+        # Capping decode threads to 4 cores/CCD (32 threads on 8 CCDs = 80.14 tok/s vs 73.84 tok/s at 64T)
+        # saturates 8-channel DDR5 while halving cross-CCD barrier latency.
         if self.num_ccds > 2 and n_phys > 24:
             return min(n_phys, max(16, self.num_ccds * 4))
         return n_phys
 
     @property
+    def batch_threads(self) -> int:
+        # Match batch_threads to decode_threads so speculative decoding micro-batches (n_tokens > 1)
+        # do not spawn (n_phys - decode_threads) extra spinning threads across CCDs.
+        return self.decode_threads
+
+    @property
+    def taskset_mask(self) -> str:
+        n_phys = len(self.physical_core_cpus)
+        t_dec = self.decode_threads
+        if self.num_ccds > 2 and n_phys > t_dec and self.num_ccds > 0:
+            cores_per_ccd = max(1, n_phys // self.num_ccds)
+            keep_per_ccd = max(1, t_dec // self.num_ccds)
+            selected: List[int] = []
+            for ccd_idx in range(self.num_ccds):
+                start = ccd_idx * cores_per_ccd
+                selected.extend(self.physical_core_cpus[start : start + keep_per_ccd])
+            if len(selected) == t_dec:
+                return ",".join(str(c) for c in selected)
+        return ",".join(str(c) for c in self.physical_core_cpus)
+
+    @property
     def omp_proc_bind(self) -> str:
-        return "spread" if (self.num_ccds > 2 and len(self.physical_core_cpus) > 24) else "close"
+        return "close"
 
 
 def probe_hardware() -> HardwareInfo:
