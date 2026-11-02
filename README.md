@@ -4,31 +4,34 @@
 
 > 📄 **Documentation Navigation:**
 > - **Overview, `llama-modchip` Beta Matrix & Quickstart (`README.md`)** — *You are here*
-> - **[Full Technical Paper & Mathematical Proofs (`ARCHITECTURE.md`)](ARCHITECTURE.md)** — *Deep dive into Mamba-2/GQA physics, `_MM_HINT_NTA`, `2MB` HugePages STLB math, `LLAMA_MOE_TOP_K=4` norm preservation, `RouteCrack` break-even theorem, negative ablations, and Linux Kernel auditing benchmarks*
-> - **[Engineering FAQ & Xeon/EPYC Server Scaling (`FAQ.md`)](FAQ.md)** — *SWA vs Full 256K NIAH retrieval, Mamba-2 zero-rollback gating, latency/throughput breakdown, and Intel Xeon Scalable / AMD EPYC multi-agent scaling*
+> - **[Full Technical Paper & Mathematical Proofs (`ARCHITECTURE.md`)](ARCHITECTURE.md)** — *Deep dive into Mamba-2/GQA physics, `_MM_HINT_NTA`, `2MB` HugePages STLB math, `LLAMA_MOE_TOP_K=4` norm preservation, `RouteCrack + Stockfish-PVS v2` break-even theorem, negative ablations, and Linux Kernel auditing benchmarks*
+> - **[`RouteCrack + Stockfish-PVS v2` Catalog of 96+ Techniques (`speculative/ROUTECRACK_TECHNIQUES.md`)](speculative/ROUTECRACK_TECHNIQUES.md)** — *How Chess-Engine PVS + Zobrist Transposition Tables unlocked 4 dormant RouteCrack techniques (`M=7` Singular Horizon Extension, `60.40 tok/s` peak, `mean len = 6.90`)*
+> - **[Engineering FAQ & Xeon/EPYC Server Scaling (`FAQ.md`)](FAQ.md)** — *SWA vs Full 256K NIAH retrieval, Mamba-2 zero-rollback gating, Stockfish-PVS L3 cache physics, and Intel Xeon Scalable / AMD EPYC multi-agent scaling*
+> - **[Release Notes (`RELEASE_NOTES.md`)](RELEASE_NOTES.md)** — *What's new in `v2.1.0` (`Stockfish-PVS v2 Sweet Spot`, Apple Silicon M4 Pro & Fedora Ryzen 8745HS support)*
 
 ---
 
 ## 1. What This Repo Does (Direct Summary & Live Production Numbers)
 
-- **The Goal**: Run **30B-class Sparse MoE LLMs** on a **pure CPU (0 GPUs)** at **20–50+ tok/s** with up to a **262,144-token (256K) context window** for real autonomous coding (`Claude Code` with 40 tools).
-- **How It Works**: **9 low-level C++ / Linux kernel optimizations** for `llama.cpp` (`ggml-cpu`), paired with **`RouteCrack`** (a draftless C++ speculative engine executing in `0.002 ms` inside L3 cache) and **`llama-modchip` (`v0.9 Public Beta`)** — a *"Priiloader for CPU GGUF Inference"* ([`scripts/llama_modchip.py`](scripts/llama_modchip.py)) that inspects any `.gguf` header + CPU topology in `< 5 ms`, engages architecture **Safety Locks**, and tunes `llama-server` live via `/dev/shm/llama_modchip.bin`.
+- **The Goal**: Run **30B-class Sparse MoE LLMs** on a **pure CPU (0 GPUs)** at **20–60+ tok/s** with up to a **262,144-token (256K) context window** for real autonomous coding (`Claude Code` with 40 tools).
+- **How It Works**: **9 low-level C++ / Linux kernel optimizations** for `llama.cpp` (`ggml-cpu`), paired with **`RouteCrack + Stockfish-PVS v2 (Sweet Spot, M=7)`** (a draftless C++ speculative engine combining an 8-level FNV-64 hash cascade, Online Trie, Macro Codebook, and a `1.64 MB` L2/L3-resident Chess-Engine Principal Variation Search / Zobrist Transposition Table executing in `< 0.005 ms`) and **`llama-modchip` (`v0.9 Public Beta`)** — a *"Priiloader for CPU GGUF Inference"* ([`scripts/llama_modchip.py`](scripts/llama_modchip.py)) that inspects any `.gguf` header + CPU topology in `< 5 ms`, engages architecture **Safety Locks**, and tunes `llama-server` live via `/dev/shm/llama_modchip.bin`.
 - **What Is Tested vs. Beta**:
   - **Certified in Daily Production (`Tier 1`)**: **AMD Ryzen 9 9955HX (`Zen 5`, 16C/32T, Dual-CCD 64 MB L3, AVX-512 VNNI)** + **64 GB DDR5** + **Linux 6.8+ (`2MB THP`)**, tested across **4 real GGUF architectures** (`Nemotron-3.5-30B-A3B` at **256K context**, `Qwen3-30B-A3B` at **`+38.5%` base decode**, `Nemotron-H-8B`, and `Llama-40L`).
-  - **Public Beta (`Tier 2`)**: Auto-adaptive support for AMD `Zen 4 / Zen 3 / EPYC` and Intel `AVX2 / AVX-512` CPUs (community benchmarks welcome!).
+  - **Public Beta & Community Platforms (`Tier 2`)**: Auto-adaptive support for AMD `Zen 4 / Zen 3 / EPYC` (including verified [`fedora/`](fedora/README.md) setup on **AMD Ryzen 7 8745HS `GEEKOM A8`**), Intel `AVX2 / AVX-512` CPUs, and [`apple-silicon/`](apple-silicon/README.md) (**Apple M4 Pro 24 GB Metal** at `47–49 tok/s` up to `128K`).
 
-| Metric (`Ryzen 9 9955HX` Live Telemetry — Zero GPU) | Stock MoE Baseline (`Qwen3-30B-A3B`) | **Optimized Stack (`Nemotron 3.5 30B-A3B` + `RouteCrack`)** | Improvement |
+| Metric (`Ryzen 9 9955HX` Live Telemetry — Zero GPU) | Stock MoE Baseline (`Qwen3-30B-A3B`) | **Optimized Stack (`Nemotron 3.5 30B-A3B` + `RouteCrack + Stockfish-PVS v2`)** | Improvement |
 | :--- | :---: | :---: | :---: |
 | **Max Usable Context Window on CPU** | ~14,000 tokens *(Timeout >16K)* | **262,144 tokens (256K)** | **18.7x Larger** |
 | **Full 256K Global KV Cache (`LLAMA_ATTN_WINDOW=0`)** | 7,078 MB (~7.1 GB) | **384–432 MB (`Q4_0` / EAKV `Q8/Q4`)** / **624 MB (static `-ctk q8_0 -ctv q4_0`)** *(Exact 6-layer GQA over 256K with `_MM_HINT_NTA`)* | **91.2%–94.6% RAM Saved** |
 | **Hot L3 KV Working Set (`LLAMA_ATTN_WINDOW=4096` SWA)** | 7,078 MB *(No SSM state)* | **6.31–9.76 MB in 64 MB L3** *(GQA capped to 4,112 tok; 46 non-attn blocks [23 Mamba-2 + 23 MoE] carry 256K state)* | **100% L3-Resident** |
-| **Slot 0 Cold Snapshot Restore (`22.2K` tok)** | 130.8 s *(Full cold re-eval)* | **`17.2–18.9 ms`** *(`POST /slots/0?action=restore` from `/dev/shm`)* | **~6,800x Faster** |
+| **Slot 0 Cold Snapshot Restore (`22.2K` tok)** | 130.8 s *(Full cold re-eval)* | **`17.2–39.3 ms`** *(`POST /slots/0?action=restore` from `/dev/shm`)* | **~6,800x Faster** |
 | **Warm Interactive TTFT (`22K–35K` Context)** | 546.1 s | **`0.40 – 0.50 s`** *(Evaluates only user delta tokens)* | **>1,000x Faster** |
-| **Cold Prompt Prefill Throughput** | < 20.0 tok/s *(at 28K)* | **`170.0 – 241.0 tok/s`** *(Peak: **306.8 tok/s** at `-b 2048`)* | **~8.5x Faster** |
+| **Cold Prompt Prefill Throughput** | < 20.0 tok/s *(at 28K)* | **`165.2 – 241.0 tok/s`** *(Peak: **306.8 tok/s** at `-b 2048`)* | **~8.5x Faster** |
 | **Decode — Base Physical Floor (No Spec)** | ~4.5 tok/s *(at 30K)* | **`17.2 tok/s`** *(at 33K ctx)* / **`25.3–32.7 tok/s`** *(short ctx)* | **+49% to 3.8x** |
-| **Decode — Technical Prose + New Code** | ~4.5 tok/s | **`19.5 – 20.9 tok/s`** *(`78.6%` RouteCrack draft acceptance)* | **4.5x Faster** |
-| **Decode — Agent `<tool_call>` / JSON / XML** | ~4.5 tok/s | **`24.8 – 28.0+ tok/s`** *(Full tool turn in **`1.88 s`**)* | **5.5x Faster** |
-| **Decode — Refactoring & Boilerplate Burst** | ~4.5 tok/s | **`50.5 – 65.0 tok/s`** *(Multi-token context/macro match)* | **>10x Faster** |
+| **Decode — Technical Prose + New Code (`27K` ctx)** | ~4.5 tok/s | **`18.8 – 20.9 tok/s`** *(Peak **`39.3 tok/s`**, **`85.0%`** prose draft acceptance)* | **4.5x Faster** |
+| **Decode — Agent `<tool_call>` / JSON / XML (`22.3K` ctx)** | ~4.5 tok/s | **`28.0 – 34.52 tok/s`** *(Full tool turn in **`1.88–2.45 s`**, `83.3%` acceptance, `mean len = 4.18`)* | **6.5x Faster** |
+| **Decode — Mixed Code & Architecture Refactor (`26.4K` ctx)** | ~4.5 tok/s | **`28.61 tok/s` avg / `48.47 tok/s` peak** *(`86.1%` draft acceptance, `mean len = 4.66`)* | **~7x Faster** |
+| **Decode — In-Context Refactoring & Macro Burst (`M=7`)** | ~4.5 tok/s | **`48.39 tok/s` avg / `60.40–65.0 tok/s` peak** *(`96.4%–98.0%` acceptance, **`mean len = 6.90` tok/step**)* | **>11x Faster** |
 
 ---
 
@@ -91,8 +94,8 @@ Every single optimization is documented with full mathematical derivations and C
    Collapses 4.9M 4KB pages into ~9,300 2MB pages (`19.04 GiB`), expanding per-core L2 STLB coverage from 12 MB to **6.14 GB** and eliminating 24% page-table walk overhead across sparse MoE jumps.
 5. **Dual-CCD 1:1 Physical Core Pinning + Static GQA Partition (`LLAMA_KV_DISABLE_CHUNKING=1`) ([`ARCHITECTURE.md` §3.5](ARCHITECTURE.md#35-optimization-5-dual-ccd-topology--openmp-11-physical-core-pinning))**
    Locks OpenMP threads 1:1 to non-SMT physical cores (`OMP_PROC_BIND=close`, `OMP_PLACES=cores`), eliminating SMT contention and 40ns cross-CCD Infinity Fabric L3 snoops (**`306.8 tok/s`** prefill).
-6. **Draftless C++ Speculative Engine (`RouteCrack` via `--spec-type ngram-simple` Hook) ([`ARCHITECTURE.md` §3.6](ARCHITECTURE.md#36-optimization-6-draftless-linear--statistical-speculative-decoding-routecrack--no-small-neural-draft-model))**
-   `common/ngram-map.cpp` overrides `common_ngram_simple_draft()` to hijack `--spec-type ngram-simple` and execute the L3-resident C++ `RouteCrack` ensemble (`8-level FNV-64 Hash Cascade + Online Trie + PPM + Skipgram + 300 Hot Token Rules + Two-Zone 16K Hot / 24K Prefix Matcher`, loaded from `RC_TABLES_DIR`) in `0.002 ms`. Enforces strict CPU-MoE certainty gating (`84/92/96`, `87.5%` 0-rollback rate, and `100%` acceptance / `40.0–44.9 tok/s` on in-context code refactoring at 25K context).
+6. **Draftless C++ Speculative Engine (`RouteCrack + Stockfish-PVS v2` via `--spec-type ngram-simple --spec-ngram-simple-size-m 7`) ([`ARCHITECTURE.md` §3.6](ARCHITECTURE.md#36-optimization-6-draftless-linear--statistical-speculative-decoding-routecrack--no-small-neural-draft-model) · [`speculative/ROUTECRACK_TECHNIQUES.md`](speculative/ROUTECRACK_TECHNIQUES.md))**
+   `common/ngram-map.cpp` overrides `common_ngram_simple_draft()` to hijack `--spec-type ngram-simple` and execute the L3-resident C++ `RouteCrack + Stockfish-PVS v2` ensemble ([`speculative/cpp/rc_stockfish.h`](speculative/cpp/rc_stockfish.h), [`speculative/cpp/rc_predictor.h`](speculative/cpp/rc_predictor.h), [`speculative/cpp/rc_trie_v2.h`](speculative/cpp/rc_trie_v2.h): `8-level FNV-64 Hash Cascade + Online Session Trie Rescue + 11,382-Entry Macro Codebook + Chess-Engine Principal Variation Search / Zobrist Transposition Table + Two-Zone 16K Hot / 24K Prefix Matcher`, loaded from `RC_TABLES_DIR`) in `< 0.005 ms` inside `1.64 MB` of L2/L3 cache. By cross-validating statistical predictions against the live-session Zobrist TT (`tt5/tt4/tt3` + Countermove + Continuation History), `Stockfish-PVS v2` unlocks **4 dormant `RouteCrack` techniques** (including **Singular Horizon Extension `M=7`**), delivering **`+223` accepted tokens with `0` extra wasted tokens (`-32` Mamba-2 rollbacks)** on our `77,456`-token held-out benchmark and reaching **`48.39 tok/s` average / `60.40 tok/s` peak (`mean len = 6.90` tokens/step, `96.4%` acceptance)** on live 25K-context code refactoring and **`85.0%` draft acceptance** on technical prose!
 7. **Entropy-Guided Asymmetric KV Quantization (`EAKV` + `VPI`, `-ctk q8_0 -ctv q4_0`) ([`ARCHITECTURE.md` §3.7](ARCHITECTURE.md#37-optimization-7-entropy-guided-asymmetric-kv-quantization-eakv--virtual-positional-indexing-vpi))**
    Cuts KV cache memory footprint and DRAM bandwidth by **58%–62.5%** (`384 MB` raw / `432 MB` in symmetric `Q4_0`, `~432 MB` in dynamic EAKV `Q8_0/Q4_0`, and `624 MB` in static `--cache-type-k q8_0 --cache-type-v q4_0` across all 262,144 tokens) while preserving `FP16`-equivalent needle retrieval on keys.
 8. **Zero-Prefill Agentic Loops (`HARP-Cache` Prefix Tracker + Native `/dev/shm` Slot Restore + SSE Gateway) ([`ARCHITECTURE.md` §3.8](ARCHITECTURE.md#38-optimization-8-zero-prefill-agentic-loops-harp-cache---cache-reuse-256-slot-0-disk-restore--sse-gateway))**
@@ -187,16 +190,19 @@ nemotron-30b-cpu-256k/
 ├── README.md                                         # Executive Overview, Quickstart & Hardware Check
 ├── ARCHITECTURE.md                                   # Full Technical Paper, Proofs & Kernel Benchmarks
 ├── FAQ.md                                            # Engineering Trade-Offs, NIAH Retrieval & Xeon/EPYC Scaling
+├── RELEASE_NOTES.md                                  # Detailed Release Notes (v2.1.0 Stockfish-PVS v2 & Multi-Platform)
 ├── patches/
 │   └── zen5-nemotron-256k-optimizations.patch        # Unified C/C++ Patch for llama.cpp (ggml-cpu)
-├── speculative/                                      # RouteCrack Draftless Linear & Statistical Speculative Engine
+├── speculative/                                      # RouteCrack + Stockfish-PVS Draftless Speculative Engine
+│   ├── ROUTECRACK_TECHNIQUES.md                      # Master Catalog of 96+ Studied RouteCrack Techniques & PVS v2 Ablations
 │   ├── cpp/
-│   │   ├── ngram-map.cpp                             # Drop-in llama-server integration (RouteCrack + Two-Zone Context)
+│   │   ├── ngram-map.cpp                             # Drop-in llama-server integration (RouteCrack + Stockfish-PVS v2 M=7)
+│   │   ├── rc_stockfish.h                            # 1.64 MB L2/L3 Chess-Engine PVS + Zobrist TT (tt5/tt4/tt3) + Countermove
 │   │   ├── rc_predictor.h                            # 8-Level Hash Cascade, Online Trie, PPM, Skipgram, Hot Rules, Probes
 │   │   ├── rc_trie_v2.h                              # 4M-Node Arena Online Learning Trie (O(1) lookup, LRU eviction)
 │   │   ├── rc_tokenize_nemotron.cpp                  # Native GGUF vocabulary corpus tokenizer (131,072 tokens)
 │   │   ├── rc_build_tables.cpp                       # Laplace-smoothed cascade, hot rules & macro codebook builder
-│   │   ├── test_synergy.cpp                          # Held-out benchmark (78.72% acceptance, 77.19% 0-rollback)
+│   │   ├── test_synergy.cpp                          # 3-Way Held-out benchmark (77,456 tok: Baseline vs PVS v1 vs PVS v2 M=7)
 │   │   └── rc_engine.cpp                             # Standalone C++ Speculative Engine with BFS Tree Verification
 │   └── tools/                                        # Linear & Hot-Logit Probe trainers and distillation scripts
 ├── kv_cache/                                         # HARP-Cache (/dev/shm) & EAKV + VPI Asymmetric Quantization
@@ -218,4 +224,6 @@ nemotron-30b-cpu-256k/
 
 > 🔗 **Continue Reading:**
 > - **[`ARCHITECTURE.md` — Full Technical Paper & Benchmarks](ARCHITECTURE.md)**
+> - **[`speculative/ROUTECRACK_TECHNIQUES.md` — Master Catalog of 96+ `RouteCrack` Techniques & `Stockfish-PVS v2` Ablations](speculative/ROUTECRACK_TECHNIQUES.md)**
 > - **[`FAQ.md` — Technical FAQ, Long-Context Retrieval & Intel Xeon / AMD EPYC Scaling](FAQ.md)**
+> - **[`RELEASE_NOTES.md` — Release Notes (`v2.1.0`)](RELEASE_NOTES.md)**

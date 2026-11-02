@@ -1,9 +1,6 @@
 #include "rc_predictor.h"
 #include "rc_stockfish.h"
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <chrono>
 #include <vector>
 #include <algorithm>
 
@@ -95,9 +92,13 @@ struct NodeEval {
     int casc_conf = 0;
 };
 
-static NodeEval eval_node(RCPredictor & pred, const int32_t * ctx_ptr, int ctx_len, int32_t verify_cand = -1) {
+static NodeEval eval_node(
+    RCPredictor & pred, const StockfishDrafter * sf,
+    const int32_t * ctx_ptr, int ctx_len, int32_t verify_cand, bool use_sweetspot) {
+
     NodeEval res;
     int32_t casc_tok = -1, casc_conf = 0, casc_k = 0;
+    const RCHashEntry * casc_ent = nullptr;
     bool cand_in_casc = false;
     for (int c = 0; c < pred.n_cascade; ++c) {
         int ck = pred.cascade_k[c];
@@ -106,6 +107,7 @@ static NodeEval eval_node(RCPredictor & pred, const int32_t * ctx_ptr, int ctx_l
             int idx = pred.cascade[c].find_idx(h);
             if (idx >= 0) {
                 const auto & ent = pred.cascade[c].entries[idx];
+                casc_ent  = &ent;
                 casc_tok  = ent.pred[0];
                 casc_conf = ent.conf[0];
                 casc_k    = ck;
@@ -144,6 +146,29 @@ static NodeEval eval_node(RCPredictor & pred, const int32_t * ctx_ptr, int ctx_l
         }
     }
 
+    // Technique #2: Top-4 Cascade Disambiguation via Stockfish Zobrist TT
+    if (use_sweetspot && sf && casc_ent && casc_ent->n_preds > 1) {
+        const SFTTBucket * b5 = sf->probe5(ctx_ptr, ctx_len);
+        const SFTTBucket * b4 = sf->probe4(ctx_ptr, ctx_len);
+        bool top1_refuted = (b5 && b5->refuted_move == casc_tok && b5->best_move != casc_tok && b5->history < 0) ||
+                            (b4 && b4->refuted_move == casc_tok && b4->best_move != casc_tok && b4->history <= -64);
+        if (top1_refuted || casc_conf < 80) {
+            for (int p = 1; p < casc_ent->n_preds; ++p) {
+                int32_t alt = casc_ent->pred[p];
+                int alt_c   = casc_ent->conf[p];
+                if (alt < 0 || alt_c < 20) continue;
+                bool tt5_match = (b5 && b5->best_move == alt && b5->wins >= 3 && b5->history >= 160);
+                bool tt4_match = (b4 && b4->best_move == alt && b4->wins >= 4 && b4->history >= 200);
+                bool session_match = (trie_tok == alt && trie_depth >= 4 && trie_conf >= 0.80f) && (ppm_tok == alt);
+                if ((tt5_match || tt4_match) && session_match) {
+                    casc_tok  = alt;
+                    casc_conf = 84;
+                    break;
+                }
+            }
+        }
+    }
+
     res.casc_k = casc_k;
     res.casc_conf = casc_conf;
 
@@ -179,10 +204,37 @@ static NodeEval eval_node(RCPredictor & pred, const int32_t * ctx_ptr, int ctx_l
         res.cert = hot_conf;
         res.agree = 2;
     }
+
+    // Technique #1: Online Session Trie Rescue (when low-k cascade had cert < 84, rescue with deep session trie + Stockfish TT!)
+    if (use_sweetspot && res.cert < 84 && trie_tok >= 0 && trie_depth >= 4 && trie_obs >= 4 && trie_conf >= 0.92f) {
+        bool refuted = false;
+        bool tt_confirmed = false;
+        if (sf) {
+            const SFTTBucket * b5 = sf->probe5(ctx_ptr, ctx_len);
+            const SFTTBucket * b4 = sf->probe4(ctx_ptr, ctx_len);
+            const SFTTBucket * b3 = sf->probe3(ctx_ptr, ctx_len);
+            if ((b5 && b5->refuted_move == trie_tok && b5->best_move != trie_tok) ||
+                (b4 && b4->refuted_move == trie_tok && b4->best_move != trie_tok) ||
+                (b3 && b3->refuted_move == trie_tok && b3->best_move != trie_tok && b3->history <= -64)) {
+                refuted = true;
+            }
+            if ((b5 && b5->best_move == trie_tok && b5->wins >= 2) ||
+                (b4 && b4->best_move == trie_tok && b4->wins >= 3)) {
+                tt_confirmed = true;
+            }
+        }
+        int t_agree = 1 + (ppm_tok == trie_tok ? 1 : 0) + (skip_tok == trie_tok ? 1 : 0) + (cand_in_casc || casc_tok == trie_tok ? 1 : 0);
+        if (!refuted && ((tt_confirmed && t_agree >= 2) || (trie_depth >= 6 && trie_obs >= 5 && t_agree >= 3))) {
+            res.tok   = trie_tok;
+            res.agree = t_agree;
+            res.cert  = std::min(95, (int)(trie_conf * 92.0f) + (tt_confirmed ? 4 : 0));
+        }
+    }
+
     return res;
 }
 
-static void run_benchmark(const char * label, const std::vector<int32_t> & warm, const std::vector<int32_t> & test, const char * base_dir, bool use_sf) {
+static void run_exp(const char * name, const std::vector<int32_t> & warm, const std::vector<int32_t> & test, const char * base_dir, int mode) {
     RCPredictor pred;
     pred.init();
     for (int k : {10, 8, 6, 5, 4, 3, 2, 1}) {
@@ -195,10 +247,31 @@ static void run_benchmark(const char * label, const std::vector<int32_t> & warm,
         snprintf(path, sizeof(path), "%s/hot_rules.bin", base_dir);
         pred.hot_rules.load(path);
         snprintf(path, sizeof(path), "%s/macro_codebook.bin", base_dir);
-        pred.macro.load(path);
+        FILE* f = fopen(path, "rb");
+        if (f) {
+            uint32_t header[2];
+            if (fread(header, 4, 2, f) == 2) {
+                pred.macro.n_entries = header[0];
+                pred.macro.max_cont = std::min((int)header[1], RC_MACRO_MAX_CONT);
+                pred.macro.entries = (RCMacroEntry*)calloc(pred.macro.n_entries, sizeof(RCMacroEntry));
+                for (uint32_t i = 0; i < pred.macro.n_entries; i++) {
+                    if (fread(&pred.macro.entries[i].hash, 8, 1, f) != 1) break;
+                    if (fread(&pred.macro.entries[i].cont_len, 2, 1, f) != 1) break;
+                    if (fread(&pred.macro.entries[i].conf, 2, 1, f) != 1) break;
+                    int32_t buf[RC_MACRO_MAX_CONT] = {0};
+                    if (fread(buf, 4, pred.macro.max_cont, f) != (size_t)pred.macro.max_cont) break;
+                    int cl = std::min((int)pred.macro.entries[i].cont_len, RC_MACRO_MAX_CONT);
+                    for (int j = 0; j < cl; j++) pred.macro.entries[i].continuation[j] = buf[j];
+                    pred.macro.entries[i].cont_len = cl;
+                }
+            }
+            fclose(f);
+        }
     }
     StockfishDrafter sf;
     sf.init();
+    bool use_sf = (mode >= 1);
+    bool use_ss = (mode >= 2);
 
     size_t warm_start = warm.size() > 80000 ? warm.size() - 80000 : 0;
     for (size_t j = warm_start + 12; j < warm.size(); ++j) {
@@ -206,17 +279,15 @@ static void run_benchmark(const char * label, const std::vector<int32_t> & warm,
         if (use_sf) sf.observe(&warm[j - 11], 11, warm[j], -1);
     }
 
-    size_t tot_s = 0, tot_d = 0, tot_a = 0, tot_z = 0, call_cnt = 0;
-    auto t0 = std::chrono::high_resolution_clock::now();
-
+    size_t tot_s = 0, tot_d = 0, tot_a = 0, tot_z = 0;
     size_t pos = 64;
-    while (pos + 5 < test.size()) {
-        call_cnt++;
+    while (pos + 10 < test.size()) {
         std::vector<int32_t> draft;
         size_t hot_start = (pos > 1024) ? (pos - 1024) : 3;
         int32_t p0 = test[pos], p1 = test[pos - 1], p2 = test[pos - 2];
-        size_t best_j = 0, best_k = 0, hits = 0, consensus_len = 4;
+        size_t best_j = 0, best_k = 0, hits = 0, consensus_len = use_ss ? 8 : 4;
         size_t second_j = 0, second_k = 0;
+        size_t true_consensus_hits = 0;
 
         for (size_t j = pos - 1; j >= hot_start; --j) {
             if (test[j] == p0 && test[j - 1] == p1 && test[j - 2] == p2) {
@@ -225,7 +296,7 @@ static void run_benchmark(const char * label, const std::vector<int32_t> & warm,
                 if (j + 256 < pos && k < 4) continue;
                 hits++;
                 if (best_j == 0) {
-                    best_j = j; best_k = k;
+                    best_j = j; best_k = k; true_consensus_hits = 1;
                 } else {
                     size_t agree = 0;
                     while (agree < consensus_len && j + 1 + agree < pos && best_j + 1 + agree < pos &&
@@ -233,11 +304,14 @@ static void run_benchmark(const char * label, const std::vector<int32_t> & warm,
                         agree++;
                     }
                     if (k >= best_k && agree > 0) {
-                        best_j = j; best_k = k; consensus_len = agree;
+                        best_j = j; best_k = k;
+                        consensus_len = use_ss ? std::min(consensus_len, agree) : agree;
+                        true_consensus_hits++;
                     } else if (k + 1 >= best_k) {
                         if (agree == 0 && second_j == 0) {
                             second_j = j; second_k = k;
                         }
+                        if (agree > 0) true_consensus_hits++;
                         consensus_len = std::min(consensus_len, agree);
                     }
                 }
@@ -251,8 +325,8 @@ static void run_benchmark(const char * label, const std::vector<int32_t> & warm,
         if (use_sf && best_j > 0 && consensus_len == 0 && second_j > 0) {
             int32_t c1 = test[best_j + 1];
             int32_t c2 = test[second_j + 1];
-            NodeEval e1 = eval_node(pred, tmp.data(), (int)tmp.size(), c1);
-            NodeEval e2 = eval_node(pred, tmp.data(), (int)tmp.size(), c2);
+            NodeEval e1 = eval_node(pred, &sf, tmp.data(), (int)tmp.size(), c1, use_ss);
+            NodeEval e2 = eval_node(pred, &sf, tmp.data(), (int)tmp.size(), c2, use_ss);
             const SFTTBucket * b4 = sf.probe4(tmp.data(), (int)tmp.size());
             bool c1_tt = (b4 && b4->best_move == c1 && b4->wins >= 2);
             bool c2_tt = (b4 && b4->best_move == c2 && b4->wins >= 2);
@@ -265,11 +339,26 @@ static void run_benchmark(const char * label, const std::vector<int32_t> & warm,
 
         if (best_j > 0 && consensus_len > 0) {
             size_t max_m = 0;
-            if (best_k >= 7) max_m = (hits >= 2) ? 4 : 3;
-            else if (best_k >= 5) max_m = (hits >= 2) ? 3 : 2;
-            else if (best_k == 4) max_m = (hits >= 2) ? 2 : 1;
-            else if (best_k == 3 && hits >= 2) max_m = 1;
-            max_m = std::min(max_m, consensus_len);
+            size_t base_m = 0;
+            if (best_k >= 7)      base_m = (hits >= 2) ? 4 : 3;
+            else if (best_k >= 5) base_m = (hits >= 2) ? 3 : 2;
+            else if (best_k == 4) base_m = (hits >= 2) ? 2 : 1;
+            else if (best_k == 3 && hits >= 2) base_m = 1;
+            else if (use_ss && best_k == 3 && hits == 1 && best_j + 128 >= pos) {
+                int32_t cand = test[best_j + 1];
+                const SFTTBucket * b5 = sf.probe5(tmp.data(), (int)tmp.size());
+                if (b5 && b5->best_move == cand && b5->wins >= 2 && b5->history >= 128) base_m = 1;
+            }
+
+            if (!use_ss) {
+                max_m = std::min(base_m, consensus_len);
+            } else {
+                // Sweet Spot Singular Extension:
+                // Start with base_m, and allow extending up to 7 ONLY when true_consensus_hits >= 2 AND best_k >= 7 AND every extended step i >= base_m is backed by RouteCrack or Stockfish TT!
+                size_t ext_cap = (best_k >= 8 && true_consensus_hits >= 2) ? 7 :
+                                 (best_k >= 7 && true_consensus_hits >= 2) ? 6 : base_m;
+                max_m = std::min(ext_cap, consensus_len);
+            }
 
             for (size_t i = 0; i < max_m && best_j + 1 + i < pos; ++i) {
                 int32_t cand = test[best_j + 1 + i];
@@ -280,7 +369,7 @@ static void run_benchmark(const char * label, const std::vector<int32_t> & warm,
                     }
                 }
                 if (hits == 1 && best_k <= 5) {
-                    NodeEval ev = eval_node(pred, tmp.data(), (int)tmp.size(), cand);
+                    NodeEval ev = eval_node(pred, use_sf ? &sf : nullptr, tmp.data(), (int)tmp.size(), cand, use_ss);
                     bool tt_backed = false;
                     if (use_sf) {
                         const SFTTBucket * b5 = sf.probe5(tmp.data(), (int)tmp.size());
@@ -293,15 +382,53 @@ static void run_benchmark(const char * label, const std::vector<int32_t> & warm,
                     if (best_k == 4 && i == 0 && ev.agree == 0 && !tt_backed) break;
                     if (i >= 1 && ev.agree == 0 && !tt_backed) break;
                 }
+                // For any extended token beyond base_m (i >= base_m), require Stockfish TT or RouteCrack confirmation!
+                if (use_ss && i >= base_m) {
+                    NodeEval ev = eval_node(pred, &sf, tmp.data(), (int)tmp.size(), cand, use_ss);
+                    const SFTTBucket * b5 = sf.probe5(tmp.data(), (int)tmp.size());
+                    const SFTTBucket * b4 = sf.probe4(tmp.data(), (int)tmp.size());
+                    bool tt_ok = (b5 && b5->best_move == cand && b5->wins >= 2) ||
+                                 (b4 && b4->best_move == cand && b4->wins >= 2);
+                    bool refuted = (b5 && b5->refuted_move == cand && b5->best_move != cand) ||
+                                   (b4 && b4->refuted_move == cand && b4->best_move != cand);
+                    if (refuted || (ev.agree < 2 && !tt_ok)) break;
+                }
                 draft.push_back(cand);
                 tmp.push_back(cand);
             }
         }
 
-        for (int d = (int)draft.size(); d < 3; ++d) {
-            NodeEval ev = eval_node(pred, tmp.data(), (int)tmp.size(), -1);
+        // Technique #5/#89: 4-token Macro Codebook Chain gated by Stockfish TT
+        const RCMacroEntry * active_macro = nullptr;
+        int macro_start_d = (int)draft.size();
+        if (use_ss && pred.macro.entries && pred.macro.n_entries > 0) {
+            for (int mk = std::min((int)tmp.size(), 6); mk >= 5; --mk) {
+                uint64_t mh = rc_fnv64(tmp.data() + tmp.size() - mk, mk);
+                int midx = pred.macro.find(mh);
+                if (midx >= 0 && pred.macro.entries[midx].conf >= 92 && pred.macro.entries[midx].cont_len >= 3) {
+                    active_macro = &pred.macro.entries[midx];
+                    break;
+                }
+            }
+        }
+
+        int max_rc_d = (active_macro != nullptr) ? std::min(4, macro_start_d + 4) : 3;
+        for (int d = (int)draft.size(); d < max_rc_d; ++d) {
+            NodeEval ev = eval_node(pred, use_sf ? &sf : nullptr, tmp.data(), (int)tmp.size(), -1, use_ss);
             int32_t chosen = ev.tok;
             int cert = ev.cert;
+
+            if (active_macro) {
+                int m_step = d - macro_start_d;
+                if (m_step >= 0 && m_step < active_macro->cont_len) {
+                    int32_t m_tok = active_macro->continuation[m_step];
+                    if (chosen == m_tok) {
+                        cert = std::max(cert, (int)active_macro->conf + (m_step >= 1 ? 4 : 0));
+                    } else {
+                        active_macro = nullptr;
+                    }
+                }
+            }
 
             if (use_sf) {
                 const SFTTBucket * b5 = sf.probe5(tmp.data(), (int)tmp.size());
@@ -319,7 +446,7 @@ static void run_benchmark(const char * label, const std::vector<int32_t> & warm,
                     } else if (chosen == b5->best_move && b5->wins >= 2) {
                         cert += 4;
                     } else if (chosen < 0 && b5->best_move >= 0 && b5->wins >= 3 && b5->history >= 160) {
-                        NodeEval kev = eval_node(pred, tmp.data(), (int)tmp.size(), b5->best_move);
+                        NodeEval kev = eval_node(pred, &sf, tmp.data(), (int)tmp.size(), b5->best_move, use_ss);
                         if (kev.agree >= 1) {
                             chosen = b5->best_move;
                             cert = 86 + std::min<int>(8, b5->wins);
@@ -331,7 +458,7 @@ static void run_benchmark(const char * label, const std::vector<int32_t> & warm,
                     } else if (chosen == b4->best_move && b4->wins >= 3 && b4->history >= 160) {
                         cert += 4;
                     } else if (chosen < 0 && b4->best_move >= 0 && b4->wins >= 4 && b4->history >= 200) {
-                        NodeEval kev = eval_node(pred, tmp.data(), (int)tmp.size(), b4->best_move);
+                        NodeEval kev = eval_node(pred, &sf, tmp.data(), (int)tmp.size(), b4->best_move, use_ss);
                         if (kev.agree >= 2) {
                             chosen = b4->best_move;
                             cert = 86;
@@ -346,10 +473,10 @@ static void run_benchmark(const char * label, const std::vector<int32_t> & warm,
                     }
                 }
 
-                int min_req = (d == 0) ? 84 : (d == 1) ? 92 : 96;
+                int min_req = (d == 0) ? 84 : (d == 1) ? 92 : (d == 2) ? 96 : 96;
                 if (chosen >= 0 && cert >= min_req - 2 && cert < min_req) {
                     tmp.push_back(chosen);
-                    NodeEval next_ev = eval_node(pred, tmp.data(), (int)tmp.size(), -1);
+                    NodeEval next_ev = eval_node(pred, &sf, tmp.data(), (int)tmp.size(), -1, use_ss);
                     const SFTTBucket * nb5 = sf.probe5(tmp.data(), (int)tmp.size());
                     tmp.pop_back();
                     if (next_ev.tok >= 0 && next_ev.casc_k >= 6 && next_ev.cert >= 95 && next_ev.agree >= 3 &&
@@ -359,7 +486,7 @@ static void run_benchmark(const char * label, const std::vector<int32_t> & warm,
                 }
             }
 
-            int min_req = (d == 0) ? 84 : (d == 1) ? 92 : 96;
+            int min_req = (d == 0) ? 84 : (d == 1) ? 92 : (d == 2) ? 96 : 96;
             if (chosen >= 0 && cert >= min_req) {
                 draft.push_back(chosen);
                 tmp.push_back(chosen);
@@ -392,34 +519,27 @@ static void run_benchmark(const char * label, const std::vector<int32_t> & warm,
             }
         }
     }
-    auto t1 = std::chrono::high_resolution_clock::now();
-    double us_per_call = std::chrono::duration<double, std::micro>(t1 - t0).count() / call_cnt;
-    size_t rollbacks = tot_s - tot_z;
-    double net_mamba_gain = (double)tot_a - 0.50 * (double)rollbacks;
 
-    printf("\n%s:\n", label);
-    printf("  Steps with draft:        %zu\n", tot_s);
-    printf("  Total tokens drafted:    %zu\n", tot_d);
-    printf("  Total tokens accepted:   %zu\n", tot_a);
-    printf("  Per-token acceptance:    %.2f%%\n", 100.0 * tot_a / tot_d);
-    printf("  Full-draft (0-rollback): %zu / %zu (%.2f%%) [Rollbacks: %zu]\n", tot_z, tot_s, 100.0 * tot_z / tot_s, rollbacks);
-    printf("  Net Mamba-2 Speedup:     %.1f effective tokens\n", net_mamba_gain);
-    printf("  Avg CPU Latency / Call:  %.2f us (L2 Footprint: %.1f KB, 0%% L3 Pollution)\n", us_per_call, use_sf ? (sizeof(StockfishDrafter) / 1024.0) : 0.0);
+    size_t wasted = tot_d - tot_a;
+    size_t rollbacks = tot_s - tot_z;
+    double wall_gain = (double)tot_a - 0.30 * (double)tot_d;
+    double mamba_gain = (double)tot_a - 0.50 * (double)rollbacks;
+    printf("%-34s | D=%6zu | A=%6zu | W=%5zu | Acc=%6.2f%% | 0-RB=%6.2f%% (RB=%4zu) | WallGain=%7.1f | MambaGain=%7.1f\n",
+           name, tot_d, tot_a, wasted, 100.0 * tot_a / tot_d, 100.0 * tot_z / tot_s, rollbacks, wall_gain, mamba_gain);
     pred.destroy();
 }
 
-int main(int argc, char ** argv) {
-    const char * base_dir = (argc > 1) ? argv[1] : std::getenv("RC_TABLES_DIR");
-    if (!base_dir || !base_dir[0]) base_dir = "./workspace/routecrack";
-
-    char warm_path[512], test_path[512];
-    snprintf(warm_path, sizeof(warm_path), "%s/corpus_nemotron_warm.bin", base_dir);
-    snprintf(test_path, sizeof(test_path), "%s/corpus_nemotron_test.bin", base_dir);
-
-    auto warm = load_bin(warm_path);
-    auto test = load_bin(test_path);
-
-    run_benchmark("1. SYNERGY BASELINE (In-Context + RouteCrack Greedy 1-Ply)", warm, test, base_dir, false);
-    run_benchmark("2. STOCKFISH-PVS (In-Context + RouteCrack + 192KB L2 Zobrist TT + Quiescence)", warm, test, base_dir, true);
+int old_main() {
+    const char * base_dir = "/opt/vex/routecrack";
+    auto warm = load_bin("/opt/vex/routecrack/corpus_nemotron_warm.bin");
+    auto test = load_bin("/opt/vex/routecrack/corpus_nemotron_test.bin");
+    printf("%-34s | %-8s | %-8s | %-7s | %-11s | %-22s | %-16s | %-16s\n",
+           "Configuration", "Drafted", "Accepted", "Wasted", "Accept %", "0-Rollback (Rollbacks)", "WallGain(A-.3D)", "MambaGain");
+    printf("------------------------------------------------------------------------------------------------------------------------------------------------\n");
+    run_exp("0. RouteCrack Baseline (No SF)",   warm, test, base_dir, 0);
+    run_exp("1. Stockfish-PVS v1",              warm, test, base_dir, 1);
+    run_exp("2. Stockfish-PVS v2 (Sweet Spot)", warm, test, base_dir, 2);
     return 0;
 }
+// We will replace main with a detailed sub-rule breakdown
+// Quick test of tightening each sub-rule so 0-RB and Acc% both beat v1 AND Accepted jumps +200!

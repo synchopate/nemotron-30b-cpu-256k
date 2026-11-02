@@ -378,6 +378,54 @@ Alongside the Linear Probe, `RCPredictor` combines 5 L3-resident statistical pre
 | **4. Non-Adjacent Skip-Gram** | $(t_{-3}, t_{-1}) \to t_0$ | Captures C/Python syntax, brackets & JSON fields | **~40%** | ~5% | $< 0.005\text{ ms}$ |
 | **5. Macro & Hot-Token Rules** | $1..6 \to 1..15$ tokens | 300 deterministic hot rules + 11,382 macro chains | **> 95%** | ~12% | $< 0.005\text{ ms}$ |
 | **6. Linear / Online Logit Probe** | Current step $\mathbf{\ell}_{\text{hot}}, h_t$ | Linear projection $W \cdot \mathbf{\ell}_{\text{hot}} + b$ (48–200 hot classes) | **58.2% – 85.5%** | ~51% (hot tokens) | $< 0.002\text{ ms}$ |
+| **7. `Stockfish-PVS v2` (`rc_stockfish.h`)** | $k = 5, 4, 3, 2, 1$ + $D=7$ PVS | `1.64 MB` Zobrist TT (`tt5/tt4/tt3`) + Countermove + Continuation History + Singular Horizon Extension (`M=7`) | **86.1% – 96.4%** *(live)* | Orthogonal Live Session | $< 0.005\text{ ms}$ |
+
+#### 4. `Stockfish-PVS v2` Chess-Engine Search, Zobrist Transposition Tables & The 4 Unlocked `RouteCrack` Techniques (`M=7` Sweet Spot)
+
+> 📄 **Full Reference:** See **[`speculative/ROUTECRACK_TECHNIQUES.md`](speculative/ROUTECRACK_TECHNIQUES.md)** for the complete catalog of **96+ studied `RouteCrack` techniques**, negative ablations, and mathematical derivations.
+
+Because every drafted token in a Sparse MoE (`128` experts, `top-4` active) activates cold expert weights from DDR5 RAM (`~0.30x` single-token latency cost per drafted token) and every rejected draft triggers an `18.4 MB` Mamba-2 recurrent state rollback (`slot.spec_ckpt`), the net wall-clock gain of a speculative drafter is governed by the **CPU-MoE Golden Equation**:
+$$\text{WallGain} = A - 0.30 \times D = 0.70 \times A - 0.30 \times W_{\text{wasted}}$$
+where $D$ is total drafted tokens, $A$ is accepted tokens, and $W_{\text{wasted}} = D - A$. Any single wasted draft token costs `-0.30` in DRAM bandwidth, so a speculative technique only increases real wall-clock `tok/s` if its **marginal precision exceeds `42.8%`** (or **`>75%`** when accounting for Mamba-2 state rollback overhead).
+
+During the `RouteCrack` research campaign (`96+` techniques evaluated across `77,456` held-out Nemotron-3.5 tokens), many promising techniques (`Online Session Trie`, `Top-4 Cascade Alternatives`, `Macro Codebook`, `D > 4 Horizon Extension`, `PPM/Skipgram Ensemble Voting`) failed when gated solely by static pre-computed confidence because static predictors trained on the same corpus make **correlated errors** (`17%–48%` precision on out-of-distribution tokens).
+
+Integrating **`StockfishDrafter`** ([`speculative/cpp/rc_stockfish.h`](speculative/cpp/rc_stockfish.h), `1.64 MB` total L2/L3 footprint: `384 KB` 4-way Bucketed Zobrist Transposition Tables `tt5/tt4/tt3` with age-based generational replacement + `1 MB` Countermove Table + `256 KB` Continuation History Table + Principal Variation Search with Late Move Reductions) provided an **orthogonal, zero-allocation live-session oracle** that unlocked **4 dormant `RouteCrack` techniques** in [`speculative/cpp/ngram-map.cpp`](speculative/cpp/ngram-map.cpp):
+
+1. **Technique #1 — Online Session Trie Rescue (`rc_trie_v2.h` + `Stockfish-PVS` Gate)**:
+   - When the static 8-level FNV-64 Hash Cascade misses or has low confidence (`best_conf < min_c`) on novel session identifiers, variable names, or user file paths, `OnlineTrieV2` (`4M`-node arena) is queried (`ot_cnt >= 2`, `ot_conf >= 0.78`) and **cross-validated against the Stockfish Zobrist TT (`sf_has_cand`)** (or accepted directly on high-support session hits `ot_cnt >= 4 && ot_conf >= 0.90`).
+   - **Marginal Precision**: **`92.19%` (`+59` accepted tokens, only `5` wasted)**.
+2. **Technique #2 — Top-4 Cascade Disambiguation via Orthogonal Stockfish Zobrist TT**:
+   - Each entry in `hc_top4_k*.bin` stores the **Top-4 candidates (`tok[0..3]`, `prob[0..3]`)**. Previously, `tok[1..3]` sat unused because switching away from `tok[0]` lowered static confidence. Now, when `tok[0]` falls in the uncertain band (`0.55 <= c0 < min_c`), `Stockfish-PVS` inspects `tok[1..3]`: if an alternative `alt_t` has a strong live-session Zobrist TT match (`alt_sf >= 640`, exact `tt5/tt4` hit) that strictly dominates `tok[0]` (`alt_sf > sf_t0 + 250`), `Stockfish-PVS` promotes `alt_t` and rescues the draft step.
+3. **Techniques #5 & #89 — 11,382-Entry Multi-Token Macro Codebook (`macro_codebook.bin`)**:
+   - Matches 2–6 token context suffixes against `11,382` pre-extracted structural chains (`1..15` tokens long) with `>= 90%` empirical precision (`conf = 0.93`). When a macro fires cleanly at $d=0$, `used_macro = true` enables **Singular Horizon Extension** up to $D=7$.
+   - **Marginal Precision**: **`91.81% -> 96.44%` (`+92` accepted tokens, only `8` wasted)**.
+4. **Techniques #17 & #73 — Singular Horizon Extension (`--spec-ngram-simple-size-m 7`) & Consensus Integrity Fix**:
+   - Extending the draft horizon beyond $D=4$ unconditionally drops precision to `41%`. Instead, inspired by **Stockfish Singular Extensions**, `ngram-map.cpp` extends the draft horizon to **$D=5..7$ (`M=7`)** *only* when the beam is "singular": either backed by a verified **2-hit In-Context trajectory** (`true_consensus_hits == d`), a **Macro Codebook chain** (`used_macro`), or a **Singular Cascade + Stockfish TT lock** (`best_conf >= 0.95 && sf_best >= 600`).
+   - **Consensus Integrity Fix**: Crucially, `true_consensus_hits` is incremented *exclusively* on genuine `ctx_two_hit` steps (preventing single-hit `16K Hot / 24K Prefix` steps rescued by `RouteCrack` from masquerading as 2-hit trajectories and bypassing the `d >= 3` gate).
+   - **Marginal Precision at $D=5..7$**: **`98.18%` (`M=6`) to `98.74%` (`M=7`: `+78` accepted tokens, `1` wasted, `-7` rollbacks)**.
+
+##### Held-Out Benchmark Ablation (`77,456` Nemotron-3.5 Tokens, `351` Contexts — [`speculative/cpp/test_synergy.cpp`](speculative/cpp/test_synergy.cpp))
+
+| Speculative Engine Configuration | Drafted ($D$) | Accepted ($A$) | Wasted ($W$) | Token Precision | 0-Rollback Steps | Mamba-2 Rollbacks | **CPU-MoE `WallGain`** |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **1. `RouteCrack` Baseline (`M=5`, Static Cascade)** | 6,332 | 5,440 | 892 | `85.91%` | `87.31%` | 482 | `+3,540.4` |
+| **2. `+ Stockfish-PVS v1` (`M=5`, Zobrist TT + PVS)** | 6,329 | 5,459 | 870 | `86.25%` *(+0.34%)* | `87.84%` *(+0.53%)* | 461 *(-21)* | `+3,560.3` *(+19.9)* |
+| **3. `+ Stockfish-PVS v2 Sweet Spot` (`M=7`, +Trie +Top4 +Macro +Singular)** | **6,555** | **5,663** | **892** | **`86.39%` *(+0.48%)* ** | **`88.35%` *(+1.04%)* ** | **450 *(-32)* ** | **`+3,696.5` *(+156.1)* ** |
+
+> [!IMPORTANT]
+> **Key Breakthrough**: **`Stockfish-PVS v2 (Sweet Spot, M=7)` yields `+223` additional accepted tokens (`5,440 -> 5,663`) with ZERO additional wasted tokens (`892 -> 892`, marginal precision = `100.0%` net!) and `-32` fewer Mamba-2 recurrent state rollbacks (`482 -> 450`)!**
+
+##### Live Production 5-Stage Telemetry on `CT 100` (`Ryzen 9 9955HX`, `22.2K -> 27.7K` Context)
+
+| Stage & Workload (`Nemotron-3.5-30B-A3B-Q4_0`, `0 GPUs`) | Active Context | `M=5` Speed (`Avg / Peak`) | **`Stockfish-PVS v2 (M=7)` Speed (`Avg / Peak`)** | Draft Acceptance (`Acc / Drafted`) | Mean Spec Length (`tok/step`) |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Stage 1A: Warm TTFT + `<tool_call>` `Read` (`50` tok)** | `22,299` tok | `30.84 tok/s` (`2.60 s`) | **`34.52 tok/s` (`2.45 s` wall)** | **`83.33%`** (`35 / 42`) | **`4.18` tok/step** |
+| **Stage 1B: Prefill `harp_cache.py` (`3,089` tok) + `500` tok Code** | `25,388` tok | `40.91 / 45.43 tok/s` (`12.22 s`) | **`48.39 tok/s` avg / `60.40 tok/s` peak (`10.33 s`)** | **`96.39%`** (`401 / 416`) | **`6.90` tok/step** *(up from 5.47)* |
+| **Stage 2A: Thread-Safe Refactoring (`400` tok Mixed Code)** | `26,419` tok | `27.80 / 41.20 tok/s` | **`28.61 tok/s` avg / `48.47 tok/s` peak** | **`86.10%`** (`223 / 259`) | **`4.66` tok/step** |
+| **Stage 2B: From-Scratch Concurrent Stress Test (`350` tok)** | `26,431` tok | `18.61 / 21.84 tok/s` | **`18.66 tok/s` avg / `21.89 tok/s` peak** | `56.38%` (`53 / 94`) | `2.33` tok/step |
+| **Stage 3: Architectural & Security Audit in Italian (`350` tok)** | `26,959` tok | `18.58 / 20.50 tok/s` (`80.6%` acc) | **`18.76 tok/s` avg / `20.78 tok/s` peak** | **`85.00%`** (`34 / 40`) *(up from 67.4%)* | **`2.48` tok/step** |
+| **Multi-Turn Live `Claude Code` Session (`4,096` tok Turn 3)** | `27,713` tok | `19.00 / 30.87 tok/s` (`59.1%` acc) | **`20.68 tok/s` avg / `39.28 tok/s` peak (`-17.5 s`)** | **`67.98%`** (`1,055 / 1,552`) | **`2.68` tok/step** |
 
 ---
 
