@@ -1,0 +1,17 @@
+22:31:33
+sched_reserve:       MTL0 compute buffer size =   533.62 MiB
+sched_reserve:        CPU compute buffer size =   281.10 MiB
+| model                          |       size |     params | backend    | threads | n_ubatch | type_k | type_v |  fa |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | -------: | -----: | -----: | --: | --------------: | -------------------: |
+| nemotron_h_moe 31B.A3.5B Q4_0  |  17.59 GiB |    31.58 B | BLAS,MTL   |      10 |     1024 |   q8_0 |   q8_0 |   1 | pp2048 @ d131072 |        206.87 ± 0.00 |
+~llama_context:       MTL0 compute buffer size is 533.6211 MiB, matches expectation of 533.6211 MiB
+~llama_context:        CPU compute buffer size is 281.1016 MiB, matches expectation of 281.1016 MiB
+~llama_context:        CPU compute buffer size is   0.0000 MiB, matches expectation of   0.0000 MiB
+sched_reserve:       MTL0 compute buffer size =   533.62 MiB
+sched_reserve:        CPU compute buffer size =   277.60 MiB
+| nemotron_h_moe 31B.A3.5B Q4_0  |  17.59 GiB |    31.58 B | BLAS,MTL   |      10 |     1024 |   q8_0 |   q8_0 |   1 |  tg64 @ d131072 |         30.26 ± 0.00 |
+~llama_context:       MTL0 compute buffer size is 533.6211 MiB, matches expectation of 533.6211 MiB
+~llama_context:        CPU compute buffer size is 277.6016 MiB, matches expectation of 277.6016 MiB
+~llama_context:        CPU compute buffer size is   0.0000 MiB, matches expectation of   0.0000 MiB
+22:37:48
+vm.swapusage: total = 3072.00M  used = 2336.31M  free = 735.69M  (encrypted)

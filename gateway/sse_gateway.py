@@ -3,6 +3,7 @@ import os
 import codecs
 import json
 import re
+import shlex
 import shutil
 import sys
 import time
@@ -13,20 +14,26 @@ import uuid
 from collections import OrderedDict
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
-UPSTREAM_BASE = os.environ.get("LLAMA_BACKEND_URL", "http://127.0.0.1:8789")
+UPSTREAM_BASE = os.environ.get("LLAMA_BACKEND_URL", os.environ.get("UPSTREAM_BASE", "http://127.0.0.1:8789"))
+GATEWAY_HOST = os.environ.get("GATEWAY_HOST", "0.0.0.0")
+GATEWAY_CORS_ORIGIN = os.environ.get("GATEWAY_CORS_ORIGIN", "*")
 _GATEWAY_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_GATEWAY_DIR)
 _KV_CACHE_DIR = os.path.join(_REPO_ROOT, "kv_cache")
 if _KV_CACHE_DIR not in sys.path:
     sys.path.insert(0, _KV_CACHE_DIR)
 
-try:
-    from harp_cache import HARPCacheEngine, hash_token_block
-    _harp_engine = HARPCacheEngine(shm_path="/dev/shm/nemotron_harp_cache.bin")
-    print("[Gateway] RouteCrack-KV: HARP-Cache Shared Memory Engine initialized (/dev/shm/nemotron_harp_cache.bin).", flush=True)
-except Exception as _harp_init_err:
-    _harp_engine = None
-    print(f"[Gateway] Notice: HARP-Cache not loaded: {_harp_init_err}", flush=True)
+_harp_engine = None
+if os.environ.get("HARP_CACHE", "1") != "0" and os.path.isdir("/dev/shm"):
+    try:
+        from harp_cache import HARPCacheEngine, hash_token_block
+        _harp_engine = HARPCacheEngine(shm_path="/dev/shm/nemotron_harp_cache.bin")
+        print("[Gateway] RouteCrack-KV: HARP-Cache Shared Memory Engine initialized (/dev/shm/nemotron_harp_cache.bin).", flush=True)
+    except Exception as _harp_init_err:
+        _harp_engine = None
+        print(f"[Gateway] Notice: HARP-Cache not loaded: {_harp_init_err}", flush=True)
+else:
+    print("[Gateway] Notice: HARP-Cache disabled (no /dev/shm or HARP_CACHE=0).", flush=True)
 
 # Thread-safe session tracking (LRU up to 128 concurrent sessions)
 _state_lock = threading.Lock()
@@ -108,7 +115,36 @@ def set_session_mode(session_id: str, new_mode: str) -> None:
         if session_id in ("default", "all"):
             _default_think_mode = new_mode
 
-def try_parse_tool_call(text):
+def _coerce_xml_param(raw, prop):
+    """Convert an XML <parameter> value to the JSON type that the tool schema declares."""
+    ptype = prop.get("type") if isinstance(prop, dict) else None
+    if ptype == "string":
+        return raw
+    s = raw.strip()
+    try:
+        if ptype == "integer":
+            return int(s)
+        if ptype == "number":
+            return float(s) if any(c in s for c in ".eE") else int(s)
+        if ptype == "boolean":
+            return s.lower() == "true"
+        if ptype in ("array", "object") or (ptype is None and s[:1] in "[{"):
+            return json.loads(s)
+        if ptype is None and (s in ("true", "false") or re.match(r"^-?\d+(\.\d+)?$", s)):
+            return json.loads(s)
+    except Exception:
+        pass
+    return raw if ptype is not None else s
+
+def _write_as_bash(name, args):
+    """Turn a Write call into a base64 Bash write with a shell-quoted path."""
+    if name == "Write" and isinstance(args, dict) and args.get("file_path"):
+        import base64
+        b64 = base64.b64encode(str(args.get("content", "")).encode("utf-8")).decode("ascii")
+        return "Bash", {"command": f"echo '{b64}' | base64 -d > {shlex.quote(str(args['file_path']))}"}
+    return name, args
+
+def try_parse_tool_call(text, schemas=None):
     t = text.strip()
     if t.startswith("```"):
         t = re.sub(r"^```(?:json)?\s*", "", t)
@@ -118,29 +154,16 @@ def try_parse_tool_call(text):
     if m:
         t = m.group(1).strip()
 
-    fn_m = re.search(r"<function=\s*([^>\s]+)\s*>([\s\S]*?)(?:</function>|$)", t)
+    fn_m = re.search(r"<function=\s*([^>\n\s]+)\s*>([\s\S]*?)(?:</function>|$)", t)
     if fn_m:
         name = fn_m.group(1).strip()
         body = fn_m.group(2)
+        props = (schemas or {}).get(name, {})
         args = {}
-        for pm in re.finditer(r"<parameter=\s*([^>\s]+)\s*>\s*([\s\S]*?)\s*</parameter>", body):
+        for pm in re.finditer(r"<parameter=\s*([^>\n\s]+)\s*>\n?([\s\S]*?)\n?</parameter>", body):
             k = pm.group(1).strip()
-            v_raw = pm.group(2).strip()
-            if (v_raw.startswith("{") and v_raw.endswith("}")) or (v_raw.startswith("[") and v_raw.endswith("]")) or v_raw in ("true", "false") or re.match(r"^-?\d+(\.\d+)?$", v_raw):
-                try:
-                    args[k] = json.loads(v_raw)
-                except Exception:
-                    args[k] = v_raw
-            else:
-                args[k] = v_raw
-        if name == "Write":
-            fp = args.get("file_path", "") if isinstance(args, dict) else ""
-            cnt = args.get("content", "") if isinstance(args, dict) else ""
-            if fp:
-                import base64
-                b64 = base64.b64encode(str(cnt).encode("utf-8")).decode("ascii")
-                name = "Bash"
-                args = {"command": f"echo '{b64}' | base64 -d > '{fp}'"}
+            args[k] = _coerce_xml_param(pm.group(2), props.get(k, {}))
+        name, args = _write_as_bash(name, args)
         return {"name": name, "input": args}
 
     if t.startswith("{") and t.endswith("}"):
@@ -155,14 +178,7 @@ def try_parse_tool_call(text):
                             args = json.loads(args)
                         except Exception:
                             pass
-                    if name == "Write":
-                        fp = args.get("file_path", "") if isinstance(args, dict) else ""
-                        cnt = args.get("content", "") if isinstance(args, dict) else ""
-                        if fp:
-                            import base64
-                            b64 = base64.b64encode(cnt.encode("utf-8")).decode("ascii")
-                            name = "Bash"
-                            args = {"command": f"echo '{b64}' | base64 -d > '{fp}'"}
+                    name, args = _write_as_bash(name, args)
                     return {"name": name, "input": args if isinstance(args, dict) else {}}
                 if "function" in data and isinstance(data["function"], dict):
                     fn = data["function"]
@@ -173,14 +189,7 @@ def try_parse_tool_call(text):
                             args = json.loads(args)
                         except Exception:
                             pass
-                    if name == "Write":
-                        fp = args.get("file_path", "") if isinstance(args, dict) else ""
-                        cnt = args.get("content", "") if isinstance(args, dict) else ""
-                        if fp:
-                            import base64
-                            b64 = base64.b64encode(cnt.encode("utf-8")).decode("ascii")
-                            name = "Bash"
-                            args = {"command": f"echo '{b64}' | base64 -d > '{fp}'"}
+                    name, args = _write_as_bash(name, args)
                     return {"name": name, "input": args if isinstance(args, dict) else {}}
         except Exception:
             pass
@@ -197,9 +206,10 @@ class ThinkBlockFilter:
     - Enforces hard cap of max_tool_calls (default 2) per turn.
     - Ensures valid, sequential Anthropic block lifecycles (start -> deltas -> stop).
     """
-    def __init__(self, mode="no", max_tool_calls=2):
+    def __init__(self, mode="no", max_tool_calls=2, schemas=None):
         self.mode = mode
         self.max_tool_calls = max_tool_calls
+        self.schemas = schemas or {}
         self.next_idx = 0
         self.state = "INIT"  # INIT, THINKING, TEXT, TOOL
         self.buf = ""
@@ -451,7 +461,7 @@ class ThinkBlockFilter:
                     raw_tool = self.tool_buf.strip()
                     self.tool_buf = ""
                     self.state = "INIT"
-                    parsed = try_parse_tool_call(raw_tool)
+                    parsed = try_parse_tool_call(raw_tool, self.schemas)
                     if parsed:
                         name = parsed.get("name")
                         args = parsed.get("input", {})
@@ -550,7 +560,7 @@ class ThinkBlockFilter:
                 self.next_idx += 1
         elif self.state == "TOOL":
             self.tool_buf += self.buf
-            parsed = try_parse_tool_call(self.tool_buf.strip())
+            parsed = try_parse_tool_call(self.tool_buf.strip(), self.schemas)
             if parsed:
                 name = parsed.get("name")
                 args = parsed.get("input", {})
@@ -694,7 +704,7 @@ def normalize_anthropic_messages(messages):
                         part["content"] = _READ_LINE_NUM_RE.sub("", tr_c)
     return
 
-def sanitize_non_streaming_response(resp_dict):
+def sanitize_non_streaming_response(resp_dict, schemas=None):
     content = resp_dict.get("content", [])
     if not isinstance(content, list):
         return resp_dict
@@ -711,7 +721,7 @@ def sanitize_non_streaming_response(resp_dict):
                 thinking_extra.append(parts[0].replace("<think>", "").strip())
                 rem = parts[1].strip()
                 if rem:
-                    parsed = try_parse_tool_call(rem)
+                    parsed = try_parse_tool_call(rem, schemas)
                     if parsed:
                         has_tool_call = True
                         new_content.append({
@@ -729,7 +739,7 @@ def sanitize_non_streaming_response(resp_dict):
                     new_content.append({"type": "text", "text": parts[0].strip()})
                 thinking_extra.append(parts[1].strip())
             else:
-                parsed = try_parse_tool_call(txt)
+                parsed = try_parse_tool_call(txt, schemas)
                 if parsed:
                     has_tool_call = True
                     new_content.append({
@@ -767,7 +777,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
         pass
 
     def send_cors_headers(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
+        if not GATEWAY_CORS_ORIGIN:
+            return
+        self.send_header("Access-Control-Allow-Origin", GATEWAY_CORS_ORIGIN)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "*")
 
@@ -864,6 +876,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         log_sess = session_id[:8] if session_id else client_ip
         target_upstream = UPSTREAM_BASE
         harp_meta = None
+        tool_schemas = {}
 
         if self.path.startswith("/v1/messages"):
             try:
@@ -1007,7 +1020,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     data.pop("_ preserved_memory", None)
 
                 # SINGLE CENTRALIZED SYSTEM PROMPT (gateway/system_prompt.md)
-                _sys_prompt_path = os.environ.get("SYSTEM_PROMPT_PATH", os.path.join(_GATEWAY_DIR, "system_prompt.md"))
+                _sys_prompt_path = os.environ.get(
+                    "GATEWAY_SYSTEM_PROMPT",
+                    os.environ.get("SYSTEM_PROMPT_PATH", os.path.join(_GATEWAY_DIR, "system_prompt.md")),
+                )
                 try:
                     with open(_sys_prompt_path, "r", encoding="utf-8") as _spf:
                         master_system_prompt = _spf.read().strip()
@@ -1053,6 +1069,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     for tool in data["tools"]:
                         if isinstance(tool, dict) and "input_schema" in tool and "parameters" not in tool:
                             tool["parameters"] = tool["input_schema"]
+                        if isinstance(tool, dict) and tool.get("name") and isinstance(tool.get("parameters"), dict):
+                            tool_schemas[tool["name"]] = tool["parameters"].get("properties", {})
 
                 # Enforce safe upper bound on max_tokens to prevent runaway loops
                 cur_max = data.get("max_tokens")
@@ -1122,9 +1140,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 target_upstream = UPSTREAM_BASE
                 harp_meta = None
 
-        self._forward_request("POST", body_bytes, active_mode=active_mode, target_upstream=target_upstream, harp_meta=harp_meta)
+        self._forward_request("POST", body_bytes, active_mode=active_mode, target_upstream=target_upstream, harp_meta=harp_meta, tool_schemas=tool_schemas)
 
-    def _forward_request(self, method, body_bytes=None, active_mode="med", target_upstream=UPSTREAM_BASE, harp_meta=None):
+    def _forward_request(self, method, body_bytes=None, active_mode="med", target_upstream=UPSTREAM_BASE, harp_meta=None, tool_schemas=None):
         url = target_upstream + self.path
         req_headers = {}
         for k, v in self.headers.items():
@@ -1151,7 +1169,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 headers_sent = True
 
                 if is_event_stream:
-                    stream_filter = ThinkBlockFilter(mode=active_mode)
+                    stream_filter = ThinkBlockFilter(mode=active_mode, schemas=tool_schemas)
                     utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
                     last_event_time = time.time()
                     while True:
@@ -1188,7 +1206,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     full_body = upstream.read()
                     try:
                         resp_json = json.loads(full_body.decode("utf-8"))
-                        resp_json = sanitize_non_streaming_response(resp_json)
+                        resp_json = sanitize_non_streaming_response(resp_json, tool_schemas)
                         full_body = json.dumps(resp_json).encode("utf-8")
                     except Exception:
                         pass
@@ -1228,6 +1246,6 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get("GATEWAY_PORT", 8787))
-    server = ThreadingHTTPServer(("0.0.0.0", port), GatewayHandler)
-    print(f"[Gateway] Multi-threaded Listening on 0.0.0.0:{port} (Session-isolated, default: {_default_think_mode})", flush=True)
+    server = ThreadingHTTPServer((GATEWAY_HOST, port), GatewayHandler)
+    print(f"[Gateway] Multi-threaded Listening on {GATEWAY_HOST}:{port} (Session-isolated, default: {_default_think_mode})", flush=True)
     server.serve_forever()

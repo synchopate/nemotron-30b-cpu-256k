@@ -17,15 +17,16 @@ CPUAffinity=0-15
 # - LLAMA_MOE_TOP_K=4           : Norm-preserving active-expert pruning override (reduces Nemotron 3.5
 #                                 routed experts from 6 -> 4, and Qwen3-30B-A3B from 8 -> 4; surviving
 #                                 4 gates are automatically renormalized via expert_weights_norm=True).
+#                                 Set LLAMA_MOE_TOP_K=6 (or omit) for unpruned 6/128 expert fidelity.
 # - LLAMA_ATTN_WINDOW=0         : Default Mode A (Full 256K Exact Global GQA across all 262,144 tokens,
 #                                 relying on LLAMA_KV_L3_WINDOW=2048 _MM_HINT_NTA streaming so cold KV
 #                                 sweeps never evict L3). Set LLAMA_ATTN_WINDOW=4096 (Mode B below) for
-#                                 Ultra-Low-Latency SWA-4096 + 16 Attention Sinks + 46-layer Mamba-2 SSM.
+#                                 Ultra-Low-Latency SWA-4096 + 16 Attention Sinks + 23 Mamba-2 SSM layers.
 # - LLAMA_KV_L3_WINDOW=2048     : Boundary in ggml-cpu/ops.cpp between _MM_HINT_T0 (L3-resident hot KV)
 #                                 and _MM_HINT_NTA (non-temporal L3-bypass streaming for older KV blocks).
 # - LLAMA_SWA_STRIDE=1          : When LLAMA_ATTN_WINDOW > 0, apply SWA to all 6 GQA layers on Hybrid SSM
-#                                 models (46 Mamba-2 layers carry global state). Pure GQA models auto-lock
-#                                 to LLAMA_SWA_STRIDE=4 (3:1 Interleaved SWA).
+#                                 models (23 Mamba-2 SSM + 23 MoE blocks carry global state). Pure GQA models
+#                                 auto-lock to LLAMA_SWA_STRIDE=4 (3:1 Interleaved SWA).
 # - LLAMA_KV_DISABLE_CHUNKING=1 : Static per-head GQA partitioning across CCDs (eliminates cross-CCD snoops).
 # - RC_TABLES_DIR               : Directory containing RouteCrack offline cascade tables (hc_top4_k*.bin,
 #                                 hot_rules.bin, macro_codebook.bin, corpus_nemotron_warm.bin).

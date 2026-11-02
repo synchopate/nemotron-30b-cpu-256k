@@ -1,0 +1,12 @@
+22:28:54
+== Context depth (pp512 / tg64 after N tokens)
+| model                          |       size |     params | backend    | threads | n_ubatch | type_k | type_v |  fa |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | -------: | -----: | -----: | --: | --------------: | -------------------: |
+| nemotron_h_moe 31B.A3.5B Q4_0  |  17.59 GiB |    31.58 B | BLAS,MTL   |      10 |     2048 |   q8_0 |   q8_0 |   1 |           pp512 |        666.34 ± 0.00 |
+| nemotron_h_moe 31B.A3.5B Q4_0  |  17.59 GiB |    31.58 B | BLAS,MTL   |      10 |     2048 |   q8_0 |   q8_0 |   1 |            tg64 |         32.61 ± 0.00 |
+| nemotron_h_moe 31B.A3.5B Q4_0  |  17.59 GiB |    31.58 B | BLAS,MTL   |      10 |     2048 |   q8_0 |   q8_0 |   1 |   pp512 @ d8192 |        456.17 ± 0.00 |
+| nemotron_h_moe 31B.A3.5B Q4_0  |  17.59 GiB |    31.58 B | BLAS,MTL   |      10 |     2048 |   q8_0 |   q8_0 |   1 |    tg64 @ d8192 |         17.70 ± 0.00 |
+| nemotron_h_moe 31B.A3.5B Q4_0  |  17.59 GiB |    31.58 B | BLAS,MTL   |      10 |     2048 |   q8_0 |   q8_0 |   1 |  pp512 @ d32768 |        479.49 ± 0.00 |
+| nemotron_h_moe 31B.A3.5B Q4_0  |  17.59 GiB |    31.58 B | BLAS,MTL   |      10 |     2048 |   q8_0 |   q8_0 |   1 |   tg64 @ d32768 |         48.37 ± 0.00 |
+22:30:08
+vm.swapusage: total = 3072.00M  used = 2272.31M  free = 799.69M  (encrypted)

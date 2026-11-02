@@ -1,0 +1,5 @@
+[SSE Gateway] Notice: HARP-Cache disabled (no /dev/shm or HARP_CACHE=0).
+[SSE Gateway] Multi-threaded Listening on 127.0.0.1:8787 (Session-isolated, default: no)
+[SSE Gateway] [127.0.0.1] Forwarding to http://127.0.0.1:8789: model=nemotron-3.5-30b-a3b mode=NO budget=0 stream=True
+[SSE Gateway] [127.0.0.1] Forwarding to http://127.0.0.1:8789: model=nemotron-3.5-30b-a3b mode=NO budget=0 stream=True
+[SSE Gateway] [127.0.0.1] Forwarding to http://127.0.0.1:8789: model=nemotron-3.5-30b-a3b mode=NO budget=0 stream=True
