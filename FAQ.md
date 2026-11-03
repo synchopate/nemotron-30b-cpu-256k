@@ -100,19 +100,21 @@ Yes—and in fact, **Nemotron 3.5 30B-A3B** is uniquely suited for **Asymmetric 
    `RouteCrack` drafts 3–4 high-certainty tokens in `0.002 ms` on CPU, allowing the GPU to execute dense attention/SSM prefill and verification at 500+ GB/s VRAM bandwidth while the CPU streams the selected routed experts only **once per 3–4 verified tokens** instead of once per token.
 4. **Verified AMD Vulkan/RADV Community Benchmark (`Ryzen 9 7945HX3D` + `Radeon RX 9070 XT 16GB`)**:
    - **Quant Comparison (`256K` ctx, New Code / In-Context Refactoring)**:
-     - **`MXFP4` (`15.2 GB`)**: **`75.1 tok/s` (new code) / `80.8 tok/s` (refactor)** — *Clear winner*: faster than Q4_0 with +0.9 GB extra VRAM headroom on a 16GB card.
-     - **`Q4_0` (`16.1 GB`, previous best)**: **`69.7 tok/s` / `76.2 tok/s`**.
-     - **`Fractal-64` (`Q2_0`, `14.35 GB`, CPU-only on Vulkan)**: **`44.2 tok/s` / `45.1 tok/s`** on pure CPU.
-   - **Crucial Note for Vulkan / non-CUDA Users (`Fractal-64` / `Q2_0`)**:
-     > [!WARNING]
-     > `llama.cpp`'s Vulkan backend currently does not implement a native `Q2_0` compute shader for GPU tensor cores. If `Fractal-64` (`Q2_0`) expert layers are offloaded to a Vulkan GPU (`-ngl 99` without pinning MoE to CPU), the GPU returns NaN/zero weights, resulting in blank/junk outputs (which n-gram speculation falsely reports as 100% acceptance). For AMD Vulkan hybrid setups, **always use `MXFP4` (`15.2 GB`)** for full GPU offload, or keep `Fractal-64` strictly pinned to CPU (`-ot "\.ffn_.*_exps\.=CPU"`).
+     - **`Fractal-MXFP4` (`15.2 GB`)**: **`75.1 tok/s` (new code) / `80.8 tok/s` (refactor)** — *Clear hybrid winner*: faster than `Q4_0` while leaving `~0.9 GB` more free VRAM on a 16 GB card.
+     - **`Q4_0` (`16.1 GB`, previous best)**: **`69.7 tok/s` (new code) / `76.2 tok/s` (refactor)**.
+     - **`Fractal-64` (`Q2_0`, `14.35 GB`, Pure CPU)**: **`44.2 tok/s` (new code) / `45.1 tok/s` (refactor)** on pure CPU.
+   - **Crucial Note for Hybrid GPU+CPU Users (Vulkan & CUDA) — `MXFP4` vs `Fractal-64` (`Q2_0`)**:
+     > [!IMPORTANT]
+     > **`Fractal-64` (`GGML_TYPE_Q2_0`, `30B / 64w = 3.75 bpw`) is a custom `llama-modchip` CPU SIMD quantization format**: its fused 2-level non-linear LUT + `vpmaddwd` dot-product kernel (`ggml_vec_dot_q2_0_q8_0_generic`) is currently implemented **only in `ggml-cpu`** (neither `ggml-vulkan` nor `ggml-cuda` has a GPU compute shader for `Q2_0` yet). If any `Q2_0` MoE expert layers are offloaded to a GPU (e.g., via `-ngl 99 --n-cpu-moe 30`, which places ~8 MoE layers in VRAM), the GPU backend cannot evaluate `Q2_0` tensors and produces empty/garbage output.
+     > - **For GPU+CPU Hybrid setups (Vulkan or CUDA)**: **Always use `Fractal-MXFP4` (`15.2 GB`)** — `GGML_TYPE_MXFP4` has native GPU shaders in both Vulkan and CUDA *plus* our accelerated CPU kernels, allowing `--n-cpu-moe 30` to pack spare VRAM with MoE layers (`75.1 / 80.8 tok/s`).
+     > - **For Pure CPU setups (or if all 23 MoE layers are kept on CPU via `-ot "\.ffn_.*_exps\.=CPU"`)**: Use **`Fractal-64` (`Q2_0`, `14.35 GB`)** for the lowest RAM footprint and fastest pure-CPU streaming.
    - **Key Vulkan/RADV Findings & Flags**:
      ```bash
-     llama-server -m NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MXFP4.gguf \
+     llama-server -m NVIDIA-Nemotron-3.5-30B-A3B-Fractal-MXFP4.gguf \
        -ngl 99 --n-cpu-moe 30 --load-mode none -ctk q8_0 -ctv q4_0 -fa ...
      ```
-     - **Native `SSM_SCAN` / `SSM_CONV` on Vulkan**: `llama.cpp`'s Vulkan backend implements `SSM_SCAN` and `SSM_CONV` natively on the GPU, keeping 100% of the 46-layer Mamba-2 backbone + 256K state + ~10 of 23 MoE expert layers inside `~13 GB` of GDDR6 VRAM (`~3 GB` headroom).
-     - **Avoiding the GTT Cliff (`--n-cpu-moe 30` + `--load-mode none`)**: `--n-cpu-moe` packs spare VRAM with MoE layers just below the threshold where allocation spills into shared GTT memory, while `--load-mode none` locks the remaining CPU-streamed MoE experts in DDR5 RAM. In this hybrid setup, **`MXFP4` hits `80.8 tok/s`**, outpacing `Q4_0` by over 4.5 tok/s while freeing ~900 MB of VRAM.
+     - **Native `SSM_SCAN` / `SSM_CONV` on Vulkan**: `llama.cpp`'s Vulkan backend implements `SSM_SCAN` and `SSM_CONV` natively on the GPU, keeping 100% of the 46-layer Mamba-2 backbone + 256K state + ~8–10 of 23 MoE expert layers inside `~13 GB` of GDDR6 VRAM (`~3 GB` headroom).
+     - **Avoiding the GTT Cliff (`--n-cpu-moe 30` + `--load-mode none`)**: `--n-cpu-moe` packs spare VRAM with MoE layers just below the threshold where allocation spills into shared GTT memory, while `--load-mode none` (or `--no-mmap`) locks the remaining CPU-streamed MoE experts in DDR5 RAM. In this hybrid setup, **`Fractal-MXFP4` hits `75.1 / 80.8 tok/s`**, outpacing `Q4_0` by `+4.6–5.4 tok/s` while freeing `~900 MB` of VRAM.
 
 ---
 
