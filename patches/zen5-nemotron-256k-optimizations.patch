@@ -521,7 +521,7 @@ index 7918845..4f506cd 100644
              ggml_graph_compute_thread(&threadpool->workers[ith]);
          }
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 42ec809..e8d7cd7 100644
+index 42ec809..1d27585 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -12,6 +12,10 @@
@@ -535,14 +535,16 @@ index 42ec809..e8d7cd7 100644
  // ggml_compute_forward_dup
  
  static void ggml_compute_forward_dup_same_cont(
-@@ -8465,6 +8469,93 @@ void ggml_compute_forward_top_k(
+@@ -8465,6 +8469,114 @@ void ggml_compute_forward_top_k(
      }
  }
  
 +#if defined(__AVX2__) || defined(__AVX512F__)
 +#include <sys/mman.h>
++#include <sys/stat.h>
 +#include <fcntl.h>
 +#include <unistd.h>
++#include <cstdio>
 +
 +struct llama_modchip_shm_t {
 +    uint32_t magic;            // 0x4D4F4443 ("MODC")
@@ -579,17 +581,36 @@ index 42ec809..e8d7cd7 100644
 +        const char * env_st = getenv("LLAMA_SWA_STRIDE");
 +        swa_stride          = env_st ? atoll(env_st) : 0;
 +
-+        int fd = open("/dev/shm/llama_modchip.bin", O_RDONLY);
++        int fd = -1;
++#if defined(__linux__)
++        const char * xdg = std::getenv("XDG_RUNTIME_DIR");
++        if (xdg && xdg[0]) {
++            char path_buf[512];
++            std::snprintf(path_buf, sizeof(path_buf), "%s/llama_modchip.bin", xdg);
++            fd = open(path_buf, O_RDONLY | O_NOFOLLOW);
++        }
++        if (fd < 0) {
++            fd = open("/dev/shm/llama_modchip.bin", O_RDONLY | O_NOFOLLOW);
++        }
 +        if (fd >= 0) {
-+            void * p = mmap(nullptr, sizeof(llama_modchip_shm_t), PROT_READ, MAP_SHARED, fd, 0);
-+            close(fd);
-+            if (p != MAP_FAILED) {
-+                const llama_modchip_shm_t * s = (const llama_modchip_shm_t *)p;
-+                if (s->magic == 0x4D4F4443u) {
-+                    shm_ptr = s;
++            struct stat st;
++            if (fstat(fd, &st) == 0 &&
++                S_ISREG(st.st_mode) &&
++                st.st_size >= (off_t)sizeof(llama_modchip_shm_t) &&
++                st.st_uid == getuid()) {
++                void * p = mmap(nullptr, sizeof(llama_modchip_shm_t), PROT_READ, MAP_SHARED, fd, 0);
++                if (p != MAP_FAILED) {
++                    const llama_modchip_shm_t * s = (const llama_modchip_shm_t *)p;
++                    if (s->magic == 0x4D4F4443u) {
++                        shm_ptr = s;
++                    } else {
++                        munmap(p, sizeof(llama_modchip_shm_t));
++                    }
 +                }
 +            }
++            close(fd);
 +        }
++#endif
 +
 +        if (attn_window > 0) {
 +            fprintf(stderr, "[GGML-MODCHIP] SWA ACTIVE: Window=%ld, Sinks=%ld, Stride=%ld, L3 Window=%ld\n",
@@ -629,7 +650,7 @@ index 42ec809..e8d7cd7 100644
  static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
          const ggml_compute_params * params,
          ggml_tensor * dst,
-@@ -8473,6 +8564,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+@@ -8473,6 +8585,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
          float * partials, int64_t partial_stride) {
  
      const bool write_partials = (partials != nullptr);
@@ -639,7 +660,7 @@ index 42ec809..e8d7cd7 100644
      const ggml_tensor * q     = dst->src[0];
      const ggml_tensor * k     = dst->src[1];
      const ggml_tensor * v     = dst->src[2];
-@@ -8588,8 +8682,22 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+@@ -8588,8 +8703,22 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
          // online softmax / attention
          // loop over n_kv and n_head_kv
          // ref: https://arxiv.org/pdf/2112.05682.pdf
@@ -662,7 +683,7 @@ index 42ec809..e8d7cd7 100644
              const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
              if (mv == -INFINITY) {
                  continue;
-@@ -8597,6 +8705,53 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+@@ -8597,6 +8726,53 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
  
              float s; // KQ value
  
@@ -716,7 +737,7 @@ index 42ec809..e8d7cd7 100644
              const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
              kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
  
-@@ -9149,7 +9304,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+@@ -9149,7 +9325,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
          const int64_t nr = neq1*neq2*neq3;
  
          // disable for NUMA
@@ -725,7 +746,7 @@ index 42ec809..e8d7cd7 100644
  
          // 4x chunks per thread
          int nth_scaled = nth * 4;
-@@ -10894,7 +11049,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
+@@ -10894,7 +11070,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
      int64_t nr = V->ne[1] * V->ne[3];
  
      // disable for NUMA
@@ -1103,7 +1124,7 @@ index 1ebc50a..053cdf3 100644
      }
  }
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 59191c6..a1c567b 100644
+index da7f3a5..2a5fce1 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -380,6 +380,14 @@ void * ggml_aligned_malloc(size_t size) {
@@ -1136,10 +1157,10 @@ index ed572da..b18ef4a 100644
          if (prefetch > 0) {
              if (posix_madvise(addr, std::min(file->size(), prefetch), POSIX_MADV_WILLNEED)) {
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 333f506..f6507a0 100644
+index 3bf3a22..4b848ca 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -1096,6 +1096,18 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
+@@ -1104,6 +1104,18 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
      ml.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);
      ml.get_key(LLM_KV_EXPERT_GROUP_USED_COUNT, hparams.n_group_used,    false);
  
