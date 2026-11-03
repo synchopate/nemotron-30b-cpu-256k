@@ -98,6 +98,16 @@ Yes—and in fact, **Nemotron 3.5 30B-A3B** is uniquely suited for **Asymmetric 
    the 15.5 GB of sparse routed experts remain in system DDR5 RAM accelerated by our **2MB Transparent HugePages (`MADV_HUGEPAGE`, 6.14 GB STLB)** and **AVX-512 VNNI `q4_0_8x8` tile repacking**. Only tiny activation vectors (`2,688` floats $\approx 10.7\text{ KB}$) cross PCIe per layer—never the weights.
 3. **Multiplicative Synergy with `RouteCrack` Speculative Decoding**:
    `RouteCrack` drafts 3–4 high-certainty tokens in `0.002 ms` on CPU, allowing the GPU to execute dense attention/SSM prefill and verification at 500+ GB/s VRAM bandwidth while the CPU streams the selected routed experts only **once per 3–4 verified tokens** instead of once per token.
+4. **Verified AMD Vulkan/RADV Community Benchmark (`Ryzen 9 7945HX3D` + `Radeon RX 9070 XT 16GB`)**:
+   - **Decode (`256K` ctx)**: **`56.4 tok/s` (new code) / `66.5 tok/s` (refactor)** (~`3x` speedup over `18.8 / 25.0 tok/s` pure CPU on the same box).
+   - **Prompt Prefill (`256K` ctx)**: **`221 – 563 tok/s`**.
+   - **Key Vulkan/RADV Findings & Flags**:
+     ```bash
+     llama-server -m NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q4_0.gguf \
+       -ngl 99 --n-cpu-moe 30 --no-mmap -ctk q8_0 -ctv q4_0 -fa ...
+     ```
+     - **Native `SSM_SCAN` / `SSM_CONV` on Vulkan**: `llama.cpp`'s Vulkan backend implements `SSM_SCAN` and `SSM_CONV` natively on the GPU, keeping 100% of the 46-layer Mamba-2 backbone + 256K state + ~10 of 23 MoE expert layers inside `~13 GB` of GDDR6 VRAM (`~3 GB` headroom).
+     - **Avoiding the GTT Cliff (`--n-cpu-moe 30` + `--no-mmap`)**: `--n-cpu-moe` packs spare VRAM with MoE layers just below the threshold where allocation spills into shared GTT memory, while `--no-mmap` locks the remaining CPU-streamed MoE experts in DDR5 RAM (jumping hybrid decode from `40` to `56+ tok/s`). Pairing this setup with **`Fractal-64` (`Q2_0`, `14.35 GiB`)** shrinks the CPU-streamed MoE layers by ~30% and fuses sub-block rescaling into AVX2 `vpmaddwd`.
 
 ---
 
@@ -152,6 +162,18 @@ See **[`speculative/ROUTECRACK_TECHNIQUES.md`](speculative/ROUTECRACK_TECHNIQUES
      2. **Top-4 Cascade Disambiguation (`#2`)** (promoting `tok[1..3]` when `Stockfish` Zobrist TT strongly prefers an alternative over `tok[0]`);
      3. **11,382-Entry Multi-Token Macro Codebook (`#5 / #89`)** (`96.44%` precision);
      4. **Singular Horizon Extension (`#17 / #73`, `--spec-ngram-simple-size-m 7`)** (extending the draft beam up to `M=7` tokens *only* on singular 2-hit in-context, macro, or `>=95%` cascade+TT locks, achieving **`98.74%` marginal accuracy at $D=5..7$**, **`mean len = 6.90` tokens/step**, and **`60.40 tok/s` peak / `48.39 tok/s` average** on live 25K-context code refactoring).
+
+---
+
+## Q12: How does `Fractal-64` (`block_q2_0`, `3.75 bpw`) achieve `17.78 dB` SQNR (`100/100` Quality Gate) while cutting `6.0 GiB` of RAM, and why do 8-CCD Threadrippers need `-t == -tb` + per-CCD `taskset`?
+
+1. **`Fractal-64` (`block_q2_0`, `30 bytes` per 64 weights = `3.75 bpw`)**:
+   - Standard `Q3_K` (`3.44 bpw`) fails on Nemotron-3.5-30B-A3B because its `256`-weight super-block does not divide the `1856` MoE intermediate dimension (`1856 % 256 = 64`), forcing 92 expert tensors to fall back to `Q8_0` (`20.43 GiB`) or degrading tool-calling fidelity.
+   - `Fractal-64` (`block_q2_0` in [`patches/zen5-nemotron-256k-optimizations.patch`](patches/zen5-nemotron-256k-optimizations.patch)) uses a **64-weight block (`1856 = 29 × 64`, `2688 = 42 × 64`, zero fallback tensors)**: `2B` FP16 super-scale + `4B` (`8 × 4-bit` unsigned shifted `{4..19}` sub-scales for `8 × 8` sub-blocks) + `24B` (`qs[16]` + `qh[8]`) indexing an 8-level non-linear Laplacians/kurtosis-matched LUT `{-14, -8, -4, -1, 1, 4, 8, 14}`.
+   - In AVX2 (`ggml_vec_dot_q2_0_q8_0_generic`), sub-block rescaling is fused directly into `_mm256_madd_epi16(p01, vmult01)` (`vpmaddwd`), shrinking the model to **`14.35 GiB`** (`15.40 GiB` idle / `17.27 GiB` peak `VmRSS` at 256K context), scoring **`100.0 / 100.0`** on [`benchmarks/eval_quality_and_tools.py`](benchmarks/eval_quality_and_tools.py), and lifting pure CPU decode by **`+28.0%` (`25.02 tok/s`)** (or **`+33.5%` / `26.08 tok/s`** in `Fractal-MXFP4`).
+2. **8-CCD Threadripper PRO 7985WX (`80.14 tok/s` Decode / `386.00 tok/s` Prefill) Thread Placement**:
+   - On 8-CCD workstations (`64` cores = `8 CCDs × 8 cores`), setting `-t 16` while leaving `-tb 64` causes `llama.cpp` to switch from the 16-thread pool ($N=1$) to the 64-thread batch pool whenever speculative decoding verifies a micro-batch ($N > 1$), leaving `64 - 16 = 48` extra threads spinning in `GGML_DEFAULT_N_SPIN` across every layer.
+   - Setting `-t == -tb` (e.g., `-t 24 -tb 24` or `-t 32 -tb 32`) and pinning symmetrically across all 8 CCDs (`taskset -c 0-2,8-10,16-18,24-26,32-34,40-42,48-50,56-58`, now automated in [`scripts/llama_modchip.py`](scripts/llama_modchip.py)) eliminates thread-pool handoff spinning and unlocks all 8 CCDs' memory controllers.
 
 ---
 
