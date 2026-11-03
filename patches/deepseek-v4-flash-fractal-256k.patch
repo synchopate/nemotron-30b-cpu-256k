@@ -1,5 +1,5 @@
 diff --git a/common/common.h b/common/common.h
-index 78d0877..93836f1 100644
+index 4811345..6c6ef0a 100644
 --- a/common/common.h
 +++ b/common/common.h
 @@ -384,11 +384,10 @@ struct common_params_speculative {
@@ -19,10 +19,10 @@ index 78d0877..93836f1 100644
  };
  
 diff --git a/common/ngram-map.cpp b/common/ngram-map.cpp
-index d1cb451..06a2f23 100644
+index d1cb451..228c3cf 100644
 --- a/common/ngram-map.cpp
 +++ b/common/ngram-map.cpp
-@@ -1,536 +1,997 @@
+@@ -1,536 +1,974 @@
 -#include "common.h"
 -#include "log.h"
  #include "ngram-map.h"
@@ -62,7 +62,6 @@ index d1cb451..06a2f23 100644
 +#if defined(__linux__)
 +#include <fcntl.h>
 +#include <sys/mman.h>
-+#include <sys/stat.h>
 +#include <unistd.h>
 +#endif
 +
@@ -108,33 +107,13 @@ index d1cb451..06a2f23 100644
 +    static bool tried = false;
 +    if (!tried) {
 +        tried = true;
-+        int fd = -1;
-+        const char * xdg = std::getenv("XDG_RUNTIME_DIR");
-+        if (xdg && xdg[0]) {
-+            char path_buf[512];
-+            std::snprintf(path_buf, sizeof(path_buf), "%s/llama_modchip.bin", xdg);
-+            fd = open(path_buf, O_RDONLY | O_NOFOLLOW);
-+        }
-+        if (fd < 0) {
-+            fd = open("/dev/shm/llama_modchip.bin", O_RDONLY | O_NOFOLLOW);
-+        }
++        int fd = open("/dev/shm/llama_modchip.bin", O_RDONLY);
 +        if (fd >= 0) {
-+            struct stat st;
-+            if (fstat(fd, &st) == 0 &&
-+                S_ISREG(st.st_mode) &&
-+                st.st_size >= (off_t)sizeof(rc_modchip_shm_t) &&
-+                st.st_uid == getuid()) {
-+                void * p = mmap(nullptr, sizeof(rc_modchip_shm_t), PROT_READ, MAP_SHARED, fd, 0);
-+                if (p != MAP_FAILED) {
-+                    const rc_modchip_shm_t * s = reinterpret_cast<const rc_modchip_shm_t *>(p);
-+                    if (s->magic == 0x4D4F4443u) {
-+                        shm_ptr = s;
-+                    } else {
-+                        munmap(p, sizeof(rc_modchip_shm_t));
-+                    }
-+                }
-+            }
++            void * p = mmap(nullptr, sizeof(rc_modchip_shm_t), PROT_READ, MAP_SHARED, fd, 0);
 +            close(fd);
++            if (p != MAP_FAILED) {
++                shm_ptr = reinterpret_cast<const rc_modchip_shm_t *>(p);
++            }
          }
 -        oss << inp[start + i];
      }
@@ -168,25 +147,25 @@ index d1cb451..06a2f23 100644
 -llama_tokens common_ngram_simple_draft(
 -        const common_ngram_simple_config & config,
 -        const llama_tokens & tokens, llama_token sampled) {
-+    // Track last context size to only feed newly added tokens incrementally
-+    size_t last_inp_size = 0;
- 
+-
 -    // Simple implementation of self-speculative decoding without a draft model.
 -    //
 -    const size_t cur_len = tokens.size();
++    // Track last context size to only feed newly added tokens incrementally
++    size_t last_inp_size = 0;
+ 
+-    const size_t n_draft_min = config.size_ngram; // size of n-gram to lookup in token history
+-    const size_t n_draft_max = config.size_mgram; // the m-gram following the found n-gram is used for draft
 +    void init_once() {
 +        if (initialized) return;
 +        initialized = true;
  
--    const size_t n_draft_min = config.size_ngram; // size of n-gram to lookup in token history
--    const size_t n_draft_max = config.size_mgram; // the m-gram following the found n-gram is used for draft
-+        pred.init();
-+        sf.init();
- 
 -    // vector for tokens we want to verify.
 -    // return empty vector if there is no match.
 -    llama_tokens draft_tokens;
--
++        pred.init();
++        sf.init();
+ 
 -    // We need at least n_draft_min + n_draft_max + 1 tokens.
 -    if (cur_len <= static_cast<size_t>(n_draft_min + n_draft_max + 1)) {
 -        return draft_tokens;
@@ -247,46 +226,42 @@ index d1cb451..06a2f23 100644
 -    LOG_DBG("%s: #tokens = %zu: found matching pattern at pos %zu, length %zu, draft length %zu\n",
 -            __func__, cur_len,
 -            match_pos, pattern.size(), copy_max);
- 
+-
 -    draft_tokens.reserve(copy_max);
 -    for (size_t j = 0; j < copy_max; ++j) {
 -        draft_tokens.push_back(tokens[match_pos + n_draft_min + j]);
 -    }
 -    return draft_tokens;
 -}
--
--
--// n-gram map
--//
--
--// maximum number of counted values of a ngram map value.
--#define COMMON_NGRAM_MAX_VALUE_COUNT 16380
+ 
 +        // Pre-warm online Trie + PPM + Skipgram + Stockfish 192KB L2 Zobrist TT with recent Nemotron warm corpus (80K tokens)
 +        {
 +            char path[512];
 +            std::snprintf(path, sizeof(path), "%s/corpus_nemotron_warm.bin", base_dir);
 +            FILE * f = std::fopen(path, "rb");
 +            if (f) {
-+                if (std::fseek(f, 0, SEEK_END) == 0) {
-+                    long sz = std::ftell(f);
-+                    if (sz >= 48) {
-+                        long n_toks = sz / 4;
-+                        long warm_n = std::min<long>(n_toks, 80000);
-+                        if (std::fseek(f, (n_toks - warm_n) * 4, SEEK_SET) == 0) {
-+                            std::vector<int32_t> buf(warm_n);
-+                            if (std::fread(buf.data(), 4, warm_n, f) == (size_t)warm_n) {
-+                                for (long j = 12; j < warm_n; ++j) {
-+                                    learn_incremental_nolock(&buf[j - 11], 12);
-+                                    sf.observe(&buf[j - 11], 11, buf[j], -1);
-+                                }
-+                            }
-+                        }
++                std::fseek(f, 0, SEEK_END);
++                long sz = std::ftell(f);
++                long n_toks = sz / 4;
++                long warm_n = std::min<long>(n_toks, 80000);
++                std::fseek(f, (n_toks - warm_n) * 4, SEEK_SET);
++                std::vector<int32_t> buf(warm_n);
++                if (std::fread(buf.data(), 4, warm_n, f) == (size_t)warm_n) {
++                    for (long j = 12; j < warm_n; ++j) {
++                        learn_incremental_nolock(&buf[j - 11], 12);
++                        sf.observe(&buf[j - 11], 11, buf[j], -1);
 +                    }
 +                }
 +                std::fclose(f);
 +            }
 +        }
  
+-// n-gram map
+-//
+-
+-// maximum number of counted values of a ngram map value.
+-#define COMMON_NGRAM_MAX_VALUE_COUNT 16380
+-
 -void common_ngram_map_begin(
 -    common_ngram_map & map, const llama_tokens & tokens) {
 -    size_t size_begin = tokens.size();
@@ -492,14 +467,14 @@ index d1cb451..06a2f23 100644
 -            if (map.key_only) {
 -                continue;
 -            }
--
+ 
 -            // Check the indices of the values.
 -            for (int16_t j = COMMON_NGRAM_MAX_VALUES - 1; j >= 0; --j) {
 -                common_ngram_map_value & value = key.values[j];
 -                if (value.value_idx != 0 && value.value_idx >= idx_begin_cleanup) {
 -                    // Delete the value.
 -                    count_values_del++;
- 
+-
 -                    // Move all values after this value to the left.
 -                    for (uint16_t k = j; k < COMMON_NGRAM_MAX_VALUES - 1; ++k) {
 -                        key.values[k] = key.values[k + 1];
@@ -719,10 +694,11 @@ index d1cb451..06a2f23 100644
 +    }
 +    tail_win[win_n - 1] = (int32_t)sampled;
 +
-+    // Incrementally feed newly accepted/sampled tokens to online learners + Stockfish Zobrist TT
++    // Incrementally feed newly accepted/sampled tokens (and warm prompt tokens!) to online learners + Stockfish Zobrist TT
 +    if (inp_size != rc.last_inp_size) {
 +        size_t delta = (inp_size > rc.last_inp_size && inp_size - rc.last_inp_size <= 8)
-+                       ? (inp_size - rc.last_inp_size) : 1;
++                       ? (inp_size - rc.last_inp_size)
++                       : std::min<size_t>(inp_size, 4096);
 +        int step_idx = 0;
 +        for (size_t d = delta; d >= 1; --d, ++step_idx) {
 +            int32_t d_tok = (step_idx < rc.sf.last_draft_len) ? rc.sf.last_draft[step_idx] : -1;
@@ -776,8 +752,9 @@ index d1cb451..06a2f23 100644
 +        while (k < 12 && j >= k && inp_size >= k && inp[j - k] == inp[inp_size - k]) {
 +            k++;
 +        }
-+        if (!is_hot_zone && k < 5) return;
-+        if (is_hot_zone && j + 256 < inp_size && k < 4) return;
++        const bool online_only = (rc.pred.n_cascade == 0);
++        if (!is_hot_zone && k < (online_only ? 3 : 5)) return;
++        if (!online_only && is_hot_zone && j + 256 < inp_size && k < 4) return;
 +
 +        hits++;
 +        if (best_j == 0) {
@@ -999,10 +976,8 @@ index d1cb451..06a2f23 100644
 +                } else {
 +                    active_macro = nullptr;
 +                }
-             }
-         }
--        if (match) {
--            key_offset = i;
++            }
++        }
 +
 +        const SFTTBucket * b5 = rc.sf.probe5(tail_win, cur_win_len);
 +        const SFTTBucket * b4 = rc.sf.probe4(tail_win, cur_win_len);
@@ -1046,8 +1021,10 @@ index d1cb451..06a2f23 100644
 +                cert -= 10;
 +            } else if (b3->best_move == chosen && b3->wins >= 3 && b3->history >= 192) {
 +                cert += 3;
-+            }
-+        }
+             }
+         }
+-        if (match) {
+-            key_offset = i;
 +
 +        // 2. Stockfish 1-Ply Quiescence Lookahead (resolve 1-ply Horizon Effect)
 +        const int min_req = (d == 0) ? cert_d0 : (d == 1 ? cert_d1 : cert_d2);
@@ -1142,11 +1119,11 @@ index d1cb451..06a2f23 100644
 +        if (key.values[i].value_num == 0) {
 +            key.values[i] = {value_idx, 1, -1};
 +            return i;
-         }
++        }
 +        if (common_ngram_compare(tokens, key.values[i].value_idx, value_idx, len)) {
 +            ++key.values[i].value_num;
 +            return i;
-+        }
+         }
 +    }
 +    return -1;
 +}
@@ -1172,16 +1149,16 @@ index d1cb451..06a2f23 100644
      }
 +    key.stat_idx = inp.size() - size_key - size_value - 1;
 +}
-+
-+static void common_ngram_update_keys_KeyMap(common_ngram_map & map, const llama_tokens & inp) {
-+    const uint16_t size_key   = map.size_key;
-+    const uint16_t size_value = map.size_value;
-+    const size_t   inp_size   = inp.size();
  
 -    if (curr_key.key_num < map.min_hits) {
 -        // not enough hits to consider this a good draft
 -        LOG_DBG("%s: key_offset = %zu, key_num = %d, min_hits = %d, no draft\n", __func__,
 -                key_offset, curr_key.key_num, map.min_hits);
++static void common_ngram_update_keys_KeyMap(common_ngram_map & map, const llama_tokens & inp) {
++    const uint16_t size_key   = map.size_key;
++    const uint16_t size_value = map.size_value;
++    const size_t   inp_size   = inp.size();
++
 +    if (inp_size < size_key + size_value) {
          return;
      }
@@ -1353,15 +1330,15 @@ index d1cb451..06a2f23 100644
 +void common_ngram_map_draft(
 +    common_ngram_map & map, const llama_tokens & inp,
 +    const llama_token sampled, llama_tokens & draft) {
- 
--    if (sum_occur > 0 && max_occur < 2 * sum_occur) {
--        // The most frequent value is not much more frequent than the other values.
--        // We do not use the draft.
++
 +    const uint16_t size_key   = map.size_key;
 +    const uint16_t size_value = map.size_value;
 +    const uint16_t min_hits   = map.min_hits;
 +    const size_t   inp_size   = inp.size();
-+
+ 
+-    if (sum_occur > 0 && max_occur < 2 * sum_occur) {
+-        // The most frequent value is not much more frequent than the other values.
+-        // We do not use the draft.
 +    map.last_draft_created   = false;
 +    map.last_draft_key_idx   = 0;
 +    map.last_draft_value_idx = 0;
@@ -1405,16 +1382,20 @@ index d1cb451..06a2f23 100644
 -        return;
 -    }
 +            if (key.key_num < min_hits) return;
-+
+ 
+-    // find the key and its chosen value.
+-    const size_t key_idx = map.last_draft_key_idx;
+-    const size_t val_idx = map.last_draft_value_idx;
 +            const uint16_t best_value_idx = get_best_value_idx(key, min_hits);
 +            if (best_value_idx < COMMON_NGRAM_MAX_VALUES) {
 +                map.last_draft_created   = true;
 +                map.last_draft_key_idx   = k;
 +                map.last_draft_value_idx = best_value_idx;
  
--    // find the key and its chosen value.
--    const size_t key_idx = map.last_draft_key_idx;
--    const size_t val_idx = map.last_draft_value_idx;
+-    // find key corresponding to key_idx.
+-    common_ngram_map_key & curr_key = map.keys[key_idx];
+-    // find value corresponding to val_idx.
+-    struct common_ngram_map_value & curr_value = curr_key.values[val_idx]; // value used for draft generation.
 +                size_t draft_idx = key.values[best_value_idx].value_idx;
 +                for (int j = 0; j < size_value; ++j) {
 +                    draft.push_back(inp[draft_idx + j]);
@@ -1424,21 +1405,17 @@ index d1cb451..06a2f23 100644
 +        }
 +    }
  
--    // find key corresponding to key_idx.
--    common_ngram_map_key & curr_key = map.keys[key_idx];
--    // find value corresponding to val_idx.
--    struct common_ngram_map_value & curr_value = curr_key.values[val_idx]; // value used for draft generation.
+-    // update the value statistics
+-    LOG_DBG("common_ngram_map_send_accepted: n_accepted = %d, prev value_num = %d\n",
+-            n_accepted, curr_value.n_accepted);
+-    curr_value.n_accepted = n_accepted;
 +    // Fallback to RouteCrack + Two-Zone Context predictor when ngram_map finds no match
 +    if (draft.empty()) {
 +        common_ngram_simple_config scfg = { size_key, size_value };
 +        draft = common_ngram_simple_draft(scfg, inp, sampled);
 +    }
 +}
- 
--    // update the value statistics
--    LOG_DBG("common_ngram_map_send_accepted: n_accepted = %d, prev value_num = %d\n",
--            n_accepted, curr_value.n_accepted);
--    curr_value.n_accepted = n_accepted;
++
 +void common_ngram_map_accept(common_ngram_map & map, uint16_t n_accepted) {
 +    if (map.last_draft_created) {
 +        if (n_accepted > map.size_value) {
@@ -1469,7 +1446,7 @@ index 83f9118..adf71e9 100644
  #define QK4_0 32
  typedef struct {
 diff --git a/ggml/src/ggml-cpu/arch/x86/quants.c b/ggml/src/ggml-cpu/arch/x86/quants.c
-index ea54cfe..7ca5c6c 100644
+index ea54cfe..dc029fc 100644
 --- a/ggml/src/ggml-cpu/arch/x86/quants.c
 +++ b/ggml/src/ggml-cpu/arch/x86/quants.c
 @@ -721,6 +721,12 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
@@ -1477,7 +1454,7 @@ index ea54cfe..7ca5c6c 100644
      // Main loop
      for (; ib < nb; ++ib) {
 +#if defined(__AVX2__) || defined(__AVX512F__)
-+        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q4_0 weight streaming pollution
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from weight streaming pollution
 +        if (ib + 4 < nb) {
 +            _mm_prefetch((const char *)&x[ib + 4], _MM_HINT_NTA);
 +        }
@@ -1485,11 +1462,10 @@ index ea54cfe..7ca5c6c 100644
          /* Compute combined scale for the block */
          const __m256 d = _mm256_set1_ps( GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d) );
  
-@@ -942,6 +948,11 @@ void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
+@@ -942,6 +948,10 @@ void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
      __m256 accum2 = _mm256_setzero_ps();
  
      for (; ib + 1 < nb; ib += 2) {
-+        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from MXFP4 weight streaming pollution
 +        if (ib + 6 < nb) {
 +            _mm_prefetch((const char *)&x[ib + 6], _MM_HINT_NTA);
 +            _mm_prefetch((const char *)&y[ib + 6], _MM_HINT_T0);
@@ -1497,12 +1473,12 @@ index ea54cfe..7ca5c6c 100644
          const __m128i q4bits_1 = _mm_loadu_si128((const __m128i*)x[ib + 0].qs);
          const __m128i q4bits_2 = _mm_loadu_si128((const __m128i*)x[ib + 1].qs);
          const __m256i q8b_1 = _mm256_loadu_si256((const __m256i *)y[ib + 0].qs);
-@@ -1162,6 +1173,12 @@ void ggml_vec_dot_q5_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
+@@ -1162,6 +1172,12 @@ void ggml_vec_dot_q5_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
  
      // Main loop
      for (; ib < nb; ++ib) {
 +#if defined(__AVX2__) || defined(__AVX512F__)
-+        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q5_0 weight streaming pollution
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from weight streaming pollution
 +        if (ib + 4 < nb) {
 +            _mm_prefetch((const char *)&x[ib + 4], _MM_HINT_NTA);
 +        }
@@ -1510,12 +1486,12 @@ index ea54cfe..7ca5c6c 100644
          /* Compute combined scale for the block */
          const __m256 d = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d));
  
-@@ -1186,6 +1203,12 @@ void ggml_vec_dot_q5_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
+@@ -1186,6 +1202,12 @@ void ggml_vec_dot_q5_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
  
      // Main loop
      for (; ib < nb; ++ib) {
 +#if defined(__AVX2__) || defined(__AVX512F__)
-+        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q5_0 weight streaming pollution
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from weight streaming pollution
 +        if (ib + 4 < nb) {
 +            _mm_prefetch((const char *)&x[ib + 4], _MM_HINT_NTA);
 +        }
@@ -1523,15 +1499,14 @@ index ea54cfe..7ca5c6c 100644
          /* Compute combined scale for the block */
          const __m256 d = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d));
  
-@@ -1591,6 +1614,15 @@ void ggml_vec_dot_q2_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+@@ -1591,6 +1613,14 @@ void ggml_vec_dot_q2_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
      __m256 acc = _mm256_setzero_ps();
  
      for (int i = 0; i < nb; ++i) {
 +#if defined(__AVX2__) || defined(__AVX512F__)
-+        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q2_K weight streaming
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
 +        if (i + 2 < nb) {
-+            _mm_prefetch((const char *)&x[i + 2], _MM_HINT_NTA);
-+            _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++                _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
 +            _mm_prefetch((const char *)&x[i + 2] + 128, _MM_HINT_NTA);
 +            _mm_prefetch((const char *)&x[i + 2] + 192, _MM_HINT_NTA);
 +        }
@@ -1539,15 +1514,14 @@ index ea54cfe..7ca5c6c 100644
  
          const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
          const float dmin = -y[i].d * GGML_CPU_FP16_TO_FP32(x[i].dmin);
-@@ -1790,6 +1822,15 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+@@ -1790,6 +1820,14 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
      uint32_t aux[3];
  
      for (int i = 0; i < nb; ++i) {
 +#if defined(__AVX2__) || defined(__AVX512F__)
-+        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q3_K weight streaming
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
 +        if (i + 2 < nb) {
-+            _mm_prefetch((const char *)&x[i + 2], _MM_HINT_NTA);
-+            _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++                _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
 +            _mm_prefetch((const char *)&x[i + 2] + 128, _MM_HINT_NTA);
 +            _mm_prefetch((const char *)&x[i + 2] + 192, _MM_HINT_NTA);
 +        }
@@ -1555,15 +1529,14 @@ index ea54cfe..7ca5c6c 100644
  
          const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
  
-@@ -1895,6 +1936,15 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+@@ -1895,6 +1933,14 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
      const uint32_t *aux;
  
      for (int i = 0; i < nb; ++i) {
 +#if defined(__AVX2__) || defined(__AVX512F__)
-+        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q3_K weight streaming
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
 +        if (i + 2 < nb) {
-+            _mm_prefetch((const char *)&x[i + 2], _MM_HINT_NTA);
-+            _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++                _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
 +            _mm_prefetch((const char *)&x[i + 2] + 128, _MM_HINT_NTA);
 +            _mm_prefetch((const char *)&x[i + 2] + 192, _MM_HINT_NTA);
 +        }
@@ -1571,15 +1544,14 @@ index ea54cfe..7ca5c6c 100644
  
          const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
  
-@@ -2062,6 +2112,15 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+@@ -2062,6 +2108,14 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
      __m128 acc_m = _mm_setzero_ps();
  
     for (int i = 0; i < nb; ++i) {
 +#if defined(__AVX2__) || defined(__AVX512F__)
-+        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q4_K weight streaming
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
 +        if (i + 2 < nb) {
-+            _mm_prefetch((const char *)&x[i + 2], _MM_HINT_NTA);
-+            _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++                _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
 +            _mm_prefetch((const char *)&x[i + 2] + 128, _MM_HINT_NTA);
 +            _mm_prefetch((const char *)&x[i + 2] + 192, _MM_HINT_NTA);
 +        }
@@ -1587,15 +1559,14 @@ index ea54cfe..7ca5c6c 100644
  
          const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
          const float dmin = -y[i].d * GGML_CPU_FP16_TO_FP32(x[i].dmin);
-@@ -2128,6 +2187,15 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+@@ -2128,6 +2182,14 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
      __m128 acc_m = _mm_setzero_ps();
  
     for (int i = 0; i < nb; ++i) {
 +#if defined(__AVX2__) || defined(__AVX512F__)
-+        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q4_K weight streaming
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
 +        if (i + 2 < nb) {
-+            _mm_prefetch((const char *)&x[i + 2], _MM_HINT_NTA);
-+            _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++                _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
 +            _mm_prefetch((const char *)&x[i + 2] + 128, _MM_HINT_NTA);
 +            _mm_prefetch((const char *)&x[i + 2] + 192, _MM_HINT_NTA);
 +        }
@@ -1603,15 +1574,14 @@ index ea54cfe..7ca5c6c 100644
  
          const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
          const float dmin = -y[i].d * GGML_CPU_FP16_TO_FP32(x[i].dmin);
-@@ -2323,6 +2391,15 @@ void ggml_vec_dot_q5_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+@@ -2323,6 +2385,14 @@ void ggml_vec_dot_q5_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
      float summs = 0.f;
  
      for (int i = 0; i < nb; ++i) {
 +#if defined(__AVX2__) || defined(__AVX512F__)
-+        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q5_K weight streaming
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
 +        if (i + 2 < nb) {
-+            _mm_prefetch((const char *)&x[i + 2], _MM_HINT_NTA);
-+            _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++                _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
 +            _mm_prefetch((const char *)&x[i + 2] + 128, _MM_HINT_NTA);
 +            _mm_prefetch((const char *)&x[i + 2] + 192, _MM_HINT_NTA);
 +        }
@@ -1619,15 +1589,14 @@ index ea54cfe..7ca5c6c 100644
  
          const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
          const float dmin = -y[i].d * GGML_CPU_FP16_TO_FP32(x[i].dmin);
-@@ -2444,6 +2521,15 @@ void ggml_vec_dot_q6_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+@@ -2444,6 +2514,14 @@ void ggml_vec_dot_q6_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
      __m256 acc = _mm256_setzero_ps();
  
      for (int i = 0; i < nb; ++i) {
 +#if defined(__AVX2__) || defined(__AVX512F__)
 +        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
 +        if (i + 2 < nb) {
-+            _mm_prefetch((const char *)&x[i + 2], _MM_HINT_NTA);
-+            _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++                _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
 +            _mm_prefetch((const char *)&x[i + 2] + 128, _MM_HINT_NTA);
 +            _mm_prefetch((const char *)&x[i + 2] + 192, _MM_HINT_NTA);
 +        }
@@ -1635,15 +1604,14 @@ index ea54cfe..7ca5c6c 100644
  
          const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
  
-@@ -2515,6 +2601,15 @@ void ggml_vec_dot_q6_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+@@ -2515,6 +2593,14 @@ void ggml_vec_dot_q6_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
      __m256 acc = _mm256_setzero_ps();
  
      for (int i = 0; i < nb; ++i) {
 +#if defined(__AVX2__) || defined(__AVX512F__)
 +        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
 +        if (i + 2 < nb) {
-+            _mm_prefetch((const char *)&x[i + 2], _MM_HINT_NTA);
-+            _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++                _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
 +            _mm_prefetch((const char *)&x[i + 2] + 128, _MM_HINT_NTA);
 +            _mm_prefetch((const char *)&x[i + 2] + 192, _MM_HINT_NTA);
 +        }
@@ -1651,8 +1619,59 @@ index ea54cfe..7ca5c6c 100644
  
          const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
  
+@@ -2679,6 +2765,9 @@ void ggml_vec_dot_iq2_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const
+ 
+     __m256 accumf = _mm256_setzero_ps();
+     for (int i = 0; i < nb; ++i) {
++        if (i + 2 < nb) {
++                _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++        }
+         const float d = GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d;
+         const uint16_t * GGML_RESTRICT q2 = x[i].qs;
+         const int8_t   * GGML_RESTRICT q8 = y[i].qs;
+@@ -3609,6 +3698,8 @@ void ggml_vec_dot_iq1_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
+     __m256 accum = _mm256_setzero_ps();
+     float accum1 = 0;
+     for (int i = 0; i < nb; ++i) {
++        if (i + 2 < nb) {
++            }
+ 
+         const int8_t   * q8 = y[i].qs;
+         const uint8_t  * qs = x[i].qs;
+@@ -3620,10 +3711,8 @@ void ggml_vec_dot_iq1_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
+ #ifdef __BMI2__
+             const uint64_t packed_idx1 = _pdep_u64(*(const uint32_t *)qs, 0x00ff00ff00ff00ffULL) | _pdep_u64(qh[ib], 0x700070007000700ULL);
+             const uint64_t packed_idx2 = _pdep_u64(*(const uint32_t *)(qs + 4), 0x00ff00ff00ff00ffULL) | _pdep_u64(qh[ib + 1], 0x700070007000700ULL);
+-            const uint16_t *idx1 = (const uint16_t *)(&packed_idx1);
+-            const uint16_t *idx2 = (const uint16_t *)(&packed_idx2);
+-            const __m256i q1b_1 = _mm256_set_epi64x(iq1s_grid[idx1[3]], iq1s_grid[idx1[2]], iq1s_grid[idx1[1]], iq1s_grid[idx1[0]]);
+-            const __m256i q1b_2 = _mm256_set_epi64x(iq1s_grid[idx2[3]], iq1s_grid[idx2[2]], iq1s_grid[idx2[1]], iq1s_grid[idx2[0]]);
++            const __m256i q1b_1 = _mm256_set_epi64x(iq1s_grid[(uint16_t)(packed_idx1 >> 48)], iq1s_grid[(uint16_t)(packed_idx1 >> 32)], iq1s_grid[(uint16_t)(packed_idx1 >> 16)], iq1s_grid[(uint16_t)packed_idx1]);
++            const __m256i q1b_2 = _mm256_set_epi64x(iq1s_grid[(uint16_t)(packed_idx2 >> 48)], iq1s_grid[(uint16_t)(packed_idx2 >> 32)], iq1s_grid[(uint16_t)(packed_idx2 >> 16)], iq1s_grid[(uint16_t)packed_idx2]);
+ #else
+             const __m256i q1b_1 = _mm256_set_epi64x(iq1s_grid[qs[3] | ((qh[ib+0] >> 1) & 0x700)], iq1s_grid[qs[2] | ((qh[ib+0] << 2) & 0x700)],
+                                                     iq1s_grid[qs[1] | ((qh[ib+0] << 5) & 0x700)], iq1s_grid[qs[0] | ((qh[ib+0] << 8) & 0x700)]);
+@@ -3757,14 +3846,14 @@ void ggml_vec_dot_iq1_m_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
+         __m256i sumi2 = _mm256_setzero_si256();
+         for (int ib = 0; ib < QK_K/32; ib += 2) {
+ #ifdef __BMI2__
++            if (ib == 0 && i + 2 < nb) {
++                    }
+             const uint64_t packed_idx1 = _pdep_u64(*(const uint32_t *)qs, 0x00ff00ff00ff00ffULL)
+                                        | _pdep_u64(*(const uint16_t*)(qh) & 0x7777, 0xf000f000f000f00ULL);
+             const uint64_t packed_idx2 = _pdep_u64(*(const uint32_t *)(qs + 4), 0x00ff00ff00ff00ffULL)
+                                        | _pdep_u64(*(const uint16_t*)(qh + 2) & 0x7777, 0xf000f000f000f00ULL);
+-            const uint16_t *idx1 = (const uint16_t *)(&packed_idx1);
+-            const uint16_t *idx2 = (const uint16_t *)(&packed_idx2);
+-            const __m256i q1b_1 = _mm256_set_epi64x(iq1s_grid[idx1[3]], iq1s_grid[idx1[2]], iq1s_grid[idx1[1]], iq1s_grid[idx1[0]]);
+-            const __m256i q1b_2 = _mm256_set_epi64x(iq1s_grid[idx2[3]], iq1s_grid[idx2[2]], iq1s_grid[idx2[1]], iq1s_grid[idx2[0]]);
++            const __m256i q1b_1 = _mm256_set_epi64x(iq1s_grid[(uint16_t)(packed_idx1 >> 48)], iq1s_grid[(uint16_t)(packed_idx1 >> 32)], iq1s_grid[(uint16_t)(packed_idx1 >> 16)], iq1s_grid[(uint16_t)packed_idx1]);
++            const __m256i q1b_2 = _mm256_set_epi64x(iq1s_grid[(uint16_t)(packed_idx2 >> 48)], iq1s_grid[(uint16_t)(packed_idx2 >> 32)], iq1s_grid[(uint16_t)(packed_idx2 >> 16)], iq1s_grid[(uint16_t)packed_idx2]);
+ 
+             // Convert signs to bytes 0x81 (negative) or 0x01 (positive)
+             const uint64_t delta_sign = _pdep_u64(*(const uint32_t*)(qh) & 0x88888888, 0xf0f0f0f0f0f0f0f0ULL);
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 491316f..53a684f 100644
+index 7918845..8f2c3af 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
 @@ -489,6 +489,8 @@ struct ggml_threadpool {
@@ -1699,7 +1718,17 @@ index 491316f..53a684f 100644
  
      const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
  
-@@ -3057,6 +3062,66 @@ static int ggml_cpu_try_fuse_ops(
+@@ -2257,6 +2262,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_SOLVE_TRI:
+         case GGML_OP_GATED_DELTA_NET:
+         case GGML_OP_DSV4_HC_COMB:
++            {
++                n_tasks = (node->ne[2] >= 4) ? n_threads : 1;
++            } break;
+         case GGML_OP_DSV4_HC_PRE:
+         case GGML_OP_DSV4_HC_POST:
+             {
+@@ -3057,6 +3065,66 @@ static int ggml_cpu_try_fuse_ops(
      return 0;
  }
  
@@ -1766,7 +1795,7 @@ index 491316f..53a684f 100644
  static thread_ret_t ggml_graph_compute_thread(void * data) {
      struct ggml_compute_state * state = (struct ggml_compute_state *) data;
      struct ggml_threadpool    * tp    = state->threadpool;
-@@ -3085,6 +3150,20 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3085,11 +3153,30 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
      GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
  #endif
  
@@ -1775,19 +1804,31 @@ index 491316f..53a684f 100644
 +        const char * e = getenv("LLAMA_PROFILE_OPS");
 +        s_prof_ops = (e && atoi(e) > 0) ? atoi(e) : 0;
 +    }
-+    int64_t prof_us[GGML_OP_COUNT][GGML_TYPE_COUNT];
-+    int32_t prof_cnt[GGML_OP_COUNT][GGML_TYPE_COUNT];
++    static int64_t prof_us[GGML_OP_COUNT][GGML_TYPE_COUNT];
++    static int32_t prof_cnt[GGML_OP_COUNT][GGML_TYPE_COUNT];
 +    static int s_graph_idx = 0;
++    static int64_t s_prev_end = 0;
++    int64_t t_gstart = 0;
 +    const bool do_prof = (s_prof_ops > 0 && state->ith == 0 && cgraph->n_nodes > 500);
 +    if (do_prof) {
++        t_gstart = ggml_time_us();
 +        memset(prof_us, 0, sizeof(prof_us));
 +        memset(prof_cnt, 0, sizeof(prof_cnt));
 +    }
 +
++    extern int ggml_dsv4_skip_csa_comp;
++    const int skip_csa_comp = ggml_dsv4_skip_csa_comp;
      for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
          struct ggml_tensor * node = cgraph->nodes[node_n];
  
-@@ -3097,6 +3176,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+-        if (ggml_op_is_empty(node->op)) {
+-            // skip NOPs
++        if (ggml_op_is_empty(node->op) || (skip_csa_comp && (node->flags & 0x100))) {
++            // skip NOPs or dynamically skipped dummy CSA/LID compression node
+             continue;
+         }
+ 
+@@ -3097,6 +3184,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
              continue;
          }
  
@@ -1798,7 +1839,7 @@ index 491316f..53a684f 100644
          // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
          // Try fused ops, fall back to normal compute
          const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
-@@ -3115,6 +3198,32 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3115,6 +3206,39 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
          if (node_n + 1 < cgraph->n_nodes) {
              ggml_barrier(state->threadpool);
          }
@@ -1811,7 +1852,14 @@ index 491316f..53a684f 100644
 +        }
 +    }
 +    if (do_prof) {
++        const int64_t t_gend = ggml_time_us();
++        const double g_ms = (t_gend - t_gstart) / 1000.0;
++        const double gap_ms = s_prev_end > 0 ? (t_gstart - s_prev_end) / 1000.0 : 0.0;
++        s_prev_end = t_gend;
 +        s_graph_idx++;
++        if (s_graph_idx >= 45 && s_graph_idx <= 55) {
++            fprintf(stderr, "[GRAPH #%d] wall=%.2f ms, gap=%.2f ms, skip_csa=%d, n_nodes=%d\n", s_graph_idx, g_ms, gap_ms, skip_csa_comp, cgraph->n_nodes);
++        }
 +        if (s_graph_idx == s_prof_ops) {
 +            int64_t tot_us = 0;
 +            fprintf(stderr, "\n=== [LLAMA_PROFILE_OPS] Graph #%d (n_nodes=%d, nth=%d) ===\n", s_graph_idx, cgraph->n_nodes, params.nth);
@@ -1831,7 +1879,7 @@ index 491316f..53a684f 100644
      }
  
  #ifdef GGML_USE_OPENMP
-@@ -3284,6 +3393,8 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
+@@ -3284,6 +3408,8 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
          threadpool->n_barrier        = 0;
          threadpool->n_barrier_passed = 0;
          threadpool->current_chunk    = 0;
@@ -1840,61 +1888,18 @@ index 491316f..53a684f 100644
          threadpool->stop             = false;
          threadpool->pause            = tpp->paused;
          threadpool->abort            = -1;
-@@ -3376,7 +3487,152 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -3376,7 +3502,113 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
      }
  
  #ifdef GGML_USE_OPENMP
 -    if (n_threads > 1) {
 +    static int s_dual_ccd_split_layer = -2;
-+    static int s_ccd0_cpus[64];
-+    static int s_ccd1_cpus[64];
-+    static int s_n_ccd0 = 16;
-+    static int s_n_ccd1 = 16;
 +    if (s_dual_ccd_split_layer == -2) {
 +        const char * env_split = getenv("LLAMA_DUAL_CCD_SPLIT");
 +        s_dual_ccd_split_layer = (env_split && atoi(env_split) > 0) ? atoi(env_split) : -1;
-+        const int def0[16] = {0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23};
-+        const int def1[16] = {8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31};
-+        memcpy(s_ccd0_cpus, def0, sizeof(def0));
-+        memcpy(s_ccd1_cpus, def1, sizeof(def1));
-+#if defined(__linux__)
-+        FILE * fp = fopen("/sys/devices/system/cpu/cpu0/cache/index3/shared_cpu_list", "r");
-+        if (fp) {
-+            char buf[256] = {0};
-+            if (fgets(buf, sizeof(buf) - 1, fp)) {
-+                bool in_ccd0[256] = {false};
-+                int n0 = 0, n1 = 0;
-+                const char * p = buf;
-+                while (*p) {
-+                    int a = 0, b = 0;
-+                    if (sscanf(p, "%d-%d", &a, &b) == 2) {
-+                        for (int c = a; c <= b && c < 256 && n0 < 64; c++) {
-+                            s_ccd0_cpus[n0++] = c;
-+                            in_ccd0[c] = true;
-+                        }
-+                    } else if (sscanf(p, "%d", &a) == 1 && a >= 0 && a < 256 && n0 < 64) {
-+                        s_ccd0_cpus[n0++] = a;
-+                        in_ccd0[a] = true;
-+                    }
-+                    while (*p && *p != ',') p++;
-+                    if (*p == ',') p++;
-+                }
-+                int n_conf = (int)sysconf(_SC_NPROCESSORS_ONLN);
-+                if (n_conf > 256) n_conf = 256;
-+                for (int c = 0; c < n_conf && n1 < 64; c++) {
-+                    if (!in_ccd0[c]) s_ccd1_cpus[n1++] = c;
-+                }
-+                if (n0 > 0 && n1 > 0) {
-+                    s_n_ccd0 = n0;
-+                    s_n_ccd1 = n1;
-+                }
-+            }
-+            fclose(fp);
-+        }
-+#endif
 +        if (s_dual_ccd_split_layer > 0) {
-+            fprintf(stderr, "[GGML-DUAL-CCD] Vertical Layer Partitioning ACTIVE: Layers 0..%d -> CCD0 (%d logical CPUs), Layers %d..N -> CCD1 (%d logical CPUs)\n",
-+                    s_dual_ccd_split_layer - 1, s_n_ccd0, s_dual_ccd_split_layer, s_n_ccd1);
++            fprintf(stderr, "[GGML-DUAL-CCD] Vertical Layer Partitioning ACTIVE: Layers 0..%d -> CCD0 (32MB L3), Layers %d..N -> CCD1 (32MB L3)\n",
++                    s_dual_ccd_split_layer - 1, s_dual_ccd_split_layer);
 +        }
 +    }
 +
@@ -1925,10 +1930,12 @@ index 491316f..53a684f 100644
 +        {
 +            int omp_id = omp_get_thread_num();
 +
++            static const int ccd0_cpus[16] = {0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23};
++            static const int ccd1_cpus[16] = {8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31};
 +            static __thread int tls_pinned_cpu = -1;
 +            int target_cpu = (omp_id < n_threads)
-+                ? s_ccd0_cpus[omp_id % s_n_ccd0]
-+                : s_ccd1_cpus[(omp_id - n_threads) % s_n_ccd1];
++                ? ccd0_cpus[omp_id % 16]
++                : ccd1_cpus[(omp_id - n_threads) % 16];
 +            if (tls_pinned_cpu != target_cpu) {
 +                cpu_set_t cpuset;
 +                CPU_ZERO(&cpuset);
@@ -1991,35 +1998,36 @@ index 491316f..53a684f 100644
 +        }
 +        threadpool->dual_ccd_active = false;
 +    } else if (n_threads > 1) {
++        atomic_store_explicit(&threadpool->n_barrier, 0, memory_order_relaxed);
++        atomic_store_explicit(&threadpool->n_barrier_passed, 0, memory_order_relaxed);
          #pragma omp parallel num_threads(n_threads)
          {
              #pragma omp single
-@@ -3392,6 +3648,23 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -3392,6 +3624,16 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
              ggml_thread_apply_priority(threadpool->prio);
              if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
                  ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
-+            } else if (n_threads == 16 && sysconf(_SC_NPROCESSORS_ONLN) == 32) {
++            } else if (n_threads == 16 || n_threads == 32) {
 +                static __thread int tls_std_pinned_cpu = -1;
 +                if (tls_std_pinned_cpu != ith) {
-+                    cpu_set_t cur_mask;
-+                    CPU_ZERO(&cur_mask);
-+                    // Only apply 1:1 physical core pinning if no custom taskset mask was already set externally
-+                    if (pthread_getaffinity_np(pthread_self(), sizeof(cur_mask), &cur_mask) == 0 && CPU_COUNT(&cur_mask) >= 32) {
-+                        cpu_set_t cpuset;
-+                        CPU_ZERO(&cpuset);
-+                        CPU_SET(ith, &cpuset);
-+                        if (pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) == 0) {
-+                            tls_std_pinned_cpu = ith;
-+                        }
-+                    } else {
++                    cpu_set_t cpuset;
++                    CPU_ZERO(&cpuset);
++                    CPU_SET(ith, &cpuset);
++                    if (pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) == 0) {
 +                        tls_std_pinned_cpu = ith;
 +                    }
 +                }
              }
              ggml_graph_compute_thread(&threadpool->workers[ith]);
          }
+@@ -3893,3 +4135,5 @@ void ggml_cpu_init(void) {
+ 
+     ggml_critical_section_end();
+ }
++
++int ggml_dsv4_skip_csa_comp = 0;
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 42ec809..1d27585 100644
+index 42ec809..a5dc038 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -12,6 +12,10 @@
@@ -2033,16 +2041,80 @@ index 42ec809..1d27585 100644
  // ggml_compute_forward_dup
  
  static void ggml_compute_forward_dup_same_cont(
-@@ -8465,6 +8469,114 @@ void ggml_compute_forward_top_k(
+@@ -2010,6 +2014,32 @@ static void ggml_compute_forward_concat_f16(
+ 
+     const ggml_fp16_t * x;
+ 
++    if (nb00 == sizeof(ggml_fp16_t) && nb10 == sizeof(ggml_fp16_t) && nb0 == sizeof(ggml_fp16_t)) {
++        const int64_t nr  = ne1 * ne2 * ne3;
++        const int64_t dr  = (nr + nth - 1) / nth;
++        const int64_t ir0 = dr * ith;
++        const int64_t ir1 = MIN(ir0 + dr, nr);
++        for (int64_t ir = ir0; ir < ir1; ++ir) {
++            const int64_t i1 = ir % ne1;
++            const int64_t i2 = (ir / ne1) % ne2;
++            const int64_t i3 = ir / (ne1 * ne2);
++            char * y = (char *)dst->data + i1*nb1 + i2*nb2 + i3*nb3;
++            if (dim == 0) {
++                const char * x0 = (const char *)src0->data + i1*nb01 + i2*nb02 + i3*nb03;
++                const char * x1 = (const char *)src1->data + i1*nb11 + i2*nb12 + i3*nb13;
++                memcpy(y,                           x0, ne00 * sizeof(ggml_fp16_t));
++                memcpy(y + ne00 * sizeof(ggml_fp16_t), x1, ne10 * sizeof(ggml_fp16_t));
++            } else if (i1 < ne01 && i2 < ne02 && i3 < ne03) {
++                const char * x0 = (const char *)src0->data + i1*nb01 + i2*nb02 + i3*nb03;
++                memcpy(y, x0, ne0 * sizeof(ggml_fp16_t));
++            } else {
++                const char * x1 = (const char *)src1->data + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13;
++                memcpy(y, x1, ne0 * sizeof(ggml_fp16_t));
++            }
++        }
++        return;
++    }
++
+     // TODO: smarter multi-theading
+     for (int i3 = 0; i3 < ne3; i3++) {
+         for (int i2 = ith; i2 < ne2; i2 += nth) {
+@@ -2053,6 +2083,32 @@ static void ggml_compute_forward_concat_f32(
+ 
+     const float * x;
+ 
++    if (nb00 == sizeof(float) && nb10 == sizeof(float) && nb0 == sizeof(float)) {
++        const int64_t nr  = ne1 * ne2 * ne3;
++        const int64_t dr  = (nr + nth - 1) / nth;
++        const int64_t ir0 = dr * ith;
++        const int64_t ir1 = MIN(ir0 + dr, nr);
++        for (int64_t ir = ir0; ir < ir1; ++ir) {
++            const int64_t i1 = ir % ne1;
++            const int64_t i2 = (ir / ne1) % ne2;
++            const int64_t i3 = ir / (ne1 * ne2);
++            char * y = (char *)dst->data + i1*nb1 + i2*nb2 + i3*nb3;
++            if (dim == 0) {
++                const char * x0 = (const char *)src0->data + i1*nb01 + i2*nb02 + i3*nb03;
++                const char * x1 = (const char *)src1->data + i1*nb11 + i2*nb12 + i3*nb13;
++                memcpy(y,                     x0, ne00 * sizeof(float));
++                memcpy(y + ne00 * sizeof(float), x1, ne10 * sizeof(float));
++            } else if (i1 < ne01 && i2 < ne02 && i3 < ne03) {
++                const char * x0 = (const char *)src0->data + i1*nb01 + i2*nb02 + i3*nb03;
++                memcpy(y, x0, ne0 * sizeof(float));
++            } else {
++                const char * x1 = (const char *)src1->data + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13;
++                memcpy(y, x1, ne0 * sizeof(float));
++            }
++        }
++        return;
++    }
++
+     // TODO: smarter multi-theading
+     for (int i3 = 0; i3 < ne3; i3++) {
+         for (int i2 = ith; i2 < ne2; i2 += nth) {
+@@ -8465,6 +8521,93 @@ void ggml_compute_forward_top_k(
      }
  }
  
 +#if defined(__AVX2__) || defined(__AVX512F__)
 +#include <sys/mman.h>
-+#include <sys/stat.h>
 +#include <fcntl.h>
 +#include <unistd.h>
-+#include <cstdio>
 +
 +struct llama_modchip_shm_t {
 +    uint32_t magic;            // 0x4D4F4443 ("MODC")
@@ -2079,36 +2151,17 @@ index 42ec809..1d27585 100644
 +        const char * env_st = getenv("LLAMA_SWA_STRIDE");
 +        swa_stride          = env_st ? atoll(env_st) : 0;
 +
-+        int fd = -1;
-+#if defined(__linux__)
-+        const char * xdg = std::getenv("XDG_RUNTIME_DIR");
-+        if (xdg && xdg[0]) {
-+            char path_buf[512];
-+            std::snprintf(path_buf, sizeof(path_buf), "%s/llama_modchip.bin", xdg);
-+            fd = open(path_buf, O_RDONLY | O_NOFOLLOW);
-+        }
-+        if (fd < 0) {
-+            fd = open("/dev/shm/llama_modchip.bin", O_RDONLY | O_NOFOLLOW);
-+        }
++        int fd = open("/dev/shm/llama_modchip.bin", O_RDONLY);
 +        if (fd >= 0) {
-+            struct stat st;
-+            if (fstat(fd, &st) == 0 &&
-+                S_ISREG(st.st_mode) &&
-+                st.st_size >= (off_t)sizeof(llama_modchip_shm_t) &&
-+                st.st_uid == getuid()) {
-+                void * p = mmap(nullptr, sizeof(llama_modchip_shm_t), PROT_READ, MAP_SHARED, fd, 0);
-+                if (p != MAP_FAILED) {
-+                    const llama_modchip_shm_t * s = (const llama_modchip_shm_t *)p;
-+                    if (s->magic == 0x4D4F4443u) {
-+                        shm_ptr = s;
-+                    } else {
-+                        munmap(p, sizeof(llama_modchip_shm_t));
-+                    }
++            void * p = mmap(nullptr, sizeof(llama_modchip_shm_t), PROT_READ, MAP_SHARED, fd, 0);
++            close(fd);
++            if (p != MAP_FAILED) {
++                const llama_modchip_shm_t * s = (const llama_modchip_shm_t *)p;
++                if (s->magic == 0x4D4F4443u) {
++                    shm_ptr = s;
 +                }
 +            }
-+            close(fd);
 +        }
-+#endif
 +
 +        if (attn_window > 0) {
 +            fprintf(stderr, "[GGML-MODCHIP] SWA ACTIVE: Window=%ld, Sinks=%ld, Stride=%ld, L3 Window=%ld\n",
@@ -2148,7 +2201,7 @@ index 42ec809..1d27585 100644
  static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
          const ggml_compute_params * params,
          ggml_tensor * dst,
-@@ -8473,6 +8585,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+@@ -8473,6 +8616,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
          float * partials, int64_t partial_stride) {
  
      const bool write_partials = (partials != nullptr);
@@ -2158,7 +2211,7 @@ index 42ec809..1d27585 100644
      const ggml_tensor * q     = dst->src[0];
      const ggml_tensor * k     = dst->src[1];
      const ggml_tensor * v     = dst->src[2];
-@@ -8588,8 +8703,22 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+@@ -8588,8 +8734,22 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
          // online softmax / attention
          // loop over n_kv and n_head_kv
          // ref: https://arxiv.org/pdf/2112.05682.pdf
@@ -2181,7 +2234,7 @@ index 42ec809..1d27585 100644
              const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
              if (mv == -INFINITY) {
                  continue;
-@@ -8597,6 +8726,53 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+@@ -8597,6 +8757,53 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
  
              float s; // KQ value
  
@@ -2235,7 +2288,16 @@ index 42ec809..1d27585 100644
              const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
              kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
  
-@@ -9149,7 +9325,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+@@ -9112,7 +9319,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+     const bool use_ref = params->use_ref;
+ 
+     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
+-    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
++    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512 && neq2 < nth;
+ 
+     if (use_split_kv_path) {
+         const int64_t chunk_size = (nek1 + nth - 1) / nth;
+@@ -9149,7 +9356,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
          const int64_t nr = neq1*neq2*neq3;
  
          // disable for NUMA
@@ -2244,7 +2306,64 @@ index 42ec809..1d27585 100644
  
          // 4x chunks per thread
          int nth_scaled = nth * 4;
-@@ -10894,7 +11070,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
+@@ -9160,12 +9367,6 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+             nchunk = nth;
+         }
+ 
+-        if (ith == 0) {
+-            ggml_threadpool_chunk_set(params->threadpool, nth);
+-        }
+-
+-        ggml_barrier(params->threadpool);
+-
+         const int64_t dr = (nr + nchunk - 1) / nchunk;
+ 
+         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
+@@ -9182,19 +9383,32 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+ #endif
+         use_tiled &= (DV % f32_epr == 0);
+ #endif
+-        int current_chunk = ith;
+-
+-        while (current_chunk < nchunk) {
+-            const int64_t ir0 = dr * current_chunk;
++        if (nchunk == nth) {
++            const int64_t ir0 = dr * ith;
+             const int64_t ir1 = MIN(ir0 + dr, nr);
+-
+-            if (use_tiled) {
+-                ggml_compute_forward_flash_attn_ext_tiled(params, dst, ir0, ir1);
+-            } else {
+-                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
++            if (ir0 < ir1) {
++                if (use_tiled) {
++                    ggml_compute_forward_flash_attn_ext_tiled(params, dst, ir0, ir1);
++                } else {
++                    ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
++                }
++            }
++        } else {
++            if (ith == 0) {
++                ggml_threadpool_chunk_set(params->threadpool, nth);
++            }
++            ggml_barrier(params->threadpool);
++            int current_chunk = ith;
++            while (current_chunk < nchunk) {
++                const int64_t ir0 = dr * current_chunk;
++                const int64_t ir1 = MIN(ir0 + dr, nr);
++                if (use_tiled) {
++                    ggml_compute_forward_flash_attn_ext_tiled(params, dst, ir0, ir1);
++                } else {
++                    ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
++                }
++                current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+             }
+-
+-            current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+         }
+     }
+ }
+@@ -10894,7 +11108,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
      int64_t nr = V->ne[1] * V->ne[3];
  
      // disable for NUMA
@@ -2253,15 +2372,182 @@ index 42ec809..1d27585 100644
  
      int nth = params->nth;
      int ith = params->ith;
+@@ -11111,6 +11325,28 @@ static void ggml_compute_forward_dsv4_hc_pre_f32(
+     const int ith = params->ith;
+     const int nth = params->nth;
+ 
++    if (hc == 4 && nbx0 == sizeof(float) && nbd0 == sizeof(float)) {
++        const int64_t dr  = (n_embd + nth - 1) / nth;
++        const int64_t i00 = dr * ith;
++        const int64_t i01 = MIN(i00 + dr, n_embd);
++        if (i00 >= i01) return;
++        for (int64_t it = 0; it < n_tokens; ++it) {
++            const float w0 = *(const float *) ((const char *) weights->data + 0*nbw0 + it*nbw1);
++            const float w1 = *(const float *) ((const char *) weights->data + 1*nbw0 + it*nbw1);
++            const float w2 = *(const float *) ((const char *) weights->data + 2*nbw0 + it*nbw1);
++            const float w3 = *(const float *) ((const char *) weights->data + 3*nbw0 + it*nbw1);
++            const float * GGML_RESTRICT x0 = (const float *) ((const char *) x->data + 0*nbx1 + it*nbx2);
++            const float * GGML_RESTRICT x1 = (const float *) ((const char *) x->data + 1*nbx1 + it*nbx2);
++            const float * GGML_RESTRICT x2 = (const float *) ((const char *) x->data + 2*nbx1 + it*nbx2);
++            const float * GGML_RESTRICT x3 = (const float *) ((const char *) x->data + 3*nbx1 + it*nbx2);
++            float * GGML_RESTRICT d0 = (float *) ((char *) dst->data + it*nbd1);
++            for (int64_t i0 = i00; i0 < i01; ++i0) {
++                d0[i0] = x0[i0]*w0 + x1[i0]*w1 + x2[i0]*w2 + x3[i0]*w3;
++            }
++        }
++        return;
++    }
++
+     const int64_t nr  = n_embd * n_tokens;
+     const int64_t dr  = (nr + nth - 1) / nth;
+     const int64_t ir0 = dr * ith;
+@@ -11188,6 +11424,63 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
+     const int ith = params->ith;
+     const int nth = params->nth;
+ 
++    if (hc == 4 && nbx0 == sizeof(float) && nbr0 == sizeof(float) && nbd0 == sizeof(float)) {
++        const int64_t dr  = (n_embd + nth - 1) / nth;
++        const int64_t i00 = dr * ith;
++        const int64_t i01 = MIN(i00 + dr, n_embd);
++        if (i00 >= i01) return;
++        for (int64_t it = 0; it < n_tokens; ++it) {
++            const float p0 = *(const float *) ((const char *) post->data + 0*nbp0 + it*nbp1);
++            const float p1 = *(const float *) ((const char *) post->data + 1*nbp0 + it*nbp1);
++            const float p2 = *(const float *) ((const char *) post->data + 2*nbp0 + it*nbp1);
++            const float p3 = *(const float *) ((const char *) post->data + 3*nbp0 + it*nbp1);
++
++            const float c00 = *(const float *) ((const char *) comb->data + 0*nbc0 + 0*nbc1 + it*nbc2);
++            const float c01 = *(const float *) ((const char *) comb->data + 0*nbc0 + 1*nbc1 + it*nbc2);
++            const float c02 = *(const float *) ((const char *) comb->data + 0*nbc0 + 2*nbc1 + it*nbc2);
++            const float c03 = *(const float *) ((const char *) comb->data + 0*nbc0 + 3*nbc1 + it*nbc2);
++
++            const float c10 = *(const float *) ((const char *) comb->data + 1*nbc0 + 0*nbc1 + it*nbc2);
++            const float c11 = *(const float *) ((const char *) comb->data + 1*nbc0 + 1*nbc1 + it*nbc2);
++            const float c12 = *(const float *) ((const char *) comb->data + 1*nbc0 + 2*nbc1 + it*nbc2);
++            const float c13 = *(const float *) ((const char *) comb->data + 1*nbc0 + 3*nbc1 + it*nbc2);
++
++            const float c20 = *(const float *) ((const char *) comb->data + 2*nbc0 + 0*nbc1 + it*nbc2);
++            const float c21 = *(const float *) ((const char *) comb->data + 2*nbc0 + 1*nbc1 + it*nbc2);
++            const float c22 = *(const float *) ((const char *) comb->data + 2*nbc0 + 2*nbc1 + it*nbc2);
++            const float c23 = *(const float *) ((const char *) comb->data + 2*nbc0 + 3*nbc1 + it*nbc2);
++
++            const float c30 = *(const float *) ((const char *) comb->data + 3*nbc0 + 0*nbc1 + it*nbc2);
++            const float c31 = *(const float *) ((const char *) comb->data + 3*nbc0 + 1*nbc1 + it*nbc2);
++            const float c32 = *(const float *) ((const char *) comb->data + 3*nbc0 + 2*nbc1 + it*nbc2);
++            const float c33 = *(const float *) ((const char *) comb->data + 3*nbc0 + 3*nbc1 + it*nbc2);
++
++            const float * GGML_RESTRICT xt = (const float *) ((const char *) x->data        + it*nbx1);
++            const float * GGML_RESTRICT r0 = (const float *) ((const char *) residual->data + 0*nbr1 + it*nbr2);
++            const float * GGML_RESTRICT r1 = (const float *) ((const char *) residual->data + 1*nbr1 + it*nbr2);
++            const float * GGML_RESTRICT r2 = (const float *) ((const char *) residual->data + 2*nbr1 + it*nbr2);
++            const float * GGML_RESTRICT r3 = (const float *) ((const char *) residual->data + 3*nbr1 + it*nbr2);
++
++            float * GGML_RESTRICT d0 = (float *) ((char *) dst->data + 0*nbd1 + it*nbd2);
++            float * GGML_RESTRICT d1 = (float *) ((char *) dst->data + 1*nbd1 + it*nbd2);
++            float * GGML_RESTRICT d2 = (float *) ((char *) dst->data + 2*nbd1 + it*nbd2);
++            float * GGML_RESTRICT d3 = (float *) ((char *) dst->data + 3*nbd1 + it*nbd2);
++
++            for (int64_t i0 = i00; i0 < i01; ++i0) {
++                const float xv  = xt[i0];
++                const float rv0 = r0[i0];
++                const float rv1 = r1[i0];
++                const float rv2 = r2[i0];
++                const float rv3 = r3[i0];
++                d0[i0] = xv * p0 + rv0 * c00 + rv1 * c01 + rv2 * c02 + rv3 * c03;
++                d1[i0] = xv * p1 + rv0 * c10 + rv1 * c11 + rv2 * c12 + rv3 * c13;
++                d2[i0] = xv * p2 + rv0 * c20 + rv1 * c21 + rv2 * c22 + rv3 * c23;
++                d3[i0] = xv * p3 + rv0 * c30 + rv1 * c31 + rv2 * c32 + rv3 * c33;
++            }
++        }
++        return;
++    }
++
+     const int64_t nr  = n_embd * hc * n_tokens;
+     const int64_t dr  = (nr + nth - 1) / nth;
+     const int64_t ir0 = dr * ith;
+@@ -11853,14 +12146,47 @@ static void ggml_compute_forward_fwht_f32(const ggml_compute_params * params, gg
+     const GGML_F32_VEC v_minus_one = GGML_F32_VEC_SET1(-1.0f);
+ #endif
+ 
+-    for (int64_t r = start_row; r < end_row; r++) {
+-        const int64_t i13 = r / (ne11 * ne12);
+-        const int64_t i12 = (r - i13 * ne11 * ne12) / ne11;
+-        const int64_t i11 = r - i13 * ne11 * ne12 - i12 * ne11;
++#if defined(__AVX512F__)
++    const __m512 v_scale = _mm512_set1_ps(scale);
++    const __m512 v_zero  = _mm512_setzero_ps();
++#endif
++    int64_t i13 = start_row / (ne11 * ne12);
++    int64_t rem = start_row - i13 * (ne11 * ne12);
++    int64_t i12 = rem / ne11;
++    int64_t i11 = rem - i12 * ne11;
+ 
++    for (int64_t r = start_row; r < end_row; r++) {
+         const float * src_row = (const float *) ((const char *) src1->data + i11 * nb11 + i12 * nb12 + i13 * nb13);
+         float * dst_row = (float *) ((char *) dst->data + i11 * nb1 + i12 * nb2 + i13 * nb3);
+-
++        if (++i11 == ne11) { i11 = 0; if (++i12 == ne12) { i12 = 0; ++i13; } }
++
++#if defined(__AVX512F__)
++        if (n >= 16) {
++            for (int64_t i = 0; i < n; i += 16) {
++                __m512 x = _mm512_mul_ps(_mm512_loadu_ps(src_row + i), v_scale);
++                __m512 s1 = _mm512_permute_ps(x, 0xB1);
++                x = _mm512_add_ps(_mm512_mask_sub_ps(x, 0xAAAA, v_zero, x), s1);
++                __m512 s2 = _mm512_permute_ps(x, 0x4E);
++                x = _mm512_add_ps(_mm512_mask_sub_ps(x, 0xCCCC, v_zero, x), s2);
++                __m512 s4 = _mm512_shuffle_f32x4(x, x, 0xB1);
++                x = _mm512_add_ps(_mm512_mask_sub_ps(x, 0xF0F0, v_zero, x), s4);
++                __m512 s8 = _mm512_shuffle_f32x4(x, x, 0x4E);
++                x = _mm512_add_ps(_mm512_mask_sub_ps(x, 0xFF00, v_zero, x), s8);
++                _mm512_storeu_ps(dst_row + i, x);
++            }
++            for (int64_t len = 16; len < n; len <<= 1) {
++                for (int64_t i = 0; i < n; i += 2 * len) {
++                    for (int64_t j = 0; j < len; j += 16) {
++                        __m512 u = _mm512_loadu_ps(dst_row + i + j);
++                        __m512 v = _mm512_loadu_ps(dst_row + i + len + j);
++                        _mm512_storeu_ps(dst_row + i + j,       _mm512_add_ps(u, v));
++                        _mm512_storeu_ps(dst_row + i + len + j, _mm512_sub_ps(u, v));
++                    }
++                }
++            }
++            continue;
++        }
++#endif
+         for (int64_t j = 0; j < n; j++) {
+             dst_row[j] = src_row[j] * scale;
+         }
+@@ -11981,6 +12307,11 @@ void ggml_compute_forward_lightning_indexer(
+             const ggml_fp16_t *   m_row = (ggml_fp16_t *) ((char *)   m->data + t*nbm1 + (s%nem3)*nbm3);
+             float             * dst_row =       (float *) ((char *) dst->data + t*nb1  +        s*nb3 );
+             for (int ik = ir0; ik < ir1; ++ik) {
++                const float mv = GGML_CPU_FP16_TO_FP32(m_row[ik]);
++                if (mv == -INFINITY) {
++                    dst_row[ik] = -INFINITY;
++                    continue;
++                }
+                 char * k_row = (char *) k->data + ik*nbk2 + s*nbk3;
+                 if (k_to_float) {
+                     k_to_float(k_row, k_row_f32, n_embd);
+@@ -11997,7 +12328,7 @@ void ggml_compute_forward_lightning_indexer(
+                     score += MAX(qk, 0.0f) * w_row[h];
+                 }
+                 // apply mask
+-                dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
++                dst_row[ik] = score + mv;
+             }
+         }
+     }
 diff --git a/ggml/src/ggml-cpu/quants.c b/ggml/src/ggml-cpu/quants.c
-index 5e36459..49ea924 100644
+index 5e36459..4f68a51 100644
 --- a/ggml/src/ggml-cpu/quants.c
 +++ b/ggml/src/ggml-cpu/quants.c
-@@ -188,38 +188,159 @@ void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
+@@ -188,38 +188,154 @@ void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
      const block_q2_0 * GGML_RESTRICT x = vx;
      const block_q8_0 * GGML_RESTRICT y = vy;
  
-+#if 0
++#if defined(__AVX512F__) && defined(__AVX512BW__)
 +    const __m512i m3_512 = _mm512_set1_epi8(0x03);
 +    const __m512i m4_512 = _mm512_set1_epi8(0x04);
 +    const __m512i zero512 = _mm512_setzero_si512();
@@ -2269,39 +2555,34 @@ index 5e36459..49ea924 100644
 +    const __m512i shuf_mult512 = _mm512_setr_epi32(
 +        0x80008000, 0x80008000, 0x80018001, 0x80018001,
 +        0x80028002, 0x80028002, 0x80038003, 0x80038003,
-+        0x80008000, 0x80008000, 0x80018001, 0x80018001,
-+        0x80028002, 0x80028002, 0x80038003, 0x80038003
++        0x80048004, 0x80048004, 0x80058005, 0x80058005,
++        0x80068006, 0x80068006, 0x80078007, 0x80078007
 +    );
++    const __m512i shift_qs = _mm512_setr_epi32(0, 0, 0, 0, 2, 2, 2, 2, 4, 4, 4, 4, 6, 6, 6, 6);
++    const __m512i ror_qh   = _mm512_setr_epi64(62, 63, 0, 1, 2, 3, 4, 5);
 +
 +    __m512 acc512 = _mm512_setzero_ps();
 +
 +    for (int i = 0; i < nb; i++) {
 +        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
-+        const float d_lo = d0 * GGML_CPU_FP16_TO_FP32(y[2 * i + 0].d);
-+        const float d_hi = d0 * GGML_CPU_FP16_TO_FP32(y[2 * i + 1].d);
-+        const __m512 vd = _mm512_insertf32x8(_mm512_castps256_ps512(_mm256_set1_ps(d_lo)), _mm256_set1_ps(d_hi), 1);
++        const __m512 vd = _mm512_mask_broadcastss_ps(
++            _mm512_set1_ps(d0 * GGML_CPU_FP16_TO_FP32(y[2 * i + 0].d)), 0xFF00,
++            _mm_set_ss(d0 * GGML_CPU_FP16_TO_FP32(y[2 * i + 1].d)));
 +
 +        uint32_t sc_raw;
 +        memcpy(&sc_raw, x[i].scales, sizeof(sc_raw));
-+        const uint32_t m01 = (sc_raw & 0x0F0F0F0FU) + 0x04040404U;
-+        const uint32_t m23 = ((sc_raw >> 4) & 0x0F0F0F0FU) + 0x04040404U;
-+        const __m512i vsc = _mm512_inserti32x8(_mm512_castsi256_si512(_mm256_set1_epi32((int32_t)m01)), _mm256_set1_epi32((int32_t)m23), 1);
-+        const __m512i vmult = _mm512_shuffle_epi8(vsc, shuf_mult512);
++        const uint64_t m_all = ((uint64_t)((sc_raw & 0x0F0F0F0FU) + 0x04040404U)) |
++                               (((uint64_t)(((sc_raw >> 4) & 0x0F0F0F0FU) + 0x04040404U)) << 32);
++        const __m512i vmult = _mm512_shuffle_epi8(_mm512_set1_epi64((int64_t)m_all), shuf_mult512);
 +
-+        const __m128i qs16 = _mm_loadu_si128((const __m128i *)x[i].qs);
-+        const __m128i qh_lo = _mm_loadl_epi64((const __m128i *)x[i].qh);
-+        const __m128i qh16 = _mm_unpacklo_epi64(qh_lo, _mm_srli_epi16(qh_lo, 1));
-+
-+        const __m256i qs_01 = _mm256_set_m128i(_mm_srli_epi16(qs16, 2), qs16);
-+        const __m256i qh_01 = _mm256_set_m128i(qh16, _mm_slli_epi16(qh16, 2));
-+        const __m256i qs_23 = _mm256_set_m128i(_mm_srli_epi16(qs16, 6), _mm_srli_epi16(qs16, 4));
-+        const __m256i qh_23 = _mm256_set_m128i(_mm_srli_epi16(qh16, 4), _mm_srli_epi16(qh16, 2));
-+
-+        const __m512i qs_all = _mm512_inserti64x4(_mm512_castsi256_si512(qs_01), qs_23, 1);
-+        const __m512i qh_all = _mm512_inserti64x4(_mm512_castsi256_si512(qh_01), qh_23, 1);
-+        const __m512i idx = _mm512_or_si512(_mm512_and_si512(qs_all, m3_512), _mm512_and_si512(qh_all, m4_512));
++        uint64_t qh64;
++        memcpy(&qh64, x[i].qh, sizeof(qh64));
++        const __m512i qs512 = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *)x[i].qs));
++        const __m512i qs_sh = _mm512_and_si512(_mm512_srlv_epi32(qs512, shift_qs), m3_512);
++        const __m512i qh_sh = _mm512_and_si512(_mm512_rorv_epi64(_mm512_set1_epi64((int64_t)qh64), ror_qh), m4_512);
++        const __m512i idx   = _mm512_or_si512(qs_sh, qh_sh);
 +        const __m512i q_abs = _mm512_shuffle_epi8(lut_abs512, idx);
-+        const __mmask64 neg_mask = _mm512_testn_epi8_mask(qh_all, m4_512);
++        const __mmask64 neg_mask = _mm512_testn_epi8_mask(qh_sh, m4_512);
 +
 +        const __m512i q8_all = _mm512_inserti64x4(
 +            _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *)y[2 * i + 0].qs)),
@@ -2622,38 +2903,84 @@ index 1ebc50a..053cdf3 100644
      }
  }
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 59191c6..71b44a7 100644
+index da7f3a5..6aa727a 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -364,6 +364,11 @@ void * ggml_aligned_malloc(size_t size) {
-             break;
-     }
-   #else
-+#if defined(__linux__) && defined(MADV_HUGEPAGE)
-+    if (size >= 2 * 1024 * 1024 && alignment < 2 * 1024 * 1024) {
-+        alignment = 2 * 1024 * 1024;
-+    }
-+#endif
-     int result = posix_memalign(&aligned_memory, alignment, size);
-   #endif
-     if (result != 0) {
-@@ -380,6 +385,11 @@ void * ggml_aligned_malloc(size_t size) {
+@@ -380,6 +380,13 @@ void * ggml_aligned_malloc(size_t size) {
          GGML_LOG_ERROR("%s: %s (attempted to allocate %6.2f MB)\n", __func__, error_desc, size/(1024.0*1024.0));
          return NULL;
      }
 +#if defined(__linux__) && defined(MADV_HUGEPAGE)
 +    if (size >= 2 * 1024 * 1024) {
-+        madvise(aligned_memory, size, MADV_HUGEPAGE);
++        uintptr_t page_mask = ~(uintptr_t)(4096 - 1);
++        void * page_aligned = (void *)((uintptr_t)aligned_memory & page_mask);
++        madvise(page_aligned, size, MADV_HUGEPAGE);
 +    }
 +#endif
      return aligned_memory;
  #endif
  }
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 2be3b75..c894b9e 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -853,6 +853,10 @@ static void dsv4_set_comp_inputs(
+     dsv4_set_i32(inp.state_read_idxs, plan.state_read_idxs);
+     dsv4_set_i64(inp.state_write_idxs, plan.state_write_idxs);
+     dsv4_set_i32(inp.state_write_pos, plan.state_write_pos);
++    if (strcmp(name, "csa") == 0) {
++        extern int ggml_dsv4_skip_csa_comp;
++        ggml_dsv4_skip_csa_comp = (plan.state_write_pos.size() == 1 && plan.state_write_pos[0] == -1) ? 1 : 0;
++    }
+     dsv4_set_kq_mask(inp.kq_mask, plan, n_tokens, n_stream);
+ 
+     if (debug || dsv4_compress_debug()) {
 diff --git a/src/llama-kv-cache-dsv4.cpp b/src/llama-kv-cache-dsv4.cpp
-index 5caa05e..95a4161 100644
+index 5caa05e..71d4ea6 100644
 --- a/src/llama-kv-cache-dsv4.cpp
 +++ b/src/llama-kv-cache-dsv4.cpp
-@@ -666,7 +666,9 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
+@@ -553,7 +553,7 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
+             const int32_t source_idx = state_source_idx(seq_id, ubatch.pos[i]);
+ 
+             plan.state_write_idxs.push_back(cache_off + kv_size - 1);
+-            plan.state_write_pos .push_back(0);
++            plan.state_write_pos .push_back(-1);
+ 
+             if (overlap) {
+                 for (uint32_t j = 0; j < ratio; ++j) {
+@@ -630,11 +630,12 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
+ 
+             const int64_t stream_off = dsv4_stream_offset(n_stream, seq_id, state_size);
+             const uint32_t rollback = (uint32_t) seq_id < rs_idx.size() ? rs_idx[seq_id] : 0;
+-            // Keep the restore graph fixed-width when no rollback is pending.
+-            const int64_t src_plane = rollback > 0 && rollback <= n_rs_seq ? (int64_t) rollback*state_rows : 0;
+-            for (uint32_t r = 0; r < state_size; ++r) {
+-                plan.state_restore_src_idxs.push_back((int32_t) (src_plane + stream_off + r));
+-                plan.state_restore_dst_idxs.push_back((int32_t) (stream_off + r));
++            if (rollback > 0 && rollback <= n_rs_seq) {
++                const int64_t src_plane = (int64_t) rollback*state_rows;
++                for (uint32_t r = 0; r < state_size; ++r) {
++                    plan.state_restore_src_idxs.push_back((int32_t) (src_plane + stream_off + r));
++                    plan.state_restore_dst_idxs.push_back((int32_t) (stream_off + r));
++                }
+             }
+ 
+             std::vector<uint32_t> token_idxs;
+@@ -649,8 +650,12 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
+             }
+ 
+             const uint32_t n_seq_tokens = (uint32_t) token_idxs.size();
++            if (n_seq_tokens <= 1) {
++                continue;
++            }
+             const int64_t scratch_off = (int64_t) state_rows*(1 + n_rs_seq);
+-            for (uint32_t d = 1; d <= n_rs_seq; ++d) {
++            const uint32_t max_d = std::min<uint32_t>(n_rs_seq, n_seq_tokens - 1);
++            for (uint32_t d = 1; d <= max_d; ++d) {
+                 const int64_t dst_plane = (int64_t) d*state_rows;
+ 
+                 for (uint32_t r = 0; r < state_size; ++r) {
+@@ -666,7 +671,9 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
                              }
                          }
                      } else {
@@ -2664,7 +2991,7 @@ index 5caa05e..95a4161 100644
                          src = (int32_t) (src_plane + stream_off + r);
                      }
  
-@@ -1435,6 +1437,9 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
+@@ -1435,6 +1442,9 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
  
          const bool res = kv_raw->seq_rm(seq_id, p0, p1);
          if (res) {
@@ -2689,7 +3016,7 @@ index ed572da..b18ef4a 100644
          if (prefetch > 0) {
              if (posix_madvise(addr, std::min(file->size(), prefetch), POSIX_MADV_WILLNEED)) {
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index b31e92e..c090cb1 100644
+index 3d50f8a..37a376c 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -462,6 +462,10 @@ namespace GGUFMeta {
@@ -2704,10 +3031,46 @@ index b31e92e..c090cb1 100644
              }
  
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 333f506..f6507a0 100644
+index 3bf3a22..b4f5af5 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -1096,6 +1096,18 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
+@@ -40,8 +40,6 @@
+ 
+ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
+     switch (arch) {
+-        case LLM_ARCH_CLIP:
+-            return new llama_model_clip(params);
+         case LLM_ARCH_LLAMA:
+             return new llama_model_llama(params);
+         case LLM_ARCH_LLAMA4:
+@@ -114,8 +112,6 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
+             return new llama_model_qwen3vl(params);
+         case LLM_ARCH_QWEN3VLMOE:
+             return new llama_model_qwen3vlmoe(params);
+-        case LLM_ARCH_QWEN3TTS:
+-            return new llama_model_qwen3tts(params);
+         case LLM_ARCH_PHI2:
+             return new llama_model_phi2(params);
+         case LLM_ARCH_PHI3:
+@@ -176,8 +172,6 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
+             return new llama_model_olmo2(params);
+         case LLM_ARCH_OLMOE:
+             return new llama_model_olmoe(params);
+-        case LLM_ARCH_MUSE_GLIMMER:
+-            return new llama_model_muse_glimmer(params);
+         case LLM_ARCH_OPENELM:
+             return new llama_model_openelm(params);
+         case LLM_ARCH_GPTNEOX:
+@@ -238,8 +232,6 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
+             return new llama_model_granite(params);
+         case LLM_ARCH_GRANITE_MOE:
+             return new llama_model_granite_moe(params);
+-        case LLM_ARCH_GRANITE_SWITCH:
+-            return new llama_model_granite_switch(params);
+         case LLM_ARCH_MINICPM:
+             return new llama_model_minicpm(params);
+         case LLM_ARCH_GRANITE_HYBRID:
+@@ -1104,6 +1096,18 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
      ml.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);
      ml.get_key(LLM_KV_EXPERT_GROUP_USED_COUNT, hparams.n_group_used,    false);
  
@@ -2726,6 +3089,362 @@ index 333f506..f6507a0 100644
      if (arch == LLM_ARCH_HUNYUAN_VL || arch == LLM_ARCH_HUNYUAN_DENSE) {
          if (hparams.n_expert <= 1) {
              hparams.n_expert      = 0;
+@@ -1918,7 +1922,6 @@ void llama_model::print_info() const {
+                 arch == LLM_ARCH_GRANITE ||
+                 arch == LLM_ARCH_GRANITE_MOE ||
+                 arch == LLM_ARCH_GRANITE_HYBRID ||
+-                arch == LLM_ARCH_GRANITE_SWITCH ||
+                 arch == LLM_ARCH_NEMOTRON_H_MOE) {
+             LLAMA_LOG_INFO("%s: f_embedding_scale     = %f\n", __func__, hparams.f_embedding_scale);
+             LLAMA_LOG_INFO("%s: f_residual_scale      = %f\n", __func__, hparams.f_residual_scale);
+@@ -2235,9 +2238,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE);
+ 
+-                const bool mtp_on_hybrid_nemotron =
+-                    params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
+-
+                 if (llm_arch_is_recurrent(arch)) {
+                     res = new llama_memory_recurrent(
+                             *this,
+@@ -2248,7 +2248,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             cparams.n_seq_max,
+                             cparams.n_rs_seq,
+                             nullptr);
+-                } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron) {
++                } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen) {
+                     // The main difference between hybrid architectures is the
+                     // layer filters, so pick the right one here
+                     llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
+@@ -2329,7 +2329,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                         };
+                     }
+ 
+-                    if (mtp_on_hybrid_qwen || mtp_on_hybrid_nemotron) {
++                    if (mtp_on_hybrid_qwen) {
+                         filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                     }
+ 
+@@ -2601,13 +2601,11 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+         case LLM_ARCH_DEEPSEEK2OCR:
+         case LLM_ARCH_DEEPSEEK32:
+         case LLM_ARCH_DEEPSEEK4:
+-        case LLM_ARCH_MUSE_GLIMMER:
+         case LLM_ARCH_PLM:
+         case LLM_ARCH_CHATGLM:
+         case LLM_ARCH_GRANITE:
+         case LLM_ARCH_GRANITE_MOE:
+         case LLM_ARCH_GRANITE_HYBRID:
+-        case LLM_ARCH_GRANITE_SWITCH:
+         case LLM_ARCH_CHAMELEON:
+         case LLM_ARCH_BAILINGMOE:
+         case LLM_ARCH_NEO_BERT:
+@@ -2707,7 +2705,6 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+         case LLM_ARCH_QWEN3VLMOE:
+         case LLM_ARCH_QWEN35:
+         case LLM_ARCH_QWEN35MOE:
+-        case LLM_ARCH_QWEN3TTS:
+             return LLAMA_ROPE_TYPE_IMROPE;
+ 
+         case LLM_ARCH_GLM4:
+@@ -2902,21 +2899,6 @@ void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
+         int64_t n_embd_, int64_t n_embd_q_, int64_t n_embd_k_, int64_t n_embd_v_,
+         int flags) {
+     const int64_t n_embd_qkv = n_embd_q_ + n_embd_k_ + n_embd_v_;
+-
+-    if (flags & TENSOR_SKIP) {
+-        const int skip = TENSOR_NOT_REQUIRED | TENSOR_SKIP;
+-
+-        create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", bid), {n_embd_, n_embd_qkv}, skip | TENSOR_SKIP_IF_VIRTUAL);
+-        create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias",   bid), {n_embd_qkv},          skip | TENSOR_SKIP_IF_VIRTUAL);
+-        create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", bid), {n_embd_, n_embd_q_},  skip);
+-        create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", bid), {n_embd_, n_embd_k_},  skip);
+-        create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", bid), {n_embd_, n_embd_v_},  skip);
+-        create_tensor(tn(LLM_TENSOR_ATTN_Q,   "bias",   bid), {n_embd_q_},           skip);
+-        create_tensor(tn(LLM_TENSOR_ATTN_K,   "bias",   bid), {n_embd_k_},           skip);
+-        create_tensor(tn(LLM_TENSOR_ATTN_V,   "bias",   bid), {n_embd_v_},           skip);
+-        return;
+-    }
+-
+     layer.wqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", bid), {n_embd_, n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+     if (layer.wqkv) {
+         layer.wqkv_b = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias", bid), {n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+@@ -2940,36 +2922,17 @@ uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
+ }
+ 
+ uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out) {
+-    if (model->vocab.n_tokens() == 0 || model->tok_embd == nullptr) {
++    if (!model || !model->tok_embd) {
+         return 0;
+     }
+-
+-    const ggml_tensor * tensor = model->tok_embd;
+-    const size_t nelements = ggml_nelements(tensor);
+-    GGML_ASSERT(nelements <= UINT32_MAX); // for the return type
+-
+-    if (out == nullptr) {
+-        return (uint32_t) nelements;
+-    }
+-
+-    if (tensor->type == GGML_TYPE_F32) {
+-        ggml_backend_tensor_get(tensor, out, 0, nelements * sizeof(float));
+-        return (uint32_t) nelements;
++    const uint32_t n_tokens = model->vocab.n_tokens();
++    if (!out) {
++        return n_tokens;
+     }
+-
+-    std::vector<uint8_t> buf(ggml_nbytes(tensor));
+-    ggml_backend_tensor_get(tensor, buf.data(), 0, buf.size());
+-
+-    const ggml_type_traits * traits = ggml_get_type_traits(tensor->type);
+-    if (tensor->type == GGML_TYPE_F16) {
+-        ggml_fp16_to_fp32_row((const ggml_fp16_t *) buf.data(), out, nelements);
+-    } else if (tensor->type == GGML_TYPE_BF16) {
+-        ggml_bf16_to_fp32_row((const ggml_bf16_t *) buf.data(), out, nelements);
+-    } else if (ggml_is_quantized(tensor->type) && traits->to_float != nullptr) {
+-        traits->to_float(buf.data(), out, nelements);
+-    } else {
+-        GGML_ABORT("unsupported tensor type for dequantization: %s", ggml_type_name(tensor->type));
++    const auto * traits = ggml_get_type_traits(model->tok_embd->type);
++    if (!traits || !traits->to_float) {
++        return 0;
+     }
+-
+-    return (uint32_t) nelements;
++    traits->to_float(model->tok_embd->data, out, ggml_nelements(model->tok_embd));
++    return n_tokens;
+ }
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 89cd461..d190d2c 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -746,7 +746,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+     const auto & inp_csa = inp_dsv4->get_csa();
+     GGML_ASSERT(inp_csa.kq_mask);
+ 
+-    ggml_tensor * top_k = build_lid_top_k(model, inp_dsv4, qr, cur, inp_pos, il);
++    const bool need_top_k = inp_csa.kq_mask->ne[0] > hparams.indexer_top_k;
++    ggml_tensor * top_k = need_top_k ? build_lid_top_k(model, inp_dsv4, qr, cur, inp_pos, il) : nullptr;
+ 
+     ggml_tensor * k_rot = inp_attn->self_k_rot;
+     if (k_rot) {
+@@ -778,7 +779,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+     cb(k_all, "csa_k_all", il);
+ 
+     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
+-    ggml_tensor * csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
++    ggml_tensor * csa_mask = need_top_k ? build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il) : inp_csa.kq_mask;
+ 
+     ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);
+     cb(kq_mask, "csa_lid_kq_mask", il);
+@@ -1013,42 +1014,55 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+         csa_state_score = ggml_add(ctx0, csa_state_score, csa_ape_rows);
+         cb(csa_state_score, "csa_state_score_ape", il);
+ 
+-        GGML_ASSERT(inp_dsv4->get_csa().state_write_idxs);
+-
+         const auto * csa_state = inp_dsv4->mctx->get_csa_state();
+-        const dsv4_state_tensors csa_restored = dsv4_build_state_restore(
+-                ctx0, inp_dsv4->get_csa(), csa_state, il);
+-        ggml_tensor * csa_base_kv = dsv4_view_2d(
+-                ctx0, csa_restored.kv, csa_restored.kv->ne[0], csa_state->get_n_rows(), 0);
+-        ggml_tensor * csa_base_score = dsv4_view_2d(
+-                ctx0, csa_restored.score, csa_restored.score->ne[0], csa_state->get_n_rows(), 0);
+-
+-        ggml_tensor * csa_source_kv = ggml_concat(ctx0, csa_base_kv, csa_state_kv, 1);
+-        ggml_tensor * csa_source_score = ggml_concat(ctx0, csa_base_score, csa_state_score, 1);
+-
+-        ggml_tensor * kv_comp_csa_state = build_overlap_compressed_kv_from_state(
+-                csa_source_kv,
+-                csa_source_score,
+-                inp_dsv4->get_csa().state_read_idxs,
+-                inp_dsv4->get_csa().state_write_pos,
+-                layer.attn_comp_norm,
+-                DSV4_CSA_RATIO,
+-                n_embd_head,
+-                "csa_state_compress",
+-                il);
+-
+-        if (inp_dsv4->get_csa().k_rot) {
+-            kv_comp_csa_state = llama_mul_mat_hadamard(ctx0, kv_comp_csa_state, inp_dsv4->get_csa().k_rot);
+-            cb(kv_comp_csa_state, "csa_state_compress_rot", il);
++        dsv4_state_tensors csa_restored = {};
++        if (inp_dsv4->get_csa().state_write_idxs != nullptr || inp_dsv4->get_csa().state_restore_src_idxs != nullptr || inp_dsv4->get_csa().state_snapshot_src_idxs != nullptr) {
++            csa_restored = dsv4_build_state_restore(ctx0, inp_dsv4->get_csa(), csa_state, il);
++            if (inp_dsv4->get_csa().state_restore_src_idxs != nullptr) {
++                ggml_build_forward_expand(gf, csa_restored.kv);
++                ggml_build_forward_expand(gf, csa_restored.score);
++            }
+         }
+ 
+-        ggml_build_forward_expand(gf, inp_dsv4->mctx->get_csa()->cpy_k(ctx0,
+-                    kv_comp_csa_state, inp_dsv4->get_csa().state_write_idxs, il));
++        if (inp_dsv4->get_csa().state_write_idxs) {
++            ggml_build_forward_expand(gf, csa_state_kv);
++            ggml_build_forward_expand(gf, csa_state_score);
++            if (csa_restored.kv) ggml_build_forward_expand(gf, csa_restored.kv);
++            if (csa_restored.score) ggml_build_forward_expand(gf, csa_restored.score);
++            const int n_before_csa = ggml_graph_n_nodes(gf);
++            ggml_tensor * csa_base_kv = dsv4_view_2d(
++                    ctx0, csa_restored.kv, csa_restored.kv->ne[0], csa_state->get_n_rows(), 0);
++            ggml_tensor * csa_base_score = dsv4_view_2d(
++                    ctx0, csa_restored.score, csa_restored.score->ne[0], csa_state->get_n_rows(), 0);
++
++            ggml_tensor * csa_source_kv = ggml_concat(ctx0, csa_base_kv, csa_state_kv, 1);
++            ggml_tensor * csa_source_score = ggml_concat(ctx0, csa_base_score, csa_state_score, 1);
++
++            ggml_tensor * kv_comp_csa_state = build_overlap_compressed_kv_from_state(
++                    csa_source_kv,
++                    csa_source_score,
++                    inp_dsv4->get_csa().state_read_idxs,
++                    inp_dsv4->get_csa().state_write_pos,
++                    layer.attn_comp_norm,
++                    DSV4_CSA_RATIO,
++                    n_embd_head,
++                    "csa_state_compress",
++                    il);
++
++            if (inp_dsv4->get_csa().k_rot) {
++                kv_comp_csa_state = llama_mul_mat_hadamard(ctx0, kv_comp_csa_state, inp_dsv4->get_csa().k_rot);
++                cb(kv_comp_csa_state, "csa_state_compress_rot", il);
++            }
++
++            ggml_build_forward_expand(gf, inp_dsv4->mctx->get_csa()->cpy_k(ctx0,
++                        kv_comp_csa_state, inp_dsv4->get_csa().state_write_idxs, il));
++            for (int i = n_before_csa; i < ggml_graph_n_nodes(gf); ++i) {
++                ggml_graph_node(gf, i)->flags |= 0x100;
++            }
++        }
+ 
+-        ggml_tensor * csa_snapshot_source_kv = ggml_concat(ctx0,
+-                csa_restored.kv, csa_state_kv, 1);
+-        ggml_tensor * csa_snapshot_source_score = ggml_concat(ctx0,
+-                csa_restored.score, csa_state_score, 1);
++        ggml_tensor * csa_snapshot_source_kv = inp_dsv4->get_csa().state_snapshot_src_idxs ? ggml_concat(ctx0, csa_restored.kv, csa_state_kv, 1) : nullptr;
++        ggml_tensor * csa_snapshot_source_score = inp_dsv4->get_csa().state_snapshot_src_idxs ? ggml_concat(ctx0, csa_restored.score, csa_state_score, 1) : nullptr;
+ 
+         const dsv4_state_tensors csa_snapshot = dsv4_build_state_snapshot(
+                 ctx0, inp_dsv4->get_csa(), csa_state, csa_snapshot_source_kv, csa_snapshot_source_score, il);
+@@ -1082,42 +1096,55 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+         lid_state_score = ggml_add(ctx0, lid_state_score, lid_ape_rows);
+         cb(lid_state_score, "lid_state_score_ape", il);
+ 
+-        GGML_ASSERT(inp_dsv4->get_lid().state_write_idxs);
+-
+         const auto * lid_state = inp_dsv4->mctx->get_lid_state();
+-        const dsv4_state_tensors lid_restored = dsv4_build_state_restore(
+-                ctx0, inp_dsv4->get_lid(), lid_state, il);
+-        ggml_tensor * lid_base_kv = dsv4_view_2d(
+-                ctx0, lid_restored.kv, lid_restored.kv->ne[0], lid_state->get_n_rows(), 0);
+-        ggml_tensor * lid_base_score = dsv4_view_2d(
+-                ctx0, lid_restored.score, lid_restored.score->ne[0], lid_state->get_n_rows(), 0);
+-
+-        ggml_tensor * lid_source_kv = ggml_concat(ctx0, lid_base_kv, lid_state_kv, 1);
+-        ggml_tensor * lid_source_score = ggml_concat(ctx0, lid_base_score, lid_state_score, 1);
+-
+-        ggml_tensor * kv_comp_lid_state = build_overlap_compressed_kv_from_state(
+-                lid_source_kv,
+-                lid_source_score,
+-                inp_dsv4->get_lid().state_read_idxs,
+-                inp_dsv4->get_lid().state_write_pos,
+-                layer.indexer_comp_norm,
+-                DSV4_CSA_RATIO,
+-                hparams.indexer_head_size,
+-                "lid_state_compress",
+-                il);
+-
+-        if (inp_dsv4->get_lid().k_rot) {
+-            kv_comp_lid_state = llama_mul_mat_hadamard(ctx0, kv_comp_lid_state, inp_dsv4->get_lid().k_rot);
+-            cb(kv_comp_lid_state, "lid_state_compress_rot", il);
++        dsv4_state_tensors lid_restored = {};
++        if (inp_dsv4->get_lid().state_write_idxs != nullptr || inp_dsv4->get_lid().state_restore_src_idxs != nullptr || inp_dsv4->get_lid().state_snapshot_src_idxs != nullptr) {
++            lid_restored = dsv4_build_state_restore(ctx0, inp_dsv4->get_lid(), lid_state, il);
++            if (inp_dsv4->get_lid().state_restore_src_idxs != nullptr) {
++                ggml_build_forward_expand(gf, lid_restored.kv);
++                ggml_build_forward_expand(gf, lid_restored.score);
++            }
+         }
+ 
+-        ggml_build_forward_expand(gf, inp_dsv4->mctx->get_lid()->cpy_k(ctx0,
+-                    kv_comp_lid_state, inp_dsv4->get_lid().state_write_idxs, il));
++        if (inp_dsv4->get_lid().state_write_idxs) {
++            ggml_build_forward_expand(gf, lid_state_kv);
++            ggml_build_forward_expand(gf, lid_state_score);
++            if (lid_restored.kv) ggml_build_forward_expand(gf, lid_restored.kv);
++            if (lid_restored.score) ggml_build_forward_expand(gf, lid_restored.score);
++            const int n_before_lid = ggml_graph_n_nodes(gf);
++            ggml_tensor * lid_base_kv = dsv4_view_2d(
++                    ctx0, lid_restored.kv, lid_restored.kv->ne[0], lid_state->get_n_rows(), 0);
++            ggml_tensor * lid_base_score = dsv4_view_2d(
++                    ctx0, lid_restored.score, lid_restored.score->ne[0], lid_state->get_n_rows(), 0);
++
++            ggml_tensor * lid_source_kv = ggml_concat(ctx0, lid_base_kv, lid_state_kv, 1);
++            ggml_tensor * lid_source_score = ggml_concat(ctx0, lid_base_score, lid_state_score, 1);
++
++            ggml_tensor * kv_comp_lid_state = build_overlap_compressed_kv_from_state(
++                    lid_source_kv,
++                    lid_source_score,
++                    inp_dsv4->get_lid().state_read_idxs,
++                    inp_dsv4->get_lid().state_write_pos,
++                    layer.indexer_comp_norm,
++                    DSV4_CSA_RATIO,
++                    hparams.indexer_head_size,
++                    "lid_state_compress",
++                    il);
++
++            if (inp_dsv4->get_lid().k_rot) {
++                kv_comp_lid_state = llama_mul_mat_hadamard(ctx0, kv_comp_lid_state, inp_dsv4->get_lid().k_rot);
++                cb(kv_comp_lid_state, "lid_state_compress_rot", il);
++            }
++
++            ggml_build_forward_expand(gf, inp_dsv4->mctx->get_lid()->cpy_k(ctx0,
++                        kv_comp_lid_state, inp_dsv4->get_lid().state_write_idxs, il));
++            for (int i = n_before_lid; i < ggml_graph_n_nodes(gf); ++i) {
++                ggml_graph_node(gf, i)->flags |= 0x100;
++            }
++        }
+ 
+-        ggml_tensor * lid_snapshot_source_kv = ggml_concat(ctx0,
+-                lid_restored.kv, lid_state_kv, 1);
+-        ggml_tensor * lid_snapshot_source_score = ggml_concat(ctx0,
+-                lid_restored.score, lid_state_score, 1);
++        ggml_tensor * lid_snapshot_source_kv = inp_dsv4->get_lid().state_snapshot_src_idxs ? ggml_concat(ctx0, lid_restored.kv, lid_state_kv, 1) : nullptr;
++        ggml_tensor * lid_snapshot_source_score = inp_dsv4->get_lid().state_snapshot_src_idxs ? ggml_concat(ctx0, lid_restored.score, lid_state_score, 1) : nullptr;
+ 
+         const dsv4_state_tensors lid_snapshot = dsv4_build_state_snapshot(
+                 ctx0, inp_dsv4->get_lid(), lid_state, lid_snapshot_source_kv, lid_snapshot_source_score, il);
+@@ -1182,23 +1209,16 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+         if (hca_state == nullptr) {
+             hca_state = inp_dsv4->mctx->get_hca_state();
+         }
+-        if (hca_restored.kv == nullptr) {
++        if (hca_restored.kv == nullptr && (inp_dsv4->get_hca().state_restore_src_idxs != nullptr || inp_dsv4->get_hca().state_snapshot_src_idxs != nullptr)) {
+             hca_restored = dsv4_build_state_restore(ctx0, inp_dsv4->get_hca(), hca_state, il);
+-        }
+-        if (hca_source_kv == nullptr || hca_source_score == nullptr) {
+-            ggml_tensor * hca_base_kv = dsv4_view_2d(
+-                    ctx0, hca_restored.kv, hca_restored.kv->ne[0], hca_state->get_n_rows(), 0);
+-            ggml_tensor * hca_base_score = dsv4_view_2d(
+-                    ctx0, hca_restored.score, hca_restored.score->ne[0], hca_state->get_n_rows(), 0);
+-
+-            hca_source_kv = ggml_concat(ctx0, hca_base_kv, hca_state_kv, 1);
+-            hca_source_score = ggml_concat(ctx0, hca_base_score, hca_state_score, 1);
++            if (inp_dsv4->get_hca().state_restore_src_idxs != nullptr) {
++                ggml_build_forward_expand(gf, hca_restored.kv);
++                ggml_build_forward_expand(gf, hca_restored.score);
++            }
+         }
+ 
+-        ggml_tensor * hca_snapshot_source_kv = ggml_concat(ctx0,
+-                hca_restored.kv, hca_state_kv, 1);
+-        ggml_tensor * hca_snapshot_source_score = ggml_concat(ctx0,
+-                hca_restored.score, hca_state_score, 1);
++        ggml_tensor * hca_snapshot_source_kv = inp_dsv4->get_hca().state_snapshot_src_idxs ? ggml_concat(ctx0, hca_restored.kv, hca_state_kv, 1) : nullptr;
++        ggml_tensor * hca_snapshot_source_score = inp_dsv4->get_hca().state_snapshot_src_idxs ? ggml_concat(ctx0, hca_restored.score, hca_state_score, 1) : nullptr;
+ 
+         const dsv4_state_tensors hca_snapshot = dsv4_build_state_snapshot(
+                 ctx0, inp_dsv4->get_hca(), hca_state, hca_snapshot_source_kv, hca_snapshot_source_score, il);
 diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
 index 38f2a57..2787e66 100644
 --- a/src/models/qwen35moe.cpp
@@ -2802,10 +3521,10 @@ index 38f2a57..2787e66 100644
  
      GGML_ASSERT(layer.nextn.eh_proj    && "MTP block missing nextn.eh_proj");
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 5d2798c..0f14986 100644
+index 38d2e5c..7566a67 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -2361,13 +2361,16 @@ private:
+@@ -2376,13 +2376,16 @@ private:
          }
  
          while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
@@ -2825,7 +3544,7 @@ index 5d2798c..0f14986 100644
          }
  
          auto & cur = slot.prompt.checkpoints.emplace_back();
-@@ -2585,6 +2588,33 @@ private:
+@@ -2605,6 +2608,33 @@ private:
                      const size_t token_count = tokens.size();
                      const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
  
@@ -2859,7 +3578,7 @@ index 5d2798c..0f14986 100644
                      const int64_t t_end = ggml_time_us();
                      const double t_save_ms = (t_end - t_start) / 1000.0;
  
-@@ -2631,6 +2661,40 @@ private:
+@@ -2651,6 +2681,40 @@ private:
                      slot->prompt.clear();
                      slot->prompt.tokens.insert(tokens);
  
