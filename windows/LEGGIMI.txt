@@ -1,0 +1,54 @@
+================================================================================
+  llama-modchip v2.3.0 -- Pacchetto Windows "Doppio Clic & Via"
+  Ottimizzato per: Intel Core i9-9900K + NVIDIA RTX 2080 Ti (11 GB) + 16 GB RAM
+================================================================================
+
+COME SI USA (ZERO INSTALLAZIONI MANUALI):
+-----------------------------------------
+1. Estrai questa cartella sul tuo SSD dove hai spazio libero (es. C:\modchip).
+2. Fai semplicemente DOPPIO CLIC su:
+   -> AVVIA_MODCHIP.bat
+
+COSA FA IN AUTOMATICO ALLA PRIMA ESECUZIONE:
+--------------------------------------------
+1. Rileva in automatico la tua CPU (8 core fisici dell'i9-9900K), la tua
+   RTX 2080 Ti (11 GB VRAM) e la RAM realmente libera su Windows.
+2. Scarica da solo i binari ufficiali CUDA 12.4 di llama.cpp (comprese le DLL
+   CUDA Runtime, quindi NON devi installare il CUDA Toolkit: basta il normale
+   driver NVIDIA GeForce che hai gia'!).
+3. Ti mostra un menu con 4 profili studiati appositamente per il tuo PC:
+
+   [1] CONSIGLIATO (30 Miliardi Sparse MoE Leggero per 16 GB RAM):
+       Qwen3-30B-A3B (Q3_K_M, 13.7 GiB)
+       -> Carica il backbone + ~30 layer MoE sulla tua RTX 2080 Ti (616 GB/s)
+          e lascia solo ~4.5 GB di esperti MoE sulla RAM DDR4.
+       -> Risultato: hai un modello da 30 MILIARDI di parametri velocissimo
+          e Windows resta fluido anche con soli 16 GB di RAM!
+
+   [2] LONG-CONTEXT 128K-256K (30 Miliardi Ibrido Mamba-2 + MoE):
+       NVIDIA-Nemotron-3.5-30B-A3B (Q4_0, 17.6 GiB)
+       -> Mette Mamba-2 + Attention + 9 layer MoE sulla RTX 2080 Ti (~9.6 GB)
+          e 14 layer MoE in RAM (~8.0 GB).
+       -> Nota: con 16 GB di RAM totali, chiudi Chrome/browser pesanti prima
+          di scegliere l'opzione [2].
+
+   [3] 100% GPU RTX 2080 Ti (Zero RAM di sistema usata!):
+       Qwen3-14B (Q4_K_M, 8.4 GiB)
+       -> Entra TUTTO dentro gli 11 GB GDDR6 della 2080 Ti! Vola a ~50-58 tok/s
+          senza toccare la RAM DDR4-2667.
+
+   [4] 100% GPU TURBO 128K (Precisione 8-bit Q8_0 sulla 2080 Ti):
+       NVIDIA-Nemotron-H-8B-Reasoning-128K (Q8_0, 8.0 GiB)
+       -> 128.000 token di contesto in soli ~210 MB di KV cache, 100% sulla
+          RTX 2080 Ti a ~100+ token/secondo!
+
+4. Appena il modello e' caricato, apre da solo il browser sulla Web Chat locale
+   (http://127.0.0.1:8080) ed espone anche le API compatibili OpenAI su
+   http://127.0.0.1:8080/v1 (per collegarci VS Code Continue, Cline, Cursor).
+
+VUOI FARE UN TEST DI VELOCITA' DEL PC?
+--------------------------------------
+Fai doppio clic su:
+   -> BENCHMARK_PC.bat
+Eseguira' un test di 20 secondi (prefill + generazione) e ti stampera' i tok/s
+esatti della tua RTX 2080 Ti + i9-9900K!
