@@ -422,13 +422,21 @@ if (($nCpuMoe -gt 0) -and ($freshHw.FreeRamGB -lt ($estCpuRamGB + 0.5))) {
     Read-Host "      Premi INVIO quando sei pronto per avviare il motore" | Out-Null
 }
 
+$helpOut = & $serverExe --help 2>&1 | Out-String
+$loadModeArgs = @()
+if ($helpOut -match "--load-mode") {
+    $loadModeArgs = @("--load-mode", "none")
+} elseif ($helpOut -match "--no-mmap") {
+    $loadModeArgs = @("--no-mmap")
+}
+
 $serverArgs = @(
     "-m", $modelPath,
     "--host", "127.0.0.1",
     "--port", "$Port",
     "-c", "$ctxSize",
-    "-ngl", "99",
-    "--no-mmap",
+    "-ngl", "99"
+) + $loadModeArgs + @(
     "-ctk", "q8_0",
     "-ctv", "q4_0",
     "-fa", "on",
