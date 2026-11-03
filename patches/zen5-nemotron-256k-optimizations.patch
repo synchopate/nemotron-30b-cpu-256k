@@ -202,7 +202,7 @@ index ea54cfe..7ca5c6c 100644
          const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
  
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 7918845..4f506cd 100644
+index 491316f..53a684f 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
 @@ -489,6 +489,8 @@ struct ggml_threadpool {
@@ -390,18 +390,61 @@ index 7918845..4f506cd 100644
          threadpool->stop             = false;
          threadpool->pause            = tpp->paused;
          threadpool->abort            = -1;
-@@ -3376,7 +3487,111 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -3376,7 +3487,152 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
      }
  
  #ifdef GGML_USE_OPENMP
 -    if (n_threads > 1) {
 +    static int s_dual_ccd_split_layer = -2;
++    static int s_ccd0_cpus[64];
++    static int s_ccd1_cpus[64];
++    static int s_n_ccd0 = 16;
++    static int s_n_ccd1 = 16;
 +    if (s_dual_ccd_split_layer == -2) {
 +        const char * env_split = getenv("LLAMA_DUAL_CCD_SPLIT");
 +        s_dual_ccd_split_layer = (env_split && atoi(env_split) > 0) ? atoi(env_split) : -1;
++        const int def0[16] = {0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23};
++        const int def1[16] = {8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31};
++        memcpy(s_ccd0_cpus, def0, sizeof(def0));
++        memcpy(s_ccd1_cpus, def1, sizeof(def1));
++#if defined(__linux__)
++        FILE * fp = fopen("/sys/devices/system/cpu/cpu0/cache/index3/shared_cpu_list", "r");
++        if (fp) {
++            char buf[256] = {0};
++            if (fgets(buf, sizeof(buf) - 1, fp)) {
++                bool in_ccd0[256] = {false};
++                int n0 = 0, n1 = 0;
++                const char * p = buf;
++                while (*p) {
++                    int a = 0, b = 0;
++                    if (sscanf(p, "%d-%d", &a, &b) == 2) {
++                        for (int c = a; c <= b && c < 256 && n0 < 64; c++) {
++                            s_ccd0_cpus[n0++] = c;
++                            in_ccd0[c] = true;
++                        }
++                    } else if (sscanf(p, "%d", &a) == 1 && a >= 0 && a < 256 && n0 < 64) {
++                        s_ccd0_cpus[n0++] = a;
++                        in_ccd0[a] = true;
++                    }
++                    while (*p && *p != ',') p++;
++                    if (*p == ',') p++;
++                }
++                int n_conf = (int)sysconf(_SC_NPROCESSORS_ONLN);
++                if (n_conf > 256) n_conf = 256;
++                for (int c = 0; c < n_conf && n1 < 64; c++) {
++                    if (!in_ccd0[c]) s_ccd1_cpus[n1++] = c;
++                }
++                if (n0 > 0 && n1 > 0) {
++                    s_n_ccd0 = n0;
++                    s_n_ccd1 = n1;
++                }
++            }
++            fclose(fp);
++        }
++#endif
 +        if (s_dual_ccd_split_layer > 0) {
-+            fprintf(stderr, "[GGML-DUAL-CCD] Vertical Layer Partitioning ACTIVE: Layers 0..%d -> CCD0 (32MB L3), Layers %d..N -> CCD1 (32MB L3)\n",
-+                    s_dual_ccd_split_layer - 1, s_dual_ccd_split_layer);
++            fprintf(stderr, "[GGML-DUAL-CCD] Vertical Layer Partitioning ACTIVE: Layers 0..%d -> CCD0 (%d logical CPUs), Layers %d..N -> CCD1 (%d logical CPUs)\n",
++                    s_dual_ccd_split_layer - 1, s_n_ccd0, s_dual_ccd_split_layer, s_n_ccd1);
 +        }
 +    }
 +
@@ -432,12 +475,10 @@ index 7918845..4f506cd 100644
 +        {
 +            int omp_id = omp_get_thread_num();
 +
-+            static const int ccd0_cpus[16] = {0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23};
-+            static const int ccd1_cpus[16] = {8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31};
 +            static __thread int tls_pinned_cpu = -1;
 +            int target_cpu = (omp_id < n_threads)
-+                ? ccd0_cpus[omp_id % 16]
-+                : ccd1_cpus[(omp_id - n_threads) % 16];
++                ? s_ccd0_cpus[omp_id % s_n_ccd0]
++                : s_ccd1_cpus[(omp_id - n_threads) % s_n_ccd1];
 +            if (tls_pinned_cpu != target_cpu) {
 +                cpu_set_t cpuset;
 +                CPU_ZERO(&cpuset);
@@ -503,17 +544,24 @@ index 7918845..4f506cd 100644
          #pragma omp parallel num_threads(n_threads)
          {
              #pragma omp single
-@@ -3392,6 +3607,16 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -3392,6 +3648,23 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
              ggml_thread_apply_priority(threadpool->prio);
              if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
                  ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
-+            } else if (n_threads == 16) {
++            } else if (n_threads == 16 && sysconf(_SC_NPROCESSORS_ONLN) == 32) {
 +                static __thread int tls_std_pinned_cpu = -1;
 +                if (tls_std_pinned_cpu != ith) {
-+                    cpu_set_t cpuset;
-+                    CPU_ZERO(&cpuset);
-+                    CPU_SET(ith, &cpuset);
-+                    if (pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) == 0) {
++                    cpu_set_t cur_mask;
++                    CPU_ZERO(&cur_mask);
++                    // Only apply 1:1 physical core pinning if no custom taskset mask was already set externally
++                    if (pthread_getaffinity_np(pthread_self(), sizeof(cur_mask), &cur_mask) == 0 && CPU_COUNT(&cur_mask) >= 32) {
++                        cpu_set_t cpuset;
++                        CPU_ZERO(&cpuset);
++                        CPU_SET(ith, &cpuset);
++                        if (pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) == 0) {
++                            tls_std_pinned_cpu = ith;
++                        }
++                    } else {
 +                        tls_std_pinned_cpu = ith;
 +                    }
 +                }
@@ -1103,19 +1151,28 @@ index 1ebc50a..053cdf3 100644
      }
  }
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 59191c6..a1c567b 100644
+index 59191c6..71b44a7 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -380,6 +380,14 @@ void * ggml_aligned_malloc(size_t size) {
+@@ -364,6 +364,11 @@ void * ggml_aligned_malloc(size_t size) {
+             break;
+     }
+   #else
++#if defined(__linux__) && defined(MADV_HUGEPAGE)
++    if (size >= 2 * 1024 * 1024 && alignment < 2 * 1024 * 1024) {
++        alignment = 2 * 1024 * 1024;
++    }
++#endif
+     int result = posix_memalign(&aligned_memory, alignment, size);
+   #endif
+     if (result != 0) {
+@@ -380,6 +385,11 @@ void * ggml_aligned_malloc(size_t size) {
          GGML_LOG_ERROR("%s: %s (attempted to allocate %6.2f MB)\n", __func__, error_desc, size/(1024.0*1024.0));
          return NULL;
      }
 +#if defined(__linux__) && defined(MADV_HUGEPAGE)
 +    if (size >= 2 * 1024 * 1024) {
-+        uintptr_t page_mask = ~(uintptr_t)(4096 - 1);
-+        void * page_aligned = (void *)((uintptr_t)aligned_memory & page_mask);
-+        size_t adv_size = size + ((uintptr_t)aligned_memory - (uintptr_t)page_aligned);
-+        madvise(page_aligned, adv_size, MADV_HUGEPAGE);
++        madvise(aligned_memory, size, MADV_HUGEPAGE);
 +    }
 +#endif
      return aligned_memory;

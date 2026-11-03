@@ -103,6 +103,11 @@ Measured on an **AMD Ryzen 9 9955HX** (`16C/32T Zen 5`, `64 MB L3`, `64 GB DDR5`
 | **Decode — Agent `<tool_call>` & Mixed Refactor** | ~4.5 tok/s | **`28.6 – 34.5 tok/s`** *( Peak **`48.5 tok/s`**, `86.1%` acc)* | **~7x Faster** |
 | **Decode — In-Context Refactoring (`Stockfish M=7`)** | ~4.5 tok/s | **`48.39 tok/s` avg / `60.40–65.0 tok/s` peak** *(`mean len = 6.90`)* | **>11x Faster** |
 
+> 📐 **Hardware Bandwidth Physics Check (`~75 GB/s` Dual-Channel DDR5 — full proof in [`FAQ.md` Q13](FAQ.md))**:  
+> - **$N=1$ Base Decode (`25.02–26.08 tok/s`, GEMV)**: Streams `~1.8 GB/token` $\implies \mathbf{45.5\text{ GB/s}}$ (`~61%` of theoretical DDR5 peak).  
+> - **Batched Prompt Prefill (`241–306.8 tok/s`, `-ub 512` GEMM)**: Streams weights **once per 512-token micro-batch** (`17.6 GiB / 512 ≈ 35.2 MB/token` $\implies \mathbf{10.8\text{ GB/s}}$ DDR5 traffic; prefill is AVX-512 compute-bound, not memory-bound — independently reproduced at `386 tok/s` in [Issue #1](https://github.com/synchopate/llama-modchip/issues/1) and `123 tok/s` on 8-vCPU ARM64 in [Issue #2](https://github.com/synchopate/llama-modchip/issues/2)).  
+> - **Batched Speculative Decode (`48.39 tok/s` avg, `M=7` / `mean len = 6.90`)**: Verifies `7` tokens in **one batched forward pass** (`~3.1–3.4 GB` total read per 6.90 accepted tokens = `~0.48 GB/tok` $\implies \mathbf{23.2\text{ GB/s}}$ effective / `~52 GB/s` raw bus streaming — independently reproduced at `44.97 tok/s` on 8-vCPU Graviton3 in [Issue #2](https://github.com/synchopate/llama-modchip/issues/2) and `80.14–111.62 tok/s` in [Issue #1](https://github.com/synchopate/llama-modchip/issues/1)).
+
 ### ♟️ Why a `1.64 MB` Stockfish Chess Engine Beats a `1B` Neural Draft Model on CPU
 
 On GPUs (`3.35 TB/s` HBM3), running a 1B neural draft model takes `< 1 ms`. **On a CPU (`71.7 GB/s` Dual-Channel DDR5), 1B neural draft models fail catastrophically**: streaming `600 MB` of 1B draft weights for 5 steps reads **`3.0 GB` from RAM (`40 ms`)** — **slower than running the 30B Sparse MoE target model itself (`1.8 GB` active $\rightarrow 25\text{ ms}$)**, while completely flushing the `64 MB` L3 cache!

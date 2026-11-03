@@ -177,4 +177,43 @@ See **[`speculative/ROUTECRACK_TECHNIQUES.md`](speculative/ROUTECRACK_TECHNIQUES
 
 ---
 
+## Q13: How do `306.8 tok/s` Prefill, `48.39–60.40 tok/s` Speculative Decode, and `DeepSeek-V4 284B` in `58.9 GiB` obey physical DDR5 bandwidth (`~75 GB/s`) and RAM limits?
+
+A common back-of-the-envelope mistake is applying the **single-token ($N=1$, GEMV) bandwidth formula** (`Throughput × ActiveBytesPerToken`) to **batched prompt prefill ($N=512$, GEMM)** or **multi-token speculative verification ($N=8$)**, or assuming all `284.33B` weights in `DeepSeek-V4-Flash` are quantized at a single uniform bitrate. Here is the exact hardware physics behind each number:
+
+1. **Why `241.0–306.8 tok/s` Prompt Prefill Uses Only `~10.5 GB/s` of DDR5 Bandwidth (GEMM vs. GEMV)**:
+   - Multiplying `306.8 tok/s × 1.8 GB/token = 552 GB/s` assumes the CPU re-reads `1.8 GB` from DDR5 for every single prompt token ($N=1$ GEMV).
+   - During **Prompt Prefill (`-ub 512 -b 2048`)**, `llama.cpp` executes **batched Matrix-Matrix multiplications (GEMM)** across $B = 512$ tokens simultaneously. Even if every single expert in the entire `17.59 GiB` model is touched once during a 512-token micro-batch, the weights are streamed from DDR5 **once per 512 tokens**, not 512 times:
+     $$\text{DDR5 Read per Prefill Token} \le \frac{17.59\text{ GiB}}{512\text{ tokens}} \approx 35.2\text{ MB/token} \implies 306.8\text{ tok/s} \times 35.2\text{ MB} \approx \mathbf{10.8\text{ GB/s}}$$
+   - At $B = 512$, arithmetic intensity rises from $I \approx 1\text{ FLOP/byte}$ (GEMV) to **$I > 160\text{ FLOPs/byte}$ (GEMM)**: prefill is **compute-bound on AVX-512 VNNI cores**, not DDR5 bandwidth-bound.
+   - **Independent Third-Party Reproductions**:
+     - `@aifartist` on AMD Threadripper PRO 7985WX ([Issue #1](https://github.com/synchopate/llama-modchip/issues/1)): **`386.00 tok/s` prefill**
+     - `@jarorosFork` on Apple M4 Pro ([`apple-silicon/`](apple-silicon/README.md)): **`256.0–549.0 tok/s` prefill**
+     - `@gerchik` on 8-vCPU AWS Graviton3 ARM64 ([Issue #2](https://github.com/synchopate/llama-modchip/issues/2)): **`101.67–123.37 tok/s` prefill**
+
+2. **Why `48.39 tok/s` Avg / `60.40 tok/s` Peak Speculative Decode Uses `~45–52 GB/s` of DDR5 Bandwidth**:
+   - At $N=1$ non-speculative base decode (`25.02–26.08 tok/s`), each token reads `~1.8 GB` of active weights: $25.3\text{ tok/s} \times 1.8\text{ GB} = \mathbf{45.5\text{ GB/s}}$ (~61% of dual-channel DDR5-5600 theoretical peak).
+   - When `RouteCrack + Stockfish-PVS` drafts $D = 6$ tokens (`M=7`, verifying $1 + 6 = 7$ tokens in **one batched forward pass**, achieving `mean len = 6.90` tokens/step on in-context refactoring at `96.4%` acceptance), the CPU does **not** run 7 separate forward passes!
+   - Across a 7-token verification batch in `Nemotron-3.5-30B-A3B`:
+     - All **dense / shared tensors** (`token_embd`, 46 `Mamba-2` `ssm_in`/`ssm_out` projections, 6 `GQA` projections, 23 double-width `shared experts`, and `output.weight`) are read from DDR5 **exactly once** for all 7 tokens.
+     - Routed MoE experts overlap heavily across consecutive tokens in the same syntactic phrase, so the 7-token batch streams `~3.1–3.4 GB` total from DDR5 (about `1.75×` the time of a single token, i.e., `~140 ms` per 6.90 accepted tokens = **`~0.48 GB` per accepted token**):
+       $$48.39\text{ tok/s} \times 0.48\text{ GB/tok} \approx \mathbf{23.2\text{ GB/s effective}} \quad (\text{or } \sim 52\text{ GB/s raw bus streaming during the } 140\text{ ms batch pass})$$
+   - **Independent Third-Party Reproductions**:
+     - `@gerchik` on an **8-vCPU AWS Graviton3 (`m7g.2xlarge`)** ([Issue #2](https://github.com/synchopate/llama-modchip/issues/2)): **`44.97 tok/s`** on refactoring (`41.05 tok/s` on C++20 from scratch)
+     - `@aifartist` on Threadripper PRO 7985WX ([Issue #1](https://github.com/synchopate/llama-modchip/issues/1#issuecomment-6595559921)): **`80.14 tok/s` cold / `111.62 tok/s` warm**
+
+3. **Why `DeepSeek-V4-Flash` (`284.33B` Total / `13.17B` Active) Occupies Exactly `56.56 GiB` on Disk (`58.9 GiB VmRSS`, `0` Swap)**:
+   - `DeepSeek-V4-Flash-0731-Fractal` is **not** quantized uniformly at `3.75 bpw` (`284B × 3.75 bpw` would be `133 GiB`).
+   - As implemented in [`scripts/transcode_dsv4.c`](scripts/transcode_dsv4.c) and [`scripts/transcode_dsv4_shard.py`](scripts/transcode_dsv4_shard.py):
+     - **Dense MLA & Indexer Compressor projections** (`attn_q_b`, `attn_output_a/b`, `attn_compressor_*`, `indexer_compressor_*`, `~11.8B` params) are quantized to **`Fractal-64` (`Q2_0`, `3.75 bpw`)** (`~5.5 GiB`).
+     - **Bulk 256-Expert Routed MoE layers** (`ffn_gate_exps`, `ffn_up_exps`, `ffn_down_exps`, `~265B` params) are quantized to **`IQ1_S` (`1.5625 bpw`)** weighted by the data-free analytical second-moment SwiGLU importance proxy $I_{e,j} = \|W_{\text{gate}}^{(e)}[j,:]\|_2^2 \cdot \|W_{\text{up}}^{(e)}[j,:]\|_2^2$, while sensitivity-anchored layers remain in **`IQ1_M` (`1.75 bpw`)** and **`IQ2_XXS` (`2.06 bpw`)** (`~48.2 GiB` across all routed experts + `~2.8 GiB` for shared experts, embeddings, norms, and `output.weight`).
+     - Total across the 4 GGUF shards: **`56.56 GiB` (`60,730,782,208` bytes)** on disk, and **`58.9 GiB` total `VmRSS`** at `-c 262144` (`256K` context) with **zero swap**.
+
+4. **Architectural Note on Terminology (`Stockfish-PVS`, `SwiGLU-H2`, `HARP-Cache`)**:
+   - **`Stockfish-PVS`**: [`speculative/cpp/rc_stockfish.h`](speculative/cpp/rc_stockfish.h) implements the `192 KB` L2-resident lockless 4-way Zobrist Transposition Table (`tt5/tt4/tt3`), Refutation tracking, and Stockfish History Gravity (`h += bonus - h * |bonus| / 512`), while the multi-step Principal Variation rollout, 1-ply quiescence lookahead, and Singular Horizon Extension (`M=7` on `true_consensus_hits == d`) execute in [`speculative/cpp/ngram-map.cpp`](speculative/cpp/ngram-map.cpp).
+   - **`SwiGLU-H2`**: In [`scripts/transcode_dsv4.c`](scripts/transcode_dsv4.c), $I_{e,j} = \|W_{\text{gate}}^{(e)}[j,:]\|_2^2 \cdot \|W_{\text{up}}^{(e)}[j,:]\|_2^2$ is a **closed-form, data-free diagonal second-moment / Gauss-Newton proxy** derived under isotropic unit-variance activations (avoiding the need to run a multi-hour calibration corpus through a 284B model).
+   - **`HARP-Cache`**: [`kv_cache/harp_cache.py`](kv_cache/harp_cache.py) provides the gateway-side rolling FNV-1a Radix Tree prefix tracker and telemetry accounting, while physical tensor state persistence in `/dev/shm` is executed natively in C++ by `llama-server --slot-save-path /dev/shm` (`POST /slots/0?action=restore`).
+
+---
+
 *Navigation: [⬅️ Back to Overview & Quickstart (`README.md`)](README.md) · [📄 Full Technical Paper (`ARCHITECTURE.md`)](ARCHITECTURE.md) · [♟️ 96+ `RouteCrack + Stockfish-PVS` Techniques (`speculative/ROUTECRACK_TECHNIQUES.md`)](speculative/ROUTECRACK_TECHNIQUES.md) · [🚀 Release Notes (`RELEASE_NOTES.md`)](RELEASE_NOTES.md)*

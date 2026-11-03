@@ -131,12 +131,18 @@ def set_session_mode(session_id: str, new_mode: str) -> None:
         if session_id in ("default", "all"):
             _default_think_mode = new_mode
 
+_MAX_XML_PARAM_JSON_BYTES = 65536
+GATEWAY_API_KEY = os.environ.get("GATEWAY_API_KEY", "").strip()
+GATEWAY_STRIP_REMINDERS = os.environ.get("GATEWAY_STRIP_REMINDERS", "1") != "0"
+
 def _coerce_xml_param(raw, prop):
     """Convert an XML <parameter> value to the JSON type that the tool schema declares."""
     ptype = prop.get("type") if isinstance(prop, dict) else None
     if ptype == "string":
         return raw
     s = raw.strip()
+    if len(s) > _MAX_XML_PARAM_JSON_BYTES:
+        return raw if ptype is not None else s
     try:
         if ptype == "integer":
             return int(s)
@@ -1331,8 +1337,25 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.send_cors_headers()
         self.end_headers()
 
+    def _check_auth(self) -> bool:
+        if not GATEWAY_API_KEY:
+            return True
+        import hmac
+        auth_hdr = self.headers.get("Authorization", "")
+        token = auth_hdr[7:].strip() if auth_hdr.lower().startswith("bearer ") else self.headers.get("x-api-key", "").strip()
+        if hmac.compare_digest(token.encode("utf-8"), GATEWAY_API_KEY.encode("utf-8")):
+            return True
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json")
+        self.send_cors_headers()
+        self.end_headers()
+        self.wfile.write(b'{"error":"Unauthorized: set Authorization: Bearer <GATEWAY_API_KEY>"}')
+        return False
+
     def do_GET(self):
         clean_path = self.path.split("?", 1)[0]
+        if clean_path not in ("/", "/index.html", "/ui", "/health") and not self._check_auth():
+            return
         if clean_path in ("/", "/index.html", "/ui"):
             body = WEB_UI_HTML.encode("utf-8")
             self.send_response(200)
@@ -1422,6 +1445,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         global _last_endpoint_was_chat
+        if not self._check_auth():
+            return
         length = int(self.headers.get("Content-Length", 0))
         body_bytes = self.rfile.read(length) if length else b""
 
@@ -1524,14 +1549,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 # 1. Remove mid-conversation role=="system" messages (e.g. <total_tokens>, # Environment, skill_listing).
                 # 2. Extract static Contents of .../MEMORY.md or CLAUDE.md from messages[0] and place it in data["system"]
                 #    so llama-server creates Mamba-2 Checkpoint 0 AFTER System + MEMORY.md + Tools.
-                # 3. Strip noisy <system-reminder> blocks (Attribution, skills, agents, hooks, <total_tokens>).
+                # 3. Strip noisy <system-reminder> blocks (when GATEWAY_STRIP_REMINDERS=1, default) so volatile per-turn reminders do not invalidate Mamba-2 checkpoints.
                 extracted_memory_blocks = []
                 filtered_messages = []
                 for idx_m, msg in enumerate(messages):
                     role_m = msg.get("role", "")
-                    if role_m == "system":
+                    if role_m == "system" and GATEWAY_STRIP_REMINDERS:
                         continue
-                    if role_m == "user":
+                    if role_m == "user" and GATEWAY_STRIP_REMINDERS:
                         u_content = msg.get("content")
                         if isinstance(u_content, list):
                             user_parts = []
