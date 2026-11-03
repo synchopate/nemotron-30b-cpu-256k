@@ -50,17 +50,20 @@ _session_modes = OrderedDict()
 _default_think_mode = "no"
 
 _slot0_restore_lock = threading.Lock()
+_last_endpoint_was_chat = True
 SLOT0_SNAPSHOT_NAME = os.environ.get("LLAMA_SLOT_SNAPSHOT_NAME", "claude_40tools_slot0.bin")
 
 def _ensure_slot0_restored(target_upstream: str) -> None:
-    """Auto-restores the 22.2K-token Slot 0 snapshot in ~18.9 ms if Slot 0 is cold or was evicted."""
+    """Auto-restores the Slot 0 snapshot (22.2K tokens for Nemotron or 2.94K compact tokens for DeepSeek-V4) in ~19-32 ms if Slot 0 is cold or was evicted."""
     shm_snap = f"/dev/shm/{SLOT0_SNAPSHOT_NAME}"
+    custom_cache_dir = os.environ.get("MODCHIP_CACHE_DIR", "")
     if not os.path.exists(shm_snap):
         for disk_cand in (
+            os.path.join(custom_cache_dir, SLOT0_SNAPSHOT_NAME) if custom_cache_dir else "",
             os.path.join(_REPO_ROOT, "workspace", "cache", SLOT0_SNAPSHOT_NAME),
             f"/opt/models/nemotron/cache/{SLOT0_SNAPSHOT_NAME}",
         ):
-            if os.path.exists(disk_cand):
+            if disk_cand and os.path.exists(disk_cand):
                 try:
                     shutil.copyfile(disk_cand, shm_snap)
                     if os.path.exists(disk_cand + ".ckpt") and not os.path.exists(shm_snap + ".ckpt"):
@@ -70,9 +73,13 @@ def _ensure_slot0_restored(target_upstream: str) -> None:
                     pass
                 break
 
+    if not os.path.exists(shm_snap) and custom_cache_dir and os.path.exists(os.path.join(custom_cache_dir, SLOT0_SNAPSHOT_NAME)):
+        shm_snap = os.path.join(custom_cache_dir, SLOT0_SNAPSHOT_NAME)
+
     if not os.path.exists(shm_snap):
         return
 
+    min_tok_threshold = 2500 if "dsv4" in SLOT0_SNAPSHOT_NAME.lower() else 21500
     with _slot0_restore_lock:
         try:
             req = urllib.request.Request(f"{target_upstream}/slots")
@@ -84,7 +91,7 @@ def _ensure_slot0_restored(target_upstream: str) -> None:
             if s0.get("is_processing", False):
                 return
             n_tokens = int(s0.get("n_prompt_tokens") or s0.get("n_past") or 0)
-            if n_tokens >= 21500:
+            if n_tokens >= min_tok_threshold:
                 return
             t0 = time.perf_counter()
             restore_req = urllib.request.Request(
@@ -97,7 +104,7 @@ def _ensure_slot0_restored(target_upstream: str) -> None:
                 res = json.loads(r_resp.read().decode("utf-8", errors="replace"))
             dt_ms = (time.perf_counter() - t0) * 1000.0
             print(
-                f"[Gateway] [Slot0-Guard] ⚡ Auto-restored {res.get('n_restored', 22237)} tokens "
+                f"[Gateway] [Slot0-Guard] ⚡ Auto-restored {res.get('n_restored', min_tok_threshold)} tokens "
                 f"from {shm_snap} into Slot 0 in {dt_ms:.1f} ms (was {n_tokens} tok)!",
                 flush=True,
             )
@@ -1414,6 +1421,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.wfile.write(resp_body)
 
     def do_POST(self):
+        global _last_endpoint_was_chat
         length = int(self.headers.get("Content-Length", 0))
         body_bytes = self.rfile.read(length) if length else b""
 
@@ -1637,6 +1645,28 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         if isinstance(tool, dict) and tool.get("name") and isinstance(tool.get("parameters"), dict):
                             tool_schemas[tool["name"]] = tool["parameters"].get("properties", {})
 
+                    # Optional Compact Tool Table (22,225 -> 2,940 prefix tokens for DeepSeek-V4-Flash)
+                    use_compact_tools = (
+                        os.environ.get("MODCHIP_COMPACT_TOOLS") == "1"
+                        or "dsv4" in SLOT0_SNAPSHOT_NAME.lower()
+                    )
+                    if use_compact_tools and len(data["tools"]) >= 15:
+                        compact_lines = [
+                            "## Available Tools (invoke via <｜DSML｜tool_calls><｜DSML｜invoke name=\"TOOL_NAME\"><｜DSML｜parameter name=\"PARAM\" string=\"true|false\">VAL</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>):"
+                        ]
+                        for tool in data["tools"]:
+                            if not isinstance(tool, dict):
+                                continue
+                            tname = tool.get("name", "")
+                            schema = tool.get("input_schema") or tool.get("parameters") or {}
+                            props = schema.get("properties") or {}
+                            reqs = set(schema.get("required") or [])
+                            psigs = [f"{pk}{'*' if pk in reqs else ''}:{pv.get('type','any') if isinstance(pv,dict) else 'any'}" for pk, pv in props.items()]
+                            compact_lines.append(f"- {tname}({', '.join(psigs)})")
+                        if messages and messages[0].get("role") == "system":
+                            messages[0]["content"] = messages[0].get("content", "") + "\n\n" + "\n".join(compact_lines)
+                        data.pop("tools", None)
+
                 # Enforce safe upper bound on max_tokens to prevent runaway loops
                 cur_max = data.get("max_tokens")
                 if cur_max is None or cur_max > 4096:
@@ -1665,9 +1695,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 target_upstream = UPSTREAM_BASE
                 data["model"] = "nemotron-30b"
 
-                # Auto-restore 22.2K Slot 0 snapshot in ~18.9 ms if Slot 0 was evicted or is cold
-                if isinstance(data.get("tools"), list) and len(data["tools"]) >= 20 and not is_prewarm:
+                # Auto-restore Slot 0 snapshot in ~18.9-32 ms if Slot 0 was evicted or is cold
+                if (len(messages) <= 2 or _last_endpoint_was_chat or (isinstance(data.get("tools"), list) and len(data["tools"]) >= 20)) and not is_prewarm:
                     _ensure_slot0_restored(target_upstream)
+                    _last_endpoint_was_chat = False
 
 
 
@@ -1704,6 +1735,21 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 print(f"[Gateway] Error: {e}", flush=True)
                 target_upstream = UPSTREAM_BASE
                 harp_meta = None
+
+        if not self.path.startswith("/v1/messages"):
+            _last_endpoint_was_chat = True
+            if self.path.startswith("/v1/chat/completions") and body_bytes:
+                try:
+                    cdata = json.loads(body_bytes.decode("utf-8"))
+                    cmsgs = cdata.get("messages") or []
+                    if cmsgs and not any(m.get("role") == "system" for m in cmsgs):
+                        cmsgs.insert(0, {"role": "system", "content": "You are a helpful, accurate, and concise AI assistant."})
+                        cdata["messages"] = cmsgs
+                    cdata.setdefault("repeat_penalty", 1.05)
+                    cdata.setdefault("repeat_last_n", 64)
+                    body_bytes = json.dumps(cdata).encode("utf-8")
+                except Exception:
+                    pass
 
         self._forward_request("POST", body_bytes, active_mode=active_mode, target_upstream=target_upstream, harp_meta=harp_meta, tool_schemas=tool_schemas)
 
@@ -1783,12 +1829,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
                             return
                 else:
                     full_body = upstream.read()
-                    try:
-                        resp_json = json.loads(full_body.decode("utf-8"))
-                        resp_json = sanitize_non_streaming_response(resp_json, tool_schemas)
-                        full_body = json.dumps(resp_json).encode("utf-8")
-                    except Exception:
-                        pass
+                    if self.path.startswith("/v1/messages"):
+                        try:
+                            resp_json = json.loads(full_body.decode("utf-8"))
+                            resp_json = sanitize_non_streaming_response(resp_json, tool_schemas)
+                            full_body = json.dumps(resp_json).encode("utf-8")
+                        except Exception:
+                            pass
                     try:
                         self.wfile.write(full_body)
                         self.wfile.flush()

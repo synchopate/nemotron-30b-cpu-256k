@@ -557,6 +557,37 @@ Measured directly on `Qwen3-30B-A3B-Q4_K_M` (`17.28 GiB`) on the `Ryzen 9 9955HX
 
 ---
 
+### 3.12. Optimization 11: Fitting a `284.33B` Frontier MoE (`DeepSeek-V4-Flash`, `13.17B` Active) in `< 60 GiB` RAM at `256K` Context
+
+Scaling CPU inference from a `30B` MoE (`3.0B` active) to **`DeepSeek-V4-Flash` (`284.33B` total parameters, `45` layers, `256` routed experts + `1` shared expert per layer, `13.17B` active parameters, Multi-Head Latent Attention + Indexer Compressors)** on a **`64 GiB` DDR5 CPU node** introduces three new physical walls:
+1. **The `64 GiB` Physical RAM Cliff**: Even in `IQ2_XXS`, the 4-shard `DeepSeek-V4-Flash` checkpoint occupies **`76.87 GiB` (`82.54 GB`)** on disk, exceeding a `64 GiB` container/workstation before allocating a single byte of `256K` KV cache or compute buffers.
+2. **The 256-Expert SwiGLU Degradation Wall**: Naive uncalibrated `IQ1_S` (`1.5625 bpw`) quantization across all 256 routed experts collapses SwiGLU gating accuracy because high-norm activation channels in $W_{\text{gate}}^{(e)} \odot W_{\text{up}}^{(e)}$ are quantized with uniform MSE weight.
+3. **3D Multi-Head `wo_a` L1D Thrashing & MLA Sparse Gather Stalls**: DeepSeek-V4's 3D attention output projection (`wo_a`, `ne02 > 1`) overflows the `48 KB` Zen 5 L1D cache when tiled over `i01` (`TILE_I1 = 32`), and its sparse indexer attention mask (`csa_top_k_mask`) gathers non-contiguous historical latent rows from DDR5.
+
+We solve all three walls in [`patches/deepseek-v4-flash-fractal-256k.patch`](patches/deepseek-v4-flash-fractal-256k.patch), [`scripts/transcode_dsv4.c`](scripts/transcode_dsv4.c), and [`scripts/transcode_dsv4_shard.py`](scripts/transcode_dsv4_shard.py) (invoked via [`scripts/build_fractal_moe_gguf.sh --deepseek`](scripts/build_fractal_moe_gguf.sh)):
+
+#### 1. Analytical Second-Order `SwiGLU-H2` Importance Quantization + `Fractal-64` (`Q2_0`, `3.75 bpw`) MLA Transcoding (`76.87 GiB -> 56.56 GiB`)
+- **Closed-Form `SwiGLU-H2` Hessian Diagonal (`transcode_moe_exps` in [`scripts/transcode_dsv4.c`](scripts/transcode_dsv4.c))**:
+  For each expert $e \in \{0\dots 255\}$ and intermediate channel $j \in \{0\dots d_{\text{ff}}-1\}$, the SwiGLU output enters `ffn_down_exps` as $h_{e,j}(x) = \text{SiLU}(w_{\text{gate},e,j}^\top x) \cdot (w_{\text{up},e,j}^\top x)$. Under isotropic unit-variance input activations, the expected second moment of channel $j$—which scales the second-order quantization error of row $j$ in `ffn_down_exps`—is proportional to the product of the squared row norms of the paired Gate and Up slices:
+  $$I_{e,j} = \left\|W_{\text{gate}}^{(e)}[j,:]\right\|_2^2 \cdot \left\|W_{\text{up}}^{(e)}[j,:]\right\|_2^2$$
+  In `transcode_moe_exps()`, we dequantize the paired `ffn_gate_exps` and `ffn_up_exps` tensors simultaneously across OpenMP threads, compute $I_{e,j}$ analytically without requiring an external calibration dataset, and pass $I_{e,j}$ as the `quantize_row_iq1_s` importance vector. Sensitivity-anchored layers (`DOWN_IQ2_LAYERS = {0, 1, 26, 28, 41, 42}` in `IQ2_XXS`, `DOWN_IQ1M_LAYERS = {2, 4, 5, 8, 27, 30, 32, 40}` in `IQ1_M`, and `GATE_UP_KEEP_IQ2 = {1, 4, 26, 28, 40}` in `IQ2_XXS`) preserve critical early/late routing layers, while bulk routed expert layers compress cleanly to `IQ1_S` (`1.5625 bpw`).
+- **Block-64 `Fractal-64` (`Q2_0`, `3.75 bpw`) for Dense MLA & Indexer Tensors**:
+  All dense `Q8_0` (`8.50 bpw`) Multi-Head Latent Attention and Indexer Compressor projections (`attn_q_b`, `attn_output_a`, `attn_output_b`, `attn_compressor_gate`, `attn_compressor_kv`, `attn_kv`, `indexer_compressor_gate`, `indexer_compressor_kv`) are transcoded to `block_q2_0` (`30 bytes / 64 weights = 3.75 bpw`, `-55.9%` byte reduction), while keeping `attn_q_a`, shared experts (`_shexp`), and `output.weight` untouched. Total GGUF size drops from **`76.87 GiB` to `56.56 GiB` (`-20.31 GiB`)**, and live `VmRSS` at full `-c 262144` (`256K`) context is **`58.9 GiB` (`61,772 MB`)** inside a `64 GiB` container.
+
+#### 2. Single-Cycle AVX2 Variable-Shift `ggml_vec_dot_q2_0_q8_0_generic` (`+55%` Speed) & 3D L1D Tiling (`wo_a`)
+- **Single-Cycle Variable Bit-Shifts (`_mm256_sllv_epi32` / `_mm256_srlv_epi32`)**:
+  In `ggml/src/ggml-cpu/quants.c`, unpacking the 64 upper bits (`qh[8]`) and 8×4-bit shifted sub-scales (`scales[4]`) previously used scalar byte extraction. We replace both with vectorized AVX2 variable shifts (`_mm256_sllv_epi32(vqh_bcast, vshift)` and `_mm256_srlv_epi32(_mm256_set1_epi32(sc32), _mm256_setr_epi32(0,4,8,12,16,20,24,28))`) and fuse sub-block rescaling (`mult ∈ {4..19}`) directly into `_mm256_madd_epi16(p01, vmult01)` (`vpmaddwd`), cutting 10M-block `dot_q2_0_q8_0` execution time from `86.5 ms` to **`55.8 ms` (`+55%` faster)**.
+- **3D L1D Cache Tiling (`TILE_I0 = 64` in `ggml/src/ggml-cpu/ggml-cpu.c`)**:
+  When `ne02 > 1` (3D multi-head tensors such as `attn_output_a` / `wo_a`), `src1` is re-read for every `i02` head slice. Tiling over `i00` (`TILE_I0 = 64`) instead of `i01` keeps the `[ne00, 64]` weight/activation tile inside the `48 KB` Zen 5 L1D cache across all 32 threads.
+
+#### 3. MLA-Aware `HARPCache`, Sparse Top-K Lookahead Prefetching, & $O(1)$ `llama_kv_cache_dsv4` Speculative Rollback Fix
+- **MLA Latent Detection & 8-Step Sparse Indexer Lookahead (`ggml/src/ggml-cpu/ops.cpp`)**:
+  `HARPCache` automatically detects DeepSeek MLA compressed KV tensors (`ne11 == 576` K-pe/latent and `ne21 == 512` V-latent) with an auto-tuned `1024`-token hot L3 window (`LLAMA_KV_L3_WINDOW=1024`). Inside `ggml_compute_forward_flash_attn_ext_f16_one_chunk`, when `csa_top_k_mask` is active, the loop scans ahead to `ic_pf = i + 8` and issues `_mm_prefetch(k_data + ic_pf * nb11, _MM_HINT_T0)` and `_mm_prefetch(v_data + ic_pf * nb21, _MM_HINT_T0)` Whenever `csa_mask_col[ic_pf] > -INFINITY`, hiding non-contiguous DDR5 latency behind AVX-512 FMA compute.
+- **Exact Speculative State-Plane Rollback (`src/llama-kv-cache-dsv4.cpp`)**:
+  When speculative decoding rejects $R = \text{rollback} > 0$ tokens in the previous batch and drafts $D$ new tokens (`n_tokens > n_seq_tokens`), `dsv4_build_comp_plan` previously indexed `src_plane = (d - n_seq_tokens) * state_rows`, reading stale/overwritten snapshot planes and corrupting the recurrent compressor state (causing runaway babbling after speculative rejections), while `llama_kv_cache_dsv4::seq_rm` omitted trimming `kv_csa`, `kv_hca`, and `kv_lid`. Our patch restores exact plane indexing (`std::min(n_rs_seq, rollback + (d - n_seq_tokens)) * state_rows`) and synchronous sub-cache trimming, achieving **`94.5%` draft acceptance** (`9.67 tok/s` avg / `11.50–14.69 tok/s` peak) and **`32.6 ms` Slot 0 `/dev/shm` restore** (`2,940` prefix tokens via `MODCHIP_COMPACT_TOOLS=1`).
+
+---
+
 ## 4. Anatomy of a Single Token: Where the Milliseconds Go
 
 By profiling hardware performance counters (`perf stat -e dTLB-load-misses,L1-dcache-load-misses,instructions,cycles`) before and after the kernel & C++ interventions, every millisecond of single-token generation (`N=1`, non-speculative base step) can be accounted for:

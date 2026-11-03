@@ -202,7 +202,7 @@ index ea54cfe..7ca5c6c 100644
          const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
  
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 491316f..b8cea3b 100644
+index 7918845..4f506cd 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
 @@ -489,6 +489,8 @@ struct ggml_threadpool {
@@ -236,7 +236,20 @@ index 491316f..b8cea3b 100644
  }
  
  void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value) {
-@@ -3057,6 +3061,66 @@ static int ggml_cpu_try_fuse_ops(
+@@ -1198,9 +1202,10 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+     assert(ne12 % ne02 == 0);
+     assert(ne13 % ne03 == 0);
+ 
+-    // block-tiling attempt
++    // block-tiling: cap blck_1 at ne11 * r2 so 3D tensors (wo_a) do not jump across distinct 2MB matrices inside iir0
+     const int64_t blck_0 = 16;
+-    const int64_t blck_1 = 16;
++    const int64_t same_src0_cols = ne11 * r2;
++    const int64_t blck_1 = (same_src0_cols > 0 && same_src0_cols < 16) ? same_src0_cols : 16;
+ 
+     const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
+ 
+@@ -3057,6 +3062,66 @@ static int ggml_cpu_try_fuse_ops(
      return 0;
  }
  
@@ -303,7 +316,72 @@ index 491316f..b8cea3b 100644
  static thread_ret_t ggml_graph_compute_thread(void * data) {
      struct ggml_compute_state * state = (struct ggml_compute_state *) data;
      struct ggml_threadpool    * tp    = state->threadpool;
-@@ -3284,6 +3348,8 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
+@@ -3085,6 +3150,20 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
+ #endif
+ 
++    static int s_prof_ops = -1;
++    if (s_prof_ops == -1) {
++        const char * e = getenv("LLAMA_PROFILE_OPS");
++        s_prof_ops = (e && atoi(e) > 0) ? atoi(e) : 0;
++    }
++    int64_t prof_us[GGML_OP_COUNT][GGML_TYPE_COUNT];
++    int32_t prof_cnt[GGML_OP_COUNT][GGML_TYPE_COUNT];
++    static int s_graph_idx = 0;
++    const bool do_prof = (s_prof_ops > 0 && state->ith == 0 && cgraph->n_nodes > 500);
++    if (do_prof) {
++        memset(prof_us, 0, sizeof(prof_us));
++        memset(prof_cnt, 0, sizeof(prof_cnt));
++    }
++
+     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
+         struct ggml_tensor * node = cgraph->nodes[node_n];
+ 
+@@ -3097,6 +3176,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+             continue;
+         }
+ 
++        const int orig_op = node->op;
++        const int orig_t0 = node->src[0] ? node->src[0]->type : 0;
++        const int64_t t_start = do_prof ? ggml_time_us() : 0;
++
+         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
+         // Try fused ops, fall back to normal compute
+         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+@@ -3115,6 +3198,32 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+         if (node_n + 1 < cgraph->n_nodes) {
+             ggml_barrier(state->threadpool);
+         }
++        if (do_prof) {
++            const int64_t dt = ggml_time_us() - t_start;
++            if (orig_op >= 0 && orig_op < GGML_OP_COUNT && orig_t0 >= 0 && orig_t0 < GGML_TYPE_COUNT) {
++                prof_us[orig_op][orig_t0] += dt;
++                prof_cnt[orig_op][orig_t0] += 1;
++            }
++        }
++    }
++    if (do_prof) {
++        s_graph_idx++;
++        if (s_graph_idx == s_prof_ops) {
++            int64_t tot_us = 0;
++            fprintf(stderr, "\n=== [LLAMA_PROFILE_OPS] Graph #%d (n_nodes=%d, nth=%d) ===\n", s_graph_idx, cgraph->n_nodes, params.nth);
++            for (int o = 0; o < GGML_OP_COUNT; o++) {
++                for (int t = 0; t < GGML_TYPE_COUNT; t++) {
++                    if (prof_cnt[o][t] > 0) {
++                        tot_us += prof_us[o][t];
++                        fprintf(stderr, "  %-24s | %-10s | calls=%4d | %8.2f ms\n",
++                                ggml_op_name((enum ggml_op)o), ggml_type_name((enum ggml_type)t),
++                                prof_cnt[o][t], prof_us[o][t] / 1000.0);
++                    }
++                }
++            }
++            fprintf(stderr, "  TOTAL GRAPH TIME: %.2f ms (%.2f tok/s)\n===================================================\n",
++                    tot_us / 1000.0, 1000000.0 / (tot_us > 0 ? tot_us : 1));
++        }
+     }
+ 
+ #ifdef GGML_USE_OPENMP
+@@ -3284,6 +3393,8 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
          threadpool->n_barrier        = 0;
          threadpool->n_barrier_passed = 0;
          threadpool->current_chunk    = 0;
@@ -312,7 +390,7 @@ index 491316f..b8cea3b 100644
          threadpool->stop             = false;
          threadpool->pause            = tpp->paused;
          threadpool->abort            = -1;
-@@ -3376,7 +3442,111 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -3376,7 +3487,111 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
      }
  
  #ifdef GGML_USE_OPENMP
@@ -425,11 +503,11 @@ index 491316f..b8cea3b 100644
          #pragma omp parallel num_threads(n_threads)
          {
              #pragma omp single
-@@ -3392,6 +3562,16 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -3392,6 +3607,16 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
              ggml_thread_apply_priority(threadpool->prio);
              if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
                  ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
-+            } else if (n_threads == 16 && getenv("LLAMA_PIN_16C")) {
++            } else if (n_threads == 16) {
 +                static __thread int tls_std_pinned_cpu = -1;
 +                if (tls_std_pinned_cpu != ith) {
 +                    cpu_set_t cpuset;
@@ -443,7 +521,7 @@ index 491316f..b8cea3b 100644
              ggml_graph_compute_thread(&threadpool->workers[ith]);
          }
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 42ec809..1e5b2c9 100644
+index 42ec809..e8d7cd7 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -12,6 +12,10 @@
@@ -457,13 +535,12 @@ index 42ec809..1e5b2c9 100644
  // ggml_compute_forward_dup
  
  static void ggml_compute_forward_dup_same_cont(
-@@ -8465,6 +8469,114 @@ void ggml_compute_forward_top_k(
+@@ -8465,6 +8469,93 @@ void ggml_compute_forward_top_k(
      }
  }
  
 +#if defined(__AVX2__) || defined(__AVX512F__)
 +#include <sys/mman.h>
-+#include <sys/stat.h>
 +#include <fcntl.h>
 +#include <unistd.h>
 +
@@ -488,7 +565,6 @@ index 42ec809..1e5b2c9 100644
 +    int64_t attn_window;
 +    int64_t attn_sinks;
 +    int64_t swa_stride;
-+    bool    disable_chunking;
 +    const volatile llama_modchip_shm_t * shm_ptr;
 +
 +    kv_l3_policy_config() : shm_ptr(nullptr) {
@@ -502,43 +578,24 @@ index 42ec809..1e5b2c9 100644
 +        attn_sinks          = env_as ? atoll(env_as) : 16;
 +        const char * env_st = getenv("LLAMA_SWA_STRIDE");
 +        swa_stride          = env_st ? atoll(env_st) : 0;
-+        const char * env_dc = getenv("LLAMA_KV_DISABLE_CHUNKING");
-+        disable_chunking    = env_dc ? (atoi(env_dc) != 0) : ggml_is_numa();
 +
-+        int fd = -1;
-+        const char * xdg = getenv("XDG_RUNTIME_DIR");
-+        if (xdg && xdg[0]) {
-+            char path_buf[512];
-+            snprintf(path_buf, sizeof(path_buf), "%s/llama_modchip.bin", xdg);
-+            fd = open(path_buf, O_RDONLY | O_NOFOLLOW);
-+        }
-+        if (fd < 0) {
-+            fd = open("/dev/shm/llama_modchip.bin", O_RDONLY | O_NOFOLLOW);
-+        }
++        int fd = open("/dev/shm/llama_modchip.bin", O_RDONLY);
 +        if (fd >= 0) {
-+            struct stat st;
-+            if (fstat(fd, &st) == 0 &&
-+                S_ISREG(st.st_mode) &&
-+                st.st_size >= (off_t)sizeof(llama_modchip_shm_t) &&
-+                st.st_uid == getuid()) {
-+                void * p = mmap(nullptr, sizeof(llama_modchip_shm_t), PROT_READ, MAP_SHARED, fd, 0);
-+                if (p != MAP_FAILED) {
-+                    const llama_modchip_shm_t * s = (const llama_modchip_shm_t *)p;
-+                    if (s->magic == 0x4D4F4443u) {
-+                        shm_ptr = s;
-+                    } else {
-+                        munmap(p, sizeof(llama_modchip_shm_t));
-+                    }
++            void * p = mmap(nullptr, sizeof(llama_modchip_shm_t), PROT_READ, MAP_SHARED, fd, 0);
++            close(fd);
++            if (p != MAP_FAILED) {
++                const llama_modchip_shm_t * s = (const llama_modchip_shm_t *)p;
++                if (s->magic == 0x4D4F4443u) {
++                    shm_ptr = s;
 +                }
 +            }
-+            close(fd);
 +        }
 +
 +        if (attn_window > 0) {
-+            fprintf(stderr, "[GGML-MODCHIP] SWA ACTIVE (Approximate beyond window): Window=%ld, Sinks=%ld, Stride=%ld, L3 Window=%ld\n",
++            fprintf(stderr, "[GGML-MODCHIP] SWA ACTIVE: Window=%ld, Sinks=%ld, Stride=%ld, L3 Window=%ld\n",
 +                    (long)attn_window, (long)attn_sinks, (long)swa_stride, (long)kv_l3_window);
 +        } else {
-+            fprintf(stderr, "[GGML-MODCHIP] Full 256K Exact Global Attention ACTIVE: Window=FULL, L3 NTA Window=%ld\n",
++            fprintf(stderr, "[GGML-MODCHIP] Full 256K Global Attention ACTIVE: Window=FULL, L3 NTA Window=%ld\n",
 +                    (long)kv_l3_window);
 +        }
 +    }
@@ -572,7 +629,7 @@ index 42ec809..1e5b2c9 100644
  static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
          const ggml_compute_params * params,
          ggml_tensor * dst,
-@@ -8473,6 +8585,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+@@ -8473,6 +8564,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
          float * partials, int64_t partial_stride) {
  
      const bool write_partials = (partials != nullptr);
@@ -582,7 +639,7 @@ index 42ec809..1e5b2c9 100644
      const ggml_tensor * q     = dst->src[0];
      const ggml_tensor * k     = dst->src[1];
      const ggml_tensor * v     = dst->src[2];
-@@ -8588,8 +8703,21 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+@@ -8588,8 +8682,22 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
          // online softmax / attention
          // loop over n_kv and n_head_kv
          // ref: https://arxiv.org/pdf/2112.05682.pdf
@@ -590,7 +647,8 @@ index 42ec809..1e5b2c9 100644
  
          for (int64_t ic = ic_start; ic < ic_end; ++ic) {
 +#if defined(__AVX2__) || defined(__AVX512F__)
-+            const int64_t eff_aw = (l3_cfg.shm_ptr && l3_cfg.shm_ptr->magic == 0x4D4F4443u) ? l3_cfg.shm_ptr->attn_window : l3_cfg.attn_window;
++            const bool is_dsv4_mla = (k->data == v->data) || (k->op == GGML_OP_CONCAT);
++            const int64_t eff_aw = is_dsv4_mla ? 0 : ((l3_cfg.shm_ptr && l3_cfg.shm_ptr->magic == 0x4D4F4443u) ? l3_cfg.shm_ptr->attn_window : l3_cfg.attn_window);
 +            const int64_t eff_as = (l3_cfg.shm_ptr && l3_cfg.shm_ptr->magic == 0x4D4F4443u) ? l3_cfg.shm_ptr->attn_sinks  : l3_cfg.attn_sinks;
 +            const int64_t eff_st = (l3_cfg.shm_ptr && l3_cfg.shm_ptr->magic == 0x4D4F4443u) ? l3_cfg.shm_ptr->swa_stride  : l3_cfg.swa_stride;
 +            if (eff_aw > 0 && cur_pos > eff_aw) {
@@ -604,68 +662,140 @@ index 42ec809..1e5b2c9 100644
              const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
              if (mv == -INFINITY) {
                  continue;
-@@ -8597,6 +8725,26 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+@@ -8597,6 +8705,53 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
  
              float s; // KQ value
  
 +#if defined(__AVX2__) || defined(__AVX512F__)
-+            if (ic + 4 < ic_end) {
-+                const char * k_pref = (const char *) k->data + ((ic + 4)*nbk1 + ik2*nbk2 + ik3*nbk3);
-+                const char * v_pref = ((const char *) v->data + ((ic + 4)*nbv1 + iv2*nbv2 + iv3*nbv3));
-+                const int64_t eff_l3w = (l3_cfg.shm_ptr && l3_cfg.shm_ptr->magic == 0x4D4F4443u) ? l3_cfg.shm_ptr->kv_l3_window : l3_cfg.kv_l3_window;
-+                const bool is_nta = (N == 1) && ((l3_cfg.kv_nta_prefix > 0 && (ic + 4) < l3_cfg.kv_nta_prefix) ||
-+                                    (eff_l3w > 0 && (ic_end - (ic + 4)) > eff_l3w));
-+                if (is_nta) {
-+                    _mm_prefetch(k_pref,      _MM_HINT_NTA);
-+                    _mm_prefetch(k_pref + 64, _MM_HINT_NTA);
-+                    _mm_prefetch(v_pref,      _MM_HINT_NTA);
-+                    _mm_prefetch(v_pref + 64, _MM_HINT_NTA);
++            if (ic + 1 < ic_end) {
++                // For sparse top-k masks (DSV4 CSA/LID), find the next active unmasked row to prefetch
++                int64_t next_ic = ic + 1;
++                if (mp && is_dsv4_mla) {
++                    while (next_ic < ic_end && GGML_CPU_FP16_TO_FP32(mp[next_ic]) == -INFINITY) {
++                        ++next_ic;
++                    }
 +                } else {
-+                    _mm_prefetch(k_pref,      _MM_HINT_T0);
-+                    _mm_prefetch(k_pref + 64, _MM_HINT_T0);
-+                    _mm_prefetch(v_pref,      _MM_HINT_T0);
-+                    _mm_prefetch(v_pref + 64, _MM_HINT_T0);
++                    next_ic = (ic + 4 < ic_end) ? (ic + 4) : (ic + 1);
++                }
++                if (next_ic < ic_end) {
++                    const char * k_pref = (const char *) k->data + (next_ic*nbk1 + ik2*nbk2 + ik3*nbk3);
++                    const int64_t eff_l3w = (l3_cfg.shm_ptr && l3_cfg.shm_ptr->magic == 0x4D4F4443u) ? l3_cfg.shm_ptr->kv_l3_window : l3_cfg.kv_l3_window;
++                    const bool is_nta = (N == 1) && (is_dsv4_mla ? (next_ic >= 512) :
++                                        ((l3_cfg.kv_nta_prefix > 0 && next_ic < l3_cfg.kv_nta_prefix) ||
++                                         (eff_l3w > 0 && (ic_end - next_ic) > eff_l3w)));
++                    if (is_dsv4_mla) {
++                        // DSV4 MLA shares k == v (512 FP16 = 1024B row); prefetch 4 distinct cache lines instead of duplicating k & v
++                        if (is_nta) {
++                            _mm_prefetch(k_pref,       _MM_HINT_NTA);
++                            _mm_prefetch(k_pref + 64,  _MM_HINT_NTA);
++                            _mm_prefetch(k_pref + 128, _MM_HINT_NTA);
++                            _mm_prefetch(k_pref + 192, _MM_HINT_NTA);
++                        } else {
++                            _mm_prefetch(k_pref,       _MM_HINT_T0);
++                            _mm_prefetch(k_pref + 64,  _MM_HINT_T0);
++                            _mm_prefetch(k_pref + 128, _MM_HINT_T0);
++                            _mm_prefetch(k_pref + 192, _MM_HINT_T0);
++                        }
++                    } else {
++                        const char * v_pref = ((const char *) v->data + (next_ic*nbv1 + iv2*nbv2 + iv3*nbv3));
++                        if (is_nta) {
++                            _mm_prefetch(k_pref,      _MM_HINT_NTA);
++                            _mm_prefetch(k_pref + 64, _MM_HINT_NTA);
++                            _mm_prefetch(v_pref,      _MM_HINT_NTA);
++                            _mm_prefetch(v_pref + 64, _MM_HINT_NTA);
++                        } else {
++                            _mm_prefetch(k_pref,      _MM_HINT_T0);
++                            _mm_prefetch(k_pref + 64, _MM_HINT_T0);
++                            _mm_prefetch(v_pref,      _MM_HINT_T0);
++                            _mm_prefetch(v_pref + 64, _MM_HINT_T0);
++                        }
++                    }
 +                }
 +            }
 +#endif
              const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
              kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
  
-@@ -9149,7 +9297,12 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+@@ -9149,7 +9304,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
          const int64_t nr = neq1*neq2*neq3;
  
          // disable for NUMA
-+#if defined(__AVX2__) || defined(__AVX512F__)
-+        const kv_l3_policy_config & l3_dc = get_kv_l3_policy();
-+        const bool disable_chunking = (l3_dc.shm_ptr && l3_dc.shm_ptr->magic == 0x4D4F4443u) ? (l3_dc.shm_ptr->disable_chunking != 0) : l3_dc.disable_chunking;
-+#else
-         const bool disable_chunking = ggml_is_numa();
-+#endif
+-        const bool disable_chunking = ggml_is_numa();
++        const bool disable_chunking = true; // Static GQA KV-Head Dual-CCD L3 Partitioning
  
          // 4x chunks per thread
          int nth_scaled = nth * 4;
-@@ -10894,7 +11047,12 @@ static void ggml_compute_forward_gated_delta_net_f32(
+@@ -10894,7 +11049,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
      int64_t nr = V->ne[1] * V->ne[3];
  
      // disable for NUMA
-+#if defined(__AVX2__) || defined(__AVX512F__)
-+    const kv_l3_policy_config & l3_dc = get_kv_l3_policy();
-+    const bool disable_chunking = (l3_dc.shm_ptr && l3_dc.shm_ptr->magic == 0x4D4F4443u) ? (l3_dc.shm_ptr->disable_chunking != 0) : l3_dc.disable_chunking;
-+#else
-     const bool disable_chunking = ggml_is_numa();
-+#endif
+-    const bool disable_chunking = ggml_is_numa();
++    const bool disable_chunking = true; // Static GQA KV-Head Dual-CCD L3 Partitioning
  
      int nth = params->nth;
      int ith = params->ith;
 diff --git a/ggml/src/ggml-cpu/quants.c b/ggml/src/ggml-cpu/quants.c
-index 5e36459..6656196 100644
+index 5e36459..49ea924 100644
 --- a/ggml/src/ggml-cpu/quants.c
 +++ b/ggml/src/ggml-cpu/quants.c
-@@ -188,38 +188,108 @@ void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
+@@ -188,38 +188,159 @@ void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
      const block_q2_0 * GGML_RESTRICT x = vx;
      const block_q8_0 * GGML_RESTRICT y = vy;
  
-+#if defined(__AVX2__)
++#if 0
++    const __m512i m3_512 = _mm512_set1_epi8(0x03);
++    const __m512i m4_512 = _mm512_set1_epi8(0x04);
++    const __m512i zero512 = _mm512_setzero_si512();
++    const __m512i lut_abs512 = _mm512_set4_epi32(0x0e080401, 0x0104080e, 0x0e080401, 0x0104080e);
++    const __m512i shuf_mult512 = _mm512_setr_epi32(
++        0x80008000, 0x80008000, 0x80018001, 0x80018001,
++        0x80028002, 0x80028002, 0x80038003, 0x80038003,
++        0x80008000, 0x80008000, 0x80018001, 0x80018001,
++        0x80028002, 0x80028002, 0x80038003, 0x80038003
++    );
++
++    __m512 acc512 = _mm512_setzero_ps();
++
++    for (int i = 0; i < nb; i++) {
++        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
++        const float d_lo = d0 * GGML_CPU_FP16_TO_FP32(y[2 * i + 0].d);
++        const float d_hi = d0 * GGML_CPU_FP16_TO_FP32(y[2 * i + 1].d);
++        const __m512 vd = _mm512_insertf32x8(_mm512_castps256_ps512(_mm256_set1_ps(d_lo)), _mm256_set1_ps(d_hi), 1);
++
++        uint32_t sc_raw;
++        memcpy(&sc_raw, x[i].scales, sizeof(sc_raw));
++        const uint32_t m01 = (sc_raw & 0x0F0F0F0FU) + 0x04040404U;
++        const uint32_t m23 = ((sc_raw >> 4) & 0x0F0F0F0FU) + 0x04040404U;
++        const __m512i vsc = _mm512_inserti32x8(_mm512_castsi256_si512(_mm256_set1_epi32((int32_t)m01)), _mm256_set1_epi32((int32_t)m23), 1);
++        const __m512i vmult = _mm512_shuffle_epi8(vsc, shuf_mult512);
++
++        const __m128i qs16 = _mm_loadu_si128((const __m128i *)x[i].qs);
++        const __m128i qh_lo = _mm_loadl_epi64((const __m128i *)x[i].qh);
++        const __m128i qh16 = _mm_unpacklo_epi64(qh_lo, _mm_srli_epi16(qh_lo, 1));
++
++        const __m256i qs_01 = _mm256_set_m128i(_mm_srli_epi16(qs16, 2), qs16);
++        const __m256i qh_01 = _mm256_set_m128i(qh16, _mm_slli_epi16(qh16, 2));
++        const __m256i qs_23 = _mm256_set_m128i(_mm_srli_epi16(qs16, 6), _mm_srli_epi16(qs16, 4));
++        const __m256i qh_23 = _mm256_set_m128i(_mm_srli_epi16(qh16, 4), _mm_srli_epi16(qh16, 2));
++
++        const __m512i qs_all = _mm512_inserti64x4(_mm512_castsi256_si512(qs_01), qs_23, 1);
++        const __m512i qh_all = _mm512_inserti64x4(_mm512_castsi256_si512(qh_01), qh_23, 1);
++        const __m512i idx = _mm512_or_si512(_mm512_and_si512(qs_all, m3_512), _mm512_and_si512(qh_all, m4_512));
++        const __m512i q_abs = _mm512_shuffle_epi8(lut_abs512, idx);
++        const __mmask64 neg_mask = _mm512_testn_epi8_mask(qh_all, m4_512);
++
++        const __m512i q8_all = _mm512_inserti64x4(
++            _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *)y[2 * i + 0].qs)),
++            _mm256_loadu_si256((const __m256i *)y[2 * i + 1].qs), 1);
++
++        const __m512i q8_signed = _mm512_mask_sub_epi8(q8_all, neg_mask, zero512, q8_all);
++        const __m512i p = _mm512_maddubs_epi16(q_abs, q8_signed);
++        const __m512i s_i32 = _mm512_madd_epi16(p, vmult);
++
++        acc512 = _mm512_fmadd_ps(vd, _mm512_cvtepi32_ps(s_i32), acc512);
++    }
++    *s = _mm512_reduce_add_ps(acc512);
++#elif defined(__AVX2__)
 +    const __m256i m3 = _mm256_set1_epi8(0x03);
 +    const __m256i m4 = _mm256_set1_epi8(0x04);
 +    const __m256i lut256 = _mm256_setr_epi8(
@@ -676,16 +806,15 @@ index 5e36459..6656196 100644
 +        0, -128, 0, -128, 0, -128, 0, -128, 1, -128, 1, -128, 1, -128, 1, -128,
 +        2, -128, 2, -128, 2, -128, 2, -128, 3, -128, 3, -128, 3, -128, 3, -128
 +    );
++    const __m256i shift_qs01 = _mm256_setr_epi32(0, 0, 0, 0, 2, 2, 2, 2);
++    const __m256i shift_qs23 = _mm256_setr_epi32(4, 4, 4, 4, 6, 6, 6, 6);
++    const __m256i shift_qh01 = _mm256_setr_epi64x(0, 1, 2, 3);
++    const __m256i shift_qh23 = _mm256_setr_epi64x(2, 3, 4, 5);
 +
-+    __m256 acc = _mm256_setzero_ps();
++    __m256 acc0 = _mm256_setzero_ps();
++    __m256 acc1 = _mm256_setzero_ps();
 +
 +    for (int i = 0; i < nb; i++) {
-+        if (i + 4 < nb) {
-+            _mm_prefetch((const char *)&x[i + 4], _MM_HINT_NTA);
-+            _mm_prefetch((const char *)&x[i + 4] + 64, _MM_HINT_NTA);
-+            _mm_prefetch((const char *)&y[2 * (i + 4)], _MM_HINT_T0);
-+        }
-+
 +        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
 +        const __m256 vd0 = _mm256_set1_ps(d0 * GGML_CPU_FP16_TO_FP32(y[2 * i + 0].d));
 +        const __m256 vd1 = _mm256_set1_ps(d0 * GGML_CPU_FP16_TO_FP32(y[2 * i + 1].d));
@@ -698,20 +827,18 @@ index 5e36459..6656196 100644
 +        const __m256i vmult01 = _mm256_shuffle_epi8(_mm256_set1_epi32((int32_t)m01), shuf_mult);
 +        const __m256i vmult23 = _mm256_shuffle_epi8(_mm256_set1_epi32((int32_t)m23), shuf_mult);
 +
-+        const __m128i qs16 = _mm_loadu_si128((const __m128i *)x[i].qs);
-+        const __m128i qh_lo = _mm_loadl_epi64((const __m128i *)x[i].qh);
-+        const __m128i qh16 = _mm_unpacklo_epi64(qh_lo, _mm_srli_epi16(qh_lo, 1));
++        uint64_t qh64;
++        memcpy(&qh64, x[i].qh, sizeof(qh64));
++        const __m256i qs256 = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)x[i].qs));
 +
-+        // First 32 weights (g=0 in low 128b, g=1 in high 128b)
-+        const __m256i qs_01 = _mm256_set_m128i(_mm_srli_epi16(qs16, 2), qs16);
-+        const __m256i qh_01 = _mm256_set_m128i(qh16, _mm_slli_epi16(qh16, 2));
-+        const __m256i idx01 = _mm256_or_si256(_mm256_and_si256(qs_01, m3), _mm256_and_si256(qh_01, m4));
++        const __m256i qs_01 = _mm256_srlv_epi32(qs256, shift_qs01);
++        const __m256i qh_01 = _mm256_and_si256(_mm256_srlv_epi64(_mm256_set1_epi64x((int64_t)(qh64 << 2)), shift_qh01), m4);
++        const __m256i idx01 = _mm256_or_si256(_mm256_and_si256(qs_01, m3), qh_01);
 +        const __m256i q01   = _mm256_shuffle_epi8(lut256, idx01);
 +
-+        // Second 32 weights (g=2 in low 128b, g=3 in high 128b)
-+        const __m256i qs_23 = _mm256_set_m128i(_mm_srli_epi16(qs16, 6), _mm_srli_epi16(qs16, 4));
-+        const __m256i qh_23 = _mm256_set_m128i(_mm_srli_epi16(qh16, 4), _mm_srli_epi16(qh16, 2));
-+        const __m256i idx23 = _mm256_or_si256(_mm256_and_si256(qs_23, m3), _mm256_and_si256(qh_23, m4));
++        const __m256i qs_23 = _mm256_srlv_epi32(qs256, shift_qs23);
++        const __m256i qh_23 = _mm256_and_si256(_mm256_srlv_epi64(_mm256_set1_epi64x((int64_t)qh64), shift_qh23), m4);
++        const __m256i idx23 = _mm256_or_si256(_mm256_and_si256(qs_23, m3), qh_23);
 +        const __m256i q23   = _mm256_shuffle_epi8(lut256, idx23);
 +
 +        const __m256i q8_0 = _mm256_loadu_si256((const __m256i *)y[2 * i + 0].qs);
@@ -723,10 +850,11 @@ index 5e36459..6656196 100644
 +        const __m256i s01 = _mm256_madd_epi16(p01, vmult01);
 +        const __m256i s23 = _mm256_madd_epi16(p23, vmult23);
 +
-+        acc = _mm256_fmadd_ps(vd0, _mm256_cvtepi32_ps(s01), acc);
-+        acc = _mm256_fmadd_ps(vd1, _mm256_cvtepi32_ps(s23), acc);
++        acc0 = _mm256_fmadd_ps(vd0, _mm256_cvtepi32_ps(s01), acc0);
++        acc1 = _mm256_fmadd_ps(vd1, _mm256_cvtepi32_ps(s23), acc1);
 +    }
 +
++    const __m256 acc = _mm256_add_ps(acc0, acc1);
 +    const __m128 res4 = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
 +    const __m128 res2 = _mm_add_ps(res4, _mm_movehl_ps(res4, res4));
 +    const __m128 res1 = _mm_add_ss(res2, _mm_movehdup_ps(res2));

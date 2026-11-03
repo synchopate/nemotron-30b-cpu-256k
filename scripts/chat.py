@@ -8,6 +8,7 @@ and reports exact Prefill tok/s, Decode tok/s, TTFT, and Stockfish-PVS (M=7) dra
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -33,8 +34,17 @@ def detect_endpoint(explicit_url: Optional[str] = None) -> str:
     )
     if env_url:
         return env_url.rstrip("/")
-    for port in (8787, 8789, 8080, 8001):
-        url = f"http://127.0.0.1:{port}"
+    candidates = [f"http://127.0.0.1:{p}" for p in (8787, 8789, 8080, 8001)]
+    cfg_path = os.path.expanduser("~/.config/modchip/remote_url")
+    if os.path.isfile(cfg_path):
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg_url = f.readline().strip().rstrip("/")
+                if cfg_url:
+                    candidates.append(cfg_url)
+        except Exception:
+            pass
+    for url in candidates:
         try:
             req = urllib.request.Request(f"{url}/health", method="GET")
             with urllib.request.urlopen(req, timeout=0.6) as resp:
@@ -49,6 +59,37 @@ def detect_endpoint(explicit_url: Optional[str] = None) -> str:
             except Exception:
                 continue
     return "http://127.0.0.1:8787"
+
+
+def detect_active_model(base_url: str) -> Tuple[str, str, str]:
+    """Return (raw_model_id, display_description, prompt_label)."""
+    raw_id = "nemotron-30b"
+    try:
+        req = urllib.request.Request(f"{base_url}/v1/models", method="GET")
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            models = data.get("data") or data.get("models") or []
+            if models and isinstance(models[0], dict):
+                raw_id = models[0].get("id") or models[0].get("name") or raw_id
+    except Exception:
+        pass
+
+    base_name = os.path.basename(raw_id)
+    base_clean = re.sub(r"-0000\d-of-0000\d\.gguf$|\.gguf$", "", base_name, flags=re.IGNORECASE)
+    low = base_clean.lower()
+    if "deepseek" in low or "dsv4" in low:
+        if "fractal" in low:
+            display = f"{base_clean} (284B MoE / 13.2B Active · SwiGLU-H2 + Fractal-64 Q2_0)"
+        else:
+            display = f"{base_clean} (DeepSeek-V4-Flash Hybrid MLA + MoE)"
+        return raw_id, display, "DeepSeek-V4-Flash"
+    if "nemotron" in low:
+        if "fractal" in low:
+            display = f"{base_clean} (30B MoE / 3B Active · Fractal-64 Q2_0)"
+        else:
+            display = f"{base_clean} (30B Mamba-2 + MoE Hybrid)"
+        return raw_id, display, "Nemotron-30B"
+    return raw_id, base_clean or raw_id, base_clean or "Assistant"
 
 
 def get_host_summary() -> Tuple[str, str, str]:
@@ -89,6 +130,8 @@ def stream_chat_turn(
         "messages": messages,
         "stream": True,
         "temperature": 0.0,
+        "repeat_penalty": 1.05,
+        "repeat_last_n": 64,
         "max_tokens": max_tokens,
         "reasoning_budget": think_budget,
         "chat_template_kwargs": {"enable_thinking": think_budget != 0},
@@ -231,10 +274,12 @@ class HARPCacheRing:
 
 def run_benchmark_suite(base_url: str) -> None:
     cpu, ram, hp = get_host_summary()
+    raw_model, model_display, _ = detect_active_model(base_url)
     print(f"\n{BOLD}{CYAN}╔════════════════════════════════════════════════════════════════════════════════════╗{RESET}")
-    print(f"{BOLD}{CYAN}║ ♟️  llama-modchip v2.1 — Automated 3-Stage CPU Benchmark Suite                      ║{RESET}")
+    print(f"{BOLD}{CYAN}║ ♟️  llama-modchip v2.1 — Automated 2-Stage CPU Benchmark Suite                      ║{RESET}")
     print(f"{BOLD}{CYAN}╚════════════════════════════════════════════════════════════════════════════════════╝{RESET}")
     print(f"  • Hardware : {BOLD}{cpu}{RESET} ({ram} RAM | 2MB THP: {hp})")
+    print(f"  • Model    : {BOLD}{GREEN}{model_display}{RESET}")
     print(f"  • Endpoint : {CYAN}{base_url}{RESET}\n")
 
     # Stage 1: New Code Generation
@@ -249,8 +294,8 @@ def run_benchmark_suite(base_url: str) -> None:
     s1 = stream_chat_turn(base_url, msgs1, max_tokens=250, think_budget=0, quiet=False)
     print_turn_telemetry(s1)
 
-    # Stage 2: In-Context Code Refactoring (Stockfish-PVS M=7 Burst)
-    print(f"\n{BOLD}[2/2] Stage 2: In-Context Code Refactoring — Stockfish-PVS (M=7) Burst (350 tokens)...{RESET}")
+    # Stage 2: In-Context Code Refactoring (Stockfish-PVS Burst)
+    print(f"\n{BOLD}[2/2] Stage 2: In-Context Code Refactoring — Stockfish-PVS Burst (350 tokens)...{RESET}")
     msgs2 = [
         {"role": "system", "content": "You are an expert Python systems engineer. Output the refactored class directly."},
         {
@@ -272,17 +317,25 @@ def run_benchmark_suite(base_url: str) -> None:
     print(f"{BOLD}{GREEN}║ 🚀 LLAMA-MODCHIP v2.1 BENCHMARK SCORECARD (Copy & Share on GitHub / Reddit / X!)   ║{RESET}")
     print(f"{BOLD}{GREEN}╠════════════════════════════════════════════════════════════════════════════════════╣{RESET}")
     print(f"  Hardware            : {cpu} ({ram} RAM, 2MB THP: {hp})")
+    print(f"  Active Model        : {model_display}")
     print(f"  Prompt Prefill      : {pp_best:.2f} tok/s")
     print(f"  Decode (New C++20)  : {s1['dec_tps']:.2f} tok/s (TTFT: {s1['ttft_ms']:.0f} ms)")
-    print(f"  Decode (Refactor)   : {s2['dec_tps']:.2f} tok/s (Stockfish-PVS M=7 Acceptance: {s2_spec})")
+    print(f"  Decode (Refactor)   : {s2['dec_tps']:.2f} tok/s (Stockfish-PVS Acceptance: {s2_spec})")
     print(f"{BOLD}{GREEN}╚════════════════════════════════════════════════════════════════════════════════════╝{RESET}")
     print(f"👉 Share your CPU scorecard: {CYAN}https://github.com/synchopate/llama-modchip/issues/new?template=benchmark.yml{RESET}\n")
 
 
+DEFAULT_CHAT_SYSTEM_PROMPT = "You are a helpful, accurate, and concise AI assistant."
+
+
 def run_interactive_chat(base_url: str, one_shot_prompt: Optional[str] = None) -> None:
     cpu, ram, hp = get_host_summary()
+    raw_model, model_display, prompt_label = detect_active_model(base_url)
     if one_shot_prompt:
-        msgs = [{"role": "user", "content": one_shot_prompt}]
+        msgs = [
+            {"role": "system", "content": DEFAULT_CHAT_SYSTEM_PROMPT},
+            {"role": "user", "content": one_shot_prompt},
+        ]
         stats = stream_chat_turn(base_url, msgs, max_tokens=512, think_budget=0, quiet=False)
         print_turn_telemetry(stats)
         return
@@ -291,10 +344,13 @@ def run_interactive_chat(base_url: str, one_shot_prompt: Optional[str] = None) -
     print(f"{BOLD}{CYAN}║ ♟️  llama-modchip v2.1 — Interactive CPU Chat + Live Stockfish-PVS Telemetry        ║{RESET}")
     print(f"{BOLD}{CYAN}╚════════════════════════════════════════════════════════════════════════════════════╝{RESET}")
     print(f"  • Hardware : {BOLD}{cpu}{RESET} ({ram} RAM | 2MB THP: {hp})")
-    print(f"  • Endpoint : {CYAN}{base_url}{RESET} (Web HUD also live at {CYAN}{base_url}{RESET})")
-    print(f"  • Commands : {YELLOW}/bench{RESET} (run 2-stage speed test) │ {YELLOW}/think no|med|max{RESET} │ {YELLOW}/reset{RESET} │ {YELLOW}/exit{RESET}\n")
+    print(f"  • Model    : {BOLD}{GREEN}{model_display}{RESET}")
+    print(f"  • Endpoint : {CYAN}{base_url}{RESET}")
+    print(f"  • Commands : {YELLOW}/bench{RESET} │ {YELLOW}/think no|med|max{RESET} │ {YELLOW}/model{RESET} │ {YELLOW}/reset{RESET} │ {YELLOW}/exit{RESET}\n")
 
-    messages: List[Dict[str, str]] = []
+    messages: List[Dict[str, str]] = [
+        {"role": "system", "content": DEFAULT_CHAT_SYSTEM_PROMPT}
+    ]
     think_budget = 0
 
     while True:
@@ -310,7 +366,12 @@ def run_interactive_chat(base_url: str, one_shot_prompt: Optional[str] = None) -
             break
         if user_in.lower() in ("/reset", "/clear"):
             messages.clear()
+            messages.append({"role": "system", "content": DEFAULT_CHAT_SYSTEM_PROMPT})
             print(f"{DIM}[Context cleared]{RESET}\n")
+            continue
+        if user_in.lower() in ("/model", "/status"):
+            raw_model, model_display, prompt_label = detect_active_model(base_url)
+            print(f"{DIM}[Active Model: {model_display} | Raw: {raw_model} | Endpoint: {base_url}]{RESET}\n")
             continue
         if user_in.lower() == "/bench":
             run_benchmark_suite(base_url)
@@ -323,7 +384,7 @@ def run_interactive_chat(base_url: str, one_shot_prompt: Optional[str] = None) -
             continue
 
         messages.append({"role": "user", "content": user_in})
-        sys.stdout.write(f"\n{BOLD}{CYAN}Nemotron > {RESET}")
+        sys.stdout.write(f"\n{BOLD}{CYAN}{prompt_label} > {RESET}")
         sys.stdout.flush()
         try:
             stats = stream_chat_turn(base_url, messages, max_tokens=1024, think_budget=think_budget, quiet=False)

@@ -44,6 +44,34 @@ sys.exit(0 if rc == 0 else 1)
 PYEOF
 }
 
+is_url_up() {
+    local url="${1%/}"
+    curl -sf --max-time 1 "${url}/health" >/dev/null 2>&1 || curl -sf --max-time 1 "${url}/v1/models" >/dev/null 2>&1
+}
+
+find_any_active_endpoint() {
+    local cand_url="${MODCHIP_URL:-${LLAMA_API_URL:-}}"
+    if [[ -n "$cand_url" ]] && is_url_up "$cand_url"; then
+        echo "${cand_url%/}"
+        return 0
+    fi
+    for p in "$GATEWAY_PORT" "$SERVER_PORT" 8080 8001; do
+        if is_port_up "$p"; then
+            echo "http://127.0.0.1:${p}"
+            return 0
+        fi
+    done
+    if [[ -f "${HOME}/.config/modchip/remote_url" ]]; then
+        local cfg_url
+        cfg_url="$(head -n 1 "${HOME}/.config/modchip/remote_url" | tr -d '[:space:]')"
+        if [[ -n "$cfg_url" ]] && is_url_up "$cfg_url"; then
+            echo "${cfg_url%/}"
+            return 0
+        fi
+    fi
+    return 1
+}
+
 find_any_active_port() {
     for p in "$GATEWAY_PORT" "$SERVER_PORT" 8080 8001; do
         if is_port_up "$p"; then
@@ -150,8 +178,14 @@ cmd_stop() {
 cmd_status() {
     python3 "${REPO_ROOT}/scripts/check_cpu_readiness.py"
     echo ""
-    if p="$(find_any_active_port)"; then
-        echo -e "${GREEN}${BOLD}[ONLINE]${RESET} Active inference endpoint detected on ${CYAN}http://127.0.0.1:${p}${RESET}"
+    local ep
+    if ep="$(find_any_active_endpoint)"; then
+        echo -e "${GREEN}${BOLD}[ONLINE]${RESET} Active inference endpoint detected on ${CYAN}${ep}${RESET}"
+        local active_model
+        active_model="$(curl -sf --max-time 1 "${ep}/v1/models" 2>/dev/null | python3 -c 'import sys,json; d=json.load(sys.stdin); m=(d.get("data") or d.get("models") or [{}])[0]; print(m.get("id") or m.get("name") or "")' 2>/dev/null || true)"
+        if [[ -n "$active_model" ]]; then
+            echo -e "${GREEN}${BOLD}[MODEL]${RESET}  ${BOLD}${active_model}${RESET}"
+        fi
         if is_port_up "$GATEWAY_PORT"; then
             echo -e "${GREEN}${BOLD}[WEB UI]${RESET} Live Web Chat & Telemetry HUD: ${CYAN}http://127.0.0.1:${GATEWAY_PORT}${RESET}"
         fi
@@ -161,7 +195,7 @@ cmd_status() {
 }
 
 ensure_ready_and_running() {
-    if find_any_active_port >/dev/null; then
+    if find_any_active_endpoint >/dev/null; then
         return 0
     fi
     if [[ "$(uname -s)" == "Darwin" ]]; then
@@ -180,9 +214,10 @@ ensure_ready_and_running() {
 }
 
 cmd_web() {
-    local url="http://127.0.0.1:${GATEWAY_PORT}"
-    if ! is_port_up "$GATEWAY_PORT"; then
+    local url
+    if ! url="$(find_any_active_endpoint)"; then
         ensure_ready_and_running "$@"
+        url="http://127.0.0.1:${GATEWAY_PORT}"
     fi
     echo -e "${GREEN}[*] Opening Live Web Chat & Telemetry HUD at ${CYAN}${url}${RESET}"
     if command -v xdg-open >/dev/null 2>&1; then
@@ -212,10 +247,12 @@ cmd_quantize() {
 }
 
 cmd_claude() {
-    if ! is_port_up "$GATEWAY_PORT"; then
+    local ep
+    if ! ep="$(find_any_active_endpoint)"; then
         ensure_ready_and_running
+        ep="http://127.0.0.1:${GATEWAY_PORT}"
     fi
-    export ANTHROPIC_BASE_URL="http://127.0.0.1:${GATEWAY_PORT}"
+    export ANTHROPIC_BASE_URL="${ep}"
     echo -e "${GREEN}[*] Launching Claude Code wired to ${CYAN}${ANTHROPIC_BASE_URL}${RESET}..."
     exec claude "$@"
 }

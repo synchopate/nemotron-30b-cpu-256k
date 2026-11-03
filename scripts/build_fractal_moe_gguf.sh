@@ -34,6 +34,7 @@ set -euo pipefail
 usage() {
     cat <<'EOF'
 Usage:
+  # 1. Nemotron-3.5-30B-A3B (17.59 GiB -> 14.35 GiB Fractal-64 or 15.95 GiB MXFP4):
   ./scripts/build_fractal_moe_gguf.sh \
     --input /path/to/input-model.gguf \
     --output /path/to/output-fractal-moe.gguf \
@@ -43,48 +44,92 @@ Usage:
     [--threads 16] \
     [--dry-run]
 
+  # 2. DeepSeek-V4-Flash-0731 (284.33B MoE: 76.87 GiB -> 56.56 GiB SwiGLU-H2 + Fractal-64):
+  ./scripts/build_fractal_moe_gguf.sh \
+    --deepseek \
+    --input /path/to/DeepSeek-V4-Flash-0731-UD-IQ1_S-00001-of-00003.gguf \
+    --output /path/to/DeepSeek-V4-Flash-0731-Fractal-00001-of-00003.gguf \
+    [--llama-build-dir /path/to/llama.cpp/build]
+
 Profiles:
-  fractal64 (Recommended when starting from BF16/F16) Routed experts (ffn_up_exps &
+  fractal64 (Recommended for Nemotron-3.5-30B-A3B from BF16/F16) Routed experts (ffn_up_exps &
             ffn_down_exps across all 46 MoE layers) -> Block-64 2-Level Fractal (q2_0,
             30 bytes / 64 weights = 3.75 bpw, 8x8 sub-blocks with 4-bit shifted sub-scales
             {4..19} fused into vpmaddwd and dyadic codebook {-14,-8,-4,-1,1,4,8,14});
             Mamba-2 ssm_out, 6 GQA Attention & Output head -> Q8_0; ssm_in & shared
             experts -> Q4_0.
             Output size: 14.35 GiB (14,698 MiB, -3.24 GiB vs Q4_0) with 100/100 Quality Gate.
-  mxfp4     (Default when re-quantizing from Q4_0) Routed experts -> Dyadic MXFP4 (4.25 bpw);
+  mxfp4     (Default when re-quantizing Nemotron from Q4_0) Routed experts -> Dyadic MXFP4 (4.25 bpw);
             SSM & shared experts -> Q4_0; 6 GQA Attention & Output head -> Q8_0.
             Output size: 15.95 GiB (16,328 MiB, -1.65 GiB vs Q4_0) with 100/100 Quality Gate.
   mxfp4_q5  Routed experts -> Dyadic MXFP4 (4.25 bpw); SSM & shared experts -> Q5_0;
             6 GQA Attention & Output head -> Q8_0.
             Output size: 16.10 GiB (16,489 MiB).
+  deepseek  (--deepseek) Multi-shard C/OpenMP transcoder for DeepSeek-V4-Flash-0731 (284.33B total /
+            13.17B active): applies Block-64 2-Level Fractal (q2_0, 3.75 bpw) to MLA/CSA/HCA
+            attention & compressor matrices and SwiGLU-H2 analytical Hessian importance weighting
+            I_{e,j} = ||W_gate[j,:]||^2 * ||W_up[j,:]||^2 across the 256 routed experts.
+            Shrinks all 3 shards from 76.87 GiB -> 56.56 GiB (-20.31 GiB) to fit in <= 60 GiB RAM at 256K.
 EOF
     exit 1
 }
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INPUT_GGUF=""
 OUTPUT_GGUF=""
 QUANTIZE_BIN=""
+LLAMA_BUILD_DIR=""
 IMATRIX_FILE=""
 PROFILE="fractal64"
+DEEPSEEK_MODE=0
 THREADS="$(nproc 2>/dev/null || echo 8)"
 DRY_RUN=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --input|-i)        INPUT_GGUF="$2"; shift 2 ;;
-        --output|-o)       OUTPUT_GGUF="$2"; shift 2 ;;
-        --quantize-bin|-b) QUANTIZE_BIN="$2"; shift 2 ;;
-        --imatrix|-m)      IMATRIX_FILE="$2"; shift 2 ;;
-        --profile|-p)      PROFILE="$2"; shift 2 ;;
-        --threads|-t)      THREADS="$2"; shift 2 ;;
-        --dry-run)         DRY_RUN=1; shift 1 ;;
-        --help|-h)         usage ;;
+        --input|-i)          INPUT_GGUF="$2"; shift 2 ;;
+        --output|-o)         OUTPUT_GGUF="$2"; shift 2 ;;
+        --quantize-bin|-b)   QUANTIZE_BIN="$2"; shift 2 ;;
+        --llama-build-dir)   LLAMA_BUILD_DIR="$2"; shift 2 ;;
+        --imatrix|-m)        IMATRIX_FILE="$2"; shift 2 ;;
+        --profile|-p)        PROFILE="$2"; [[ "$2" == "deepseek" ]] && DEEPSEEK_MODE=1; shift 2 ;;
+        --deepseek)          DEEPSEEK_MODE=1; PROFILE="deepseek"; shift 1 ;;
+        --threads|-t)        THREADS="$2"; shift 2 ;;
+        --dry-run)           DRY_RUN=1; shift 1 ;;
+        --help|-h)           usage ;;
         *) echo "Unknown argument: $1"; usage ;;
     esac
 done
 
 [[ -z "$INPUT_GGUF" || -z "$OUTPUT_GGUF" ]] && usage
 [[ ! -f "$INPUT_GGUF" ]] && { echo "ERROR: Input GGUF not found: $INPUT_GGUF" >&2; exit 1; }
+
+if [[ "$DEEPSEEK_MODE" -eq 1 ]]; then
+    SO_PATH="${SCRIPT_DIR}/libtranscode_dsv4.so"
+    if [[ ! -f "$SO_PATH" ]]; then
+        for cand_dir in \
+            "$LLAMA_BUILD_DIR" \
+            "${SCRIPT_DIR}/../workspace/llama.cpp/build" \
+            "${SCRIPT_DIR}/../llama.cpp/build" \
+            "${HOME}/llama.cpp/build"; do
+            if [[ -n "$cand_dir" && -d "${cand_dir}/bin" ]]; then
+                LLAMA_BUILD_DIR="$cand_dir"
+                break
+            fi
+        done
+        [[ -z "$LLAMA_BUILD_DIR" ]] && {
+            echo "ERROR: Could not locate llama.cpp build/bin directory to link libtranscode_dsv4.so. Pass --llama-build-dir /path/to/llama.cpp/build" >&2
+            exit 1
+        }
+        echo "[*] Compiling C/OpenMP SwiGLU-H2 + Fractal-64 transcoder (${SO_PATH})..."
+        gcc -O3 -march=native -fopenmp -shared -fPIC "${SCRIPT_DIR}/transcode_dsv4.c" \
+            -L"${LLAMA_BUILD_DIR}/bin" -lggml -lggml-cpu -lggml-base \
+            -Wl,-rpath,"${LLAMA_BUILD_DIR}/bin" -lm -o "$SO_PATH"
+    fi
+    export LIBTRANSCODE_DSV4_SO="$SO_PATH"
+    echo "[*] Running DeepSeek-V4-Flash SwiGLU-H2 + Fractal-64 shard transcoder..."
+    exec python3 "${SCRIPT_DIR}/transcode_dsv4_shard.py" "$INPUT_GGUF" "$OUTPUT_GGUF"
+fi
 
 if [[ -z "$QUANTIZE_BIN" ]]; then
     for cand in \

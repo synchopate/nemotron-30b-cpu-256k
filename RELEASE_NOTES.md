@@ -1,6 +1,35 @@
-# Release Notes — `llama-modchip` (`v2.2.0`)
+# Release Notes — `llama-modchip` (`v2.3.0`)
 
 > 📄 **Quick Links:** [Overview (`README.md`)](README.md) · [Technical Paper (`ARCHITECTURE.md`)](ARCHITECTURE.md) · [Fractal-MoE Quality Gate (`benchmarks/FRACTAL_MOE_QUALITY_GATE.md`)](benchmarks/FRACTAL_MOE_QUALITY_GATE.md) · [96+ `RouteCrack + Stockfish-PVS` Techniques (`speculative/ROUTECRACK_TECHNIQUES.md`)](speculative/ROUTECRACK_TECHNIQUES.md) · [Engineering FAQ (`FAQ.md`)](FAQ.md)
+
+---
+
+## 🐋 `v2.3.0` — `DeepSeek-V4-Flash 284B` in `< 60 GiB` RAM at `256K` Context (`56.56 GiB` `SwiGLU-H2 + Fractal-64`), Single-Cycle AVX2 `Q2_0` Kernels (`+55%`), & Community Leaderboard (`111.62 tok/s` Threadripper, `44.97 tok/s` AWS Graviton3 ARM64, `66.5 tok/s` AMD Vulkan)
+
+**Release Date:** November 2026  
+**Highlights:**
+1. **World's First Engine to Run a `284.33B` Frontier MoE (`DeepSeek-V4-Flash`, `13.17B` Active) Inside `< 60 GiB` RAM at `256K` Context on a 64 GB CPU Box**:
+   - **Analytical Second-Order `SwiGLU-H2` MoE Compression + `Fractal-64` (`Q2_0`, `3.75 bpw`) MLA Transcoding ([`scripts/transcode_dsv4.c`](scripts/transcode_dsv4.c), [`scripts/transcode_dsv4_shard.py`](scripts/transcode_dsv4_shard.py), [`scripts/build_fractal_moe_gguf.sh --deepseek`](scripts/build_fractal_moe_gguf.sh))**: Shrinks `DeepSeek-V4-Flash-0731` (`45` layers, `256` routed + `1` shared expert/layer, MLA + Indexer Compressors) from `76.87 GiB` (`IQ2_XXS`, which OOMs on `64 GB` RAM) down to **`56.56 GiB` (`-20.31 GiB`)** on disk and **`58.9 GiB` total `VmRSS`** at full **`-c 262144` (`256K`) context**.
+   - Computes closed-form second-order SwiGLU Hessian importance weights $I_{e,j} = \|W_{\text{gate}}^{(e)}[j,:]\|_2^2 \cdot \|W_{\text{up}}^{(e)}[j,:]\|_2^2$ directly from the paired Gate and Up expert slices while transcoding dense `Q8_0` MLA & Indexer projections (`attn_q_b`, `attn_output_a`, `attn_output_b`, `attn_compressor_gate`, `attn_compressor_kv`, `attn_kv`, `indexer_compressor_gate`, `indexer_compressor_kv`) to Block-64 `Fractal-64` (`Q2_0`, `3.75 bpw`).
+2. **Single-Cycle AVX2 Variable-Shift `dot_q2_0_q8_0` (`+55%` Speedup) & 3D L1D Tiling (`wo_a`)**:
+   - Vectorizes 64-bit upper bit-plane unpacking (`qh[8]`) and 8×4-bit shifted sub-scales (`scales[4]`) in `ggml_vec_dot_q2_0_q8_0_generic` (`ggml/src/ggml-cpu/quants.c`) using single-cycle AVX2 variable bit-shifts (`_mm256_sllv_epi32` / `_mm256_srlv_epi32`) fused into `_mm256_madd_epi16(p01, vmult01)` (`vpmaddwd`), cutting 10M-block `Q2_0 × Q8_0` runtime from `86.5 ms` to **`55.8 ms` (`+55%` faster)**.
+   - Adds **3D L1D Cache Tiling (`TILE_I0 = 64`)** in `ggml_compute_forward_mul_mat` (`ggml/src/ggml-cpu/ggml-cpu.c`) for 3D multi-head tensors (`ne02 > 1`, `wo_a`), keeping `[ne00, 64]` slices inside the `48 KB` Zen 5 L1D cache across all 32 threads.
+3. **MLA-Aware `HARPCache`, 8-Step Sparse Indexer Lookahead Prefetching, & $O(1)$ `llama_kv_cache_dsv4` Speculative Rollback Fix ([`patches/deepseek-v4-flash-fractal-256k.patch`](patches/deepseek-v4-flash-fractal-256k.patch))**:
+   - Auto-detects DeepSeek MLA compressed KV tensors (`ne11 == 576`, `ne21 == 512`, `LLAMA_KV_L3_WINDOW=1024`) for `_MM_HINT_NTA` L3 isolation and prefetches (`_mm_prefetch(..., _MM_HINT_T0)`) sparse `csa_top_k_mask` rows `8` steps ahead (`ic_pf = i + 8`).
+   - Fixes `state_snapshot` plane indexing (`std::min(n_rs_seq, rollback + (d - n_seq_tokens)) * state_rows`) and `kv_csa/hca/lid->seq_rm` in `src/llama-kv-cache-dsv4.cpp`, achieving **`94.5%` draft acceptance** (`9.67 tok/s` avg / `11.50–14.69 tok/s` peak) and clean EOS termination on both `./modchip chat` and `./modchip claude` (`Claude Code`).
+4. **Unified `./modchip chat` + `Claude Code` Compact Tool Snapshot (`32.6 ms` Slot 0 Restore)**:
+   - Updates [`modchip`](modchip), [`scripts/chat.py`](scripts/chat.py), and [`gateway/sse_gateway.py`](gateway/sse_gateway.py) with automatic active-model detection (`/v1/models`), `MODCHIP_COMPACT_TOOLS=1` (`2,940` prefix tokens, `32.6 ms` `/dev/shm` restore), and automatic Slot 0 restoration (`_last_endpoint_was_chat`) when switching between `./modchip chat` and `Claude Code`.
+5. **New Community CPU & Hybrid Benchmarks ([`README.md`](README.md), [`FAQ.md`](FAQ.md))**:
+   - **AMD Threadripper PRO 7985WX (`64C/128T Zen 4`, `256 MB` L3, 8-Ch DDR5-6000)** by `@aifartist` ([Issue #1](https://github.com/synchopate/llama-modchip/issues/1#issuecomment-6595559921)): Full thread-scaling sweep (`16/24/32/48/64` threads) + **`111.62 tok/s` warm decode** (`80.14 tok/s` cold, `386.00 tok/s` prefill at `-t 32` 4C/CCD).
+   - **AWS Graviton3 `m7g.2xlarge` (`8 vCPU ARM64 Neoverse-V1`, `32 MB` L3, `31 GB` DDR5)** by `@gerchik` ([Issue #2](https://github.com/synchopate/llama-modchip/issues/2)): **`44.97 tok/s` refactoring** / **`41.05 tok/s` C++20** (`101.67 tok/s` prefill).
+   - **AMD Ryzen 9 7945HX3D + Radeon RX 9070 XT 16GB (`Vulkan/RADV` Hybrid)** ([`FAQ.md` Q8](FAQ.md)): **`66.50 tok/s` decode** / **`563.00 tok/s` prefill** at `256K` context via tensor-role offloading (`-ngl 99 --n-cpu-moe 30 --no-mmap`).
+
+| Thread Scaling & Warm Promotion on `Threadripper PRO 7985WX` (`@aifartist`, [Issue #1](https://github.com/synchopate/llama-modchip/issues/1#issuecomment-6595559921)) | `-t 16` (`2C/CCD`) | `-t 24` (`3C/CCD`) | **`-t 32` (`4C/CCD` Sweet Spot)** | `-t 48` (`6C/CCD`) | `-t 64` (`8C/CCD`) |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Prefill (`tok/s`)** | `238.12` | `314.85` | **`386.00 tok/s`** | `361.40` | `312.18` |
+| **Stage 1: Cold C++20 Generation (`tok/s`)** | `58.40` | `68.92` | **`73.84 tok/s`** | `64.15` | `51.80` |
+| **Stage 2: Cold In-Context Refactoring (`tok/s`)** | `62.10` | `74.50` | **`80.14 tok/s`** | `69.30` | `55.42` |
+| **Stage 2: Warm Session Trie + `b5` Promotion (Run 4+)** | — | — | **`111.62 tok/s`** *(+39.3%)* | — | — |
 
 ---
 
@@ -88,7 +117,7 @@ During the `RouteCrack` research campaign (**96+ techniques** documented in **[`
 
 Integrated community contributions from **Oleksandr Nazar (`@jarorosFork`)** (`commits 9509f4c, 93b6381, d740063 -> 6694b0b`):
 - **[`apple-silicon/`](apple-silicon/README.md) — Apple Silicon (`M4 Pro 24 GB` Unified Memory) Metal Stack**:
-  - Dedicated setup & benchmark scripts ([`apple-silicon/setup.sh`](apple-silicon/setup.sh), [`apple-silicon/run-server.sh`](apple-silicon/run-server.sh), [`apple-silicon/run-gateway.sh`](apple-silicon/run-gateway.sh), [`apple-silicon/bench.sh`](apple-silicon/bench.sh), [`apple-silicon/bench_spec.sh`](apple-silicon/bench_spec.sh), [`apple-silicon/bench_server.py`](apple-silicon/bench_server.py), [`apple-silicon/agent_loop_test.py`](apple-silicon/agent_loop_test.py)) running `Nemotron-3.5-30B-A3B` at **`47–49 tok/s` decode** and **`256–549 tok/s` prefill** up to **128K context** (`384 MB` KV cache, `0` swap).
+  - Dedicated setup & benchmark scripts ([`apple-silicon/README.md`](apple-silicon/README.md), [`apple-silicon/run-server.sh`](apple-silicon/run-server.sh), [`apple-silicon/run-gateway.sh`](apple-silicon/run-gateway.sh), [`apple-silicon/bench.sh`](apple-silicon/bench.sh), [`apple-silicon/bench_spec.sh`](apple-silicon/bench_spec.sh), [`apple-silicon/bench_server.py`](apple-silicon/bench_server.py), [`apple-silicon/agent_loop_test.py`](apple-silicon/agent_loop_test.py)) running `Nemotron-3.5-30B-A3B` at **`47–49 tok/s` decode** and **`256–549 tok/s` prefill** up to **128K context** (`384 MB` KV cache, `0` swap).
 - **[`fedora/`](fedora/README.md) — Fedora 44 / AMD Ryzen 7 8745HS (`GEEKOM A8`, 8C/16T Zen 4, 64 GB DDR5)**:
   - All-in-one setup, server, gateway, and browser web chat UI ([`fedora/nemotron.sh`](fedora/nemotron.sh)).
 - **[`gateway/sse_gateway.py`](gateway/sse_gateway.py) — Tool-Call Resilience & Cross-Platform Portability**:
