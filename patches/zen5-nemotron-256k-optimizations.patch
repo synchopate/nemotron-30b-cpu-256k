@@ -569,7 +569,7 @@ index 491316f..53a684f 100644
              ggml_graph_compute_thread(&threadpool->workers[ith]);
          }
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 42ec809..e8d7cd7 100644
+index 42ec809..1d27585 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -12,6 +12,10 @@
@@ -583,14 +583,16 @@ index 42ec809..e8d7cd7 100644
  // ggml_compute_forward_dup
  
  static void ggml_compute_forward_dup_same_cont(
-@@ -8465,6 +8469,93 @@ void ggml_compute_forward_top_k(
+@@ -8465,6 +8469,114 @@ void ggml_compute_forward_top_k(
      }
  }
  
 +#if defined(__AVX2__) || defined(__AVX512F__)
 +#include <sys/mman.h>
++#include <sys/stat.h>
 +#include <fcntl.h>
 +#include <unistd.h>
++#include <cstdio>
 +
 +struct llama_modchip_shm_t {
 +    uint32_t magic;            // 0x4D4F4443 ("MODC")
@@ -627,17 +629,36 @@ index 42ec809..e8d7cd7 100644
 +        const char * env_st = getenv("LLAMA_SWA_STRIDE");
 +        swa_stride          = env_st ? atoll(env_st) : 0;
 +
-+        int fd = open("/dev/shm/llama_modchip.bin", O_RDONLY);
++        int fd = -1;
++#if defined(__linux__)
++        const char * xdg = std::getenv("XDG_RUNTIME_DIR");
++        if (xdg && xdg[0]) {
++            char path_buf[512];
++            std::snprintf(path_buf, sizeof(path_buf), "%s/llama_modchip.bin", xdg);
++            fd = open(path_buf, O_RDONLY | O_NOFOLLOW);
++        }
++        if (fd < 0) {
++            fd = open("/dev/shm/llama_modchip.bin", O_RDONLY | O_NOFOLLOW);
++        }
 +        if (fd >= 0) {
-+            void * p = mmap(nullptr, sizeof(llama_modchip_shm_t), PROT_READ, MAP_SHARED, fd, 0);
-+            close(fd);
-+            if (p != MAP_FAILED) {
-+                const llama_modchip_shm_t * s = (const llama_modchip_shm_t *)p;
-+                if (s->magic == 0x4D4F4443u) {
-+                    shm_ptr = s;
++            struct stat st;
++            if (fstat(fd, &st) == 0 &&
++                S_ISREG(st.st_mode) &&
++                st.st_size >= (off_t)sizeof(llama_modchip_shm_t) &&
++                st.st_uid == getuid()) {
++                void * p = mmap(nullptr, sizeof(llama_modchip_shm_t), PROT_READ, MAP_SHARED, fd, 0);
++                if (p != MAP_FAILED) {
++                    const llama_modchip_shm_t * s = (const llama_modchip_shm_t *)p;
++                    if (s->magic == 0x4D4F4443u) {
++                        shm_ptr = s;
++                    } else {
++                        munmap(p, sizeof(llama_modchip_shm_t));
++                    }
 +                }
 +            }
++            close(fd);
 +        }
++#endif
 +
 +        if (attn_window > 0) {
 +            fprintf(stderr, "[GGML-MODCHIP] SWA ACTIVE: Window=%ld, Sinks=%ld, Stride=%ld, L3 Window=%ld\n",
@@ -677,7 +698,7 @@ index 42ec809..e8d7cd7 100644
  static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
          const ggml_compute_params * params,
          ggml_tensor * dst,
-@@ -8473,6 +8564,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+@@ -8473,6 +8585,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
          float * partials, int64_t partial_stride) {
  
      const bool write_partials = (partials != nullptr);
@@ -687,7 +708,7 @@ index 42ec809..e8d7cd7 100644
      const ggml_tensor * q     = dst->src[0];
      const ggml_tensor * k     = dst->src[1];
      const ggml_tensor * v     = dst->src[2];
-@@ -8588,8 +8682,22 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+@@ -8588,8 +8703,22 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
          // online softmax / attention
          // loop over n_kv and n_head_kv
          // ref: https://arxiv.org/pdf/2112.05682.pdf
@@ -710,7 +731,7 @@ index 42ec809..e8d7cd7 100644
              const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
              if (mv == -INFINITY) {
                  continue;
-@@ -8597,6 +8705,53 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+@@ -8597,6 +8726,53 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
  
              float s; // KQ value
  
@@ -764,7 +785,7 @@ index 42ec809..e8d7cd7 100644
              const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
              kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
  
-@@ -9149,7 +9304,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+@@ -9149,7 +9325,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
          const int64_t nr = neq1*neq2*neq3;
  
          // disable for NUMA
@@ -773,7 +794,7 @@ index 42ec809..e8d7cd7 100644
  
          // 4x chunks per thread
          int nth_scaled = nth * 4;
-@@ -10894,7 +11049,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
+@@ -10894,7 +11070,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
      int64_t nr = V->ne[1] * V->ne[3];
  
      // disable for NUMA
@@ -1215,3 +1236,102 @@ index 333f506..f6507a0 100644
      if (arch == LLM_ARCH_HUNYUAN_VL || arch == LLM_ARCH_HUNYUAN_DENSE) {
          if (hparams.n_expert <= 1) {
              hparams.n_expert      = 0;
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 5d2798c..0f14986 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2361,13 +2361,16 @@ private:
+         }
+ 
+         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
+-            // make room for the new checkpoint, if needed
+-            const auto & cur = slot.prompt.checkpoints.front();
++            // Keep checkpoints.front() (base system+tools prefix checkpoint) pinned so new sessions never cold-prefill
++            auto evict_it = slot.prompt.checkpoints.size() > 1
++                ? std::next(slot.prompt.checkpoints.begin())
++                : slot.prompt.checkpoints.begin();
++            const auto & cur = *evict_it;
+ 
+             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+ 
+-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
++            slot.prompt.checkpoints.erase(evict_it);
+         }
+ 
+         auto & cur = slot.prompt.checkpoints.emplace_back();
+@@ -2585,6 +2588,33 @@ private:
+                     const size_t token_count = tokens.size();
+                     const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
+ 
++                    // Save Mamba-2 / hybrid context checkpoints alongside slot state (.ckpt)
++                    {
++                        const std::string ckpt_path = filepath + ".ckpt";
++                        std::ofstream fckpt(ckpt_path, std::ios::binary | std::ios::trunc);
++                        if (fckpt.good()) {
++                            const uint32_t magic = 0x434B5054; // "CKPT"
++                            const uint32_t count = (uint32_t) slot->prompt.checkpoints.size();
++                            fckpt.write(reinterpret_cast<const char *>(&magic), sizeof(magic));
++                            fckpt.write(reinterpret_cast<const char *>(&count), sizeof(count));
++                            for (const auto & ckpt : slot->prompt.checkpoints) {
++                                fckpt.write(reinterpret_cast<const char *>(&ckpt.n_tokens), sizeof(ckpt.n_tokens));
++                                fckpt.write(reinterpret_cast<const char *>(&ckpt.pos_min), sizeof(ckpt.pos_min));
++                                fckpt.write(reinterpret_cast<const char *>(&ckpt.pos_max), sizeof(ckpt.pos_max));
++                                const uint64_t sz_tgt  = ckpt.data_tgt.size();
++                                const uint64_t sz_dft  = ckpt.data_dft.size();
++                                const uint64_t sz_spec = ckpt.data_spec.size();
++                                fckpt.write(reinterpret_cast<const char *>(&sz_tgt), sizeof(sz_tgt));
++                                fckpt.write(reinterpret_cast<const char *>(&sz_dft), sizeof(sz_dft));
++                                fckpt.write(reinterpret_cast<const char *>(&sz_spec), sizeof(sz_spec));
++                                if (sz_tgt  > 0) fckpt.write(reinterpret_cast<const char *>(ckpt.data_tgt.data()),  sz_tgt);
++                                if (sz_dft  > 0) fckpt.write(reinterpret_cast<const char *>(ckpt.data_dft.data()),  sz_dft);
++                                if (sz_spec > 0) fckpt.write(reinterpret_cast<const char *>(ckpt.data_spec.data()), sz_spec);
++                            }
++                            SLT_INF(*slot, "saved %u context checkpoints to %s\n", count, ckpt_path.c_str());
++                        }
++                    }
++
+                     const int64_t t_end = ggml_time_us();
+                     const double t_save_ms = (t_end - t_start) / 1000.0;
+ 
+@@ -2631,6 +2661,40 @@ private:
+                     slot->prompt.clear();
+                     slot->prompt.tokens.insert(tokens);
+ 
++                    // Restore Mamba-2 / hybrid context checkpoints from .ckpt companion file
++                    {
++                        const std::string ckpt_path = filepath + ".ckpt";
++                        std::ifstream fckpt(ckpt_path, std::ios::binary);
++                        if (fckpt.good()) {
++                            uint32_t magic = 0;
++                            uint32_t count = 0;
++                            fckpt.read(reinterpret_cast<char *>(&magic), sizeof(magic));
++                            fckpt.read(reinterpret_cast<char *>(&count), sizeof(count));
++                            if (fckpt.good() && magic == 0x434B5054 && count <= 256) {
++                                for (uint32_t i = 0; i < count; ++i) {
++                                    common_prompt_checkpoint ckpt;
++                                    uint64_t sz_tgt = 0, sz_dft = 0, sz_spec = 0;
++                                    fckpt.read(reinterpret_cast<char *>(&ckpt.n_tokens), sizeof(ckpt.n_tokens));
++                                    fckpt.read(reinterpret_cast<char *>(&ckpt.pos_min), sizeof(ckpt.pos_min));
++                                    fckpt.read(reinterpret_cast<char *>(&ckpt.pos_max), sizeof(ckpt.pos_max));
++                                    fckpt.read(reinterpret_cast<char *>(&sz_tgt), sizeof(sz_tgt));
++                                    fckpt.read(reinterpret_cast<char *>(&sz_dft), sizeof(sz_dft));
++                                    fckpt.read(reinterpret_cast<char *>(&sz_spec), sizeof(sz_spec));
++                                    if (!fckpt.good()) break;
++                                    ckpt.data_tgt.resize(sz_tgt);
++                                    ckpt.data_dft.resize(sz_dft);
++                                    ckpt.data_spec.resize(sz_spec);
++                                    if (sz_tgt  > 0) fckpt.read(reinterpret_cast<char *>(ckpt.data_tgt.data()),  sz_tgt);
++                                    if (sz_dft  > 0) fckpt.read(reinterpret_cast<char *>(ckpt.data_dft.data()),  sz_dft);
++                                    if (sz_spec > 0) fckpt.read(reinterpret_cast<char *>(ckpt.data_spec.data()), sz_spec);
++                                    if (!fckpt.good()) break;
++                                    slot->prompt.checkpoints.push_back(std::move(ckpt));
++                                }
++                                SLT_INF(*slot, "restored %zu context checkpoints from %s\n", slot->prompt.checkpoints.size(), ckpt_path.c_str());
++                            }
++                        }
++                    }
++
+                     const int64_t t_end = ggml_time_us();
+                     const double t_restore_ms = (t_end - t_start) / 1000.0;
+ 

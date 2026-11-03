@@ -585,23 +585,34 @@ llama_tokens common_ngram_simple_draft(
     }
 
     if (best_j > 0 && consensus_len > 0) {
+        const bool online_only = (rc.pred.n_cascade == 0);
         size_t base_m = 0;
-        if (best_k >= 8)      base_m = 5;
-        else if (best_k >= 7) base_m = (hits >= 2) ? 5 : 4;
-        else if (best_k >= 5) base_m = (hits >= 2) ? 4 : 3;
-        else if (best_k == 4) base_m = (hits >= 2) ? 2 : 1;
-        else if (best_k == 3) {
-            if (hits >= 2) base_m = 1;
-            else if (best_j + 128 >= inp_size) {
-                int32_t cand = (int32_t)inp[best_j + 1];
-                const SFTTBucket * b5 = rc.sf.probe5(tail_win, cur_win_len);
-                if (b5 && b5->best_move == cand && b5->wins >= 2 && b5->history >= 128) base_m = 1;
+        if (online_only) {
+            // High-precision gating for 256-expert MoE (each drafted token activates ~5.5 new experts/layer)
+            if (best_k >= 8)      base_m = (true_consensus_hits >= 2) ? 4 : 3;
+            else if (best_k >= 6) base_m = (hits >= 2) ? 3 : 2;
+            else if (best_k == 5) base_m = (hits >= 2 || best_j + 1024 >= inp_size) ? 2 : 1;
+            else if (best_k == 4 && (hits >= 2 || best_j + 512 >= inp_size)) base_m = (hits >= 2) ? 2 : 1;
+            else if (best_k == 3 && hits >= 2 && best_j + 256 >= inp_size)   base_m = 1;
+        } else {
+            if (best_k >= 8)      base_m = 5;
+            else if (best_k >= 7) base_m = (hits >= 2) ? 5 : 4;
+            else if (best_k >= 5) base_m = (hits >= 2) ? 4 : 3;
+            else if (best_k == 4) base_m = (hits >= 2) ? 2 : 1;
+            else if (best_k == 3) {
+                if (hits >= 2) base_m = 1;
+                else if (best_j + 128 >= inp_size) {
+                    int32_t cand = (int32_t)inp[best_j + 1];
+                    const SFTTBucket * b5 = rc.sf.probe5(tail_win, cur_win_len);
+                    if (b5 && b5->best_move == cand && b5->wins >= 2 && b5->history >= 128) base_m = 1;
+                }
             }
         }
 
-        // RouteCrack Technique #17 + Stockfish Singular Horizon Extension (up to M=7 when consensus or k>=10 + TT/RC confirmed)
-        size_t ext_cap = (best_k >= 10 || (best_k >= 8 && true_consensus_hits >= 2)) ? 7 :
-                         (best_k >= 7  && true_consensus_hits >= 2) ? 6 : base_m;
+        // RouteCrack Technique #17 + Stockfish Singular Horizon Extension (capped for 256-expert MoE online_only)
+        size_t ext_cap = online_only ? base_m :
+                         ((best_k >= 10 || (best_k >= 8 && true_consensus_hits >= 2)) ? 7 :
+                          (best_k >= 7  && true_consensus_hits >= 2) ? 6 : base_m);
         size_t max_m = std::min<size_t>(ext_cap, std::min<size_t>(consensus_len, size_mgram));
 
         for (size_t i = 0; i < max_m && best_j + 1 + i < inp_size; ++i) {
@@ -611,8 +622,8 @@ llama_tokens common_ngram_simple_draft(
             if (b3 && b3->refuted_move == cand && b3->best_move != cand && b3->history <= -64 && best_k <= 5 && hits == 1) {
                 break;
             }
-            // If best_k <= 5 and hits == 1, require RouteCrack or Zobrist TT backing to avoid Mamba-2 rollback
-            if (hits == 1 && best_k <= 5) {
+            // If best_k <= 5 and hits == 1 on Mamba-2 (with offline cascade), require RouteCrack or Zobrist TT backing
+            if (!online_only && hits == 1 && best_k <= 5) {
                 int32_t rc_t = -1;
                 int rc_agree = 0;
                 rc.query_rc_nolock(tail_win, cur_win_len, rc_t, rc_agree, cand);

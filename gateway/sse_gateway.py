@@ -158,8 +158,12 @@ def _coerce_xml_param(raw, prop):
         pass
     return raw if ptype is not None else s
 
-def _write_as_bash(name, args):
-    """Turn a Write call into a base64 Bash write with a shell-quoted path."""
+def _write_as_bash(name, args, schemas=None):
+    """Optionally rewrite Write calls into base64 Bash commands ONLY when explicitly enabled."""
+    if os.environ.get("MODCHIP_EXPERIMENTAL_BASH_WRITE") != "1":
+        return name, args
+    if schemas is not None and "Bash" not in schemas:
+        return name, args
     if name == "Write" and isinstance(args, dict) and args.get("file_path"):
         import base64
         b64 = base64.b64encode(str(args.get("content", "")).encode("utf-8")).decode("ascii")
@@ -179,13 +183,16 @@ def try_parse_tool_call(text, schemas=None):
     fn_m = re.search(r"<function=\s*([^>\n\s]+)\s*>([\s\S]*?)(?:</function>|$)", t)
     if fn_m:
         name = fn_m.group(1).strip()
+        # Security hardening: reject tool names not in allowed schemas if schemas whitelist exists
+        if schemas and name not in schemas:
+            return None
         body = fn_m.group(2)
         props = (schemas or {}).get(name, {})
         args = {}
         for pm in re.finditer(r"<parameter=\s*([^>\n\s]+)\s*>\n?([\s\S]*?)\n?</parameter>", body):
             k = pm.group(1).strip()
             args[k] = _coerce_xml_param(pm.group(2), props.get(k, {}))
-        name, args = _write_as_bash(name, args)
+        name, args = _write_as_bash(name, args, schemas)
         return {"name": name, "input": args}
 
     if t.startswith("{") and t.endswith("}"):
@@ -194,24 +201,28 @@ def try_parse_tool_call(text, schemas=None):
             if isinstance(data, dict):
                 if "name" in data and ("arguments" in data or "parameters" in data or "input" in data):
                     name = data["name"]
+                    if schemas and name not in schemas:
+                        return None
                     args = data.get("arguments", data.get("parameters", data.get("input", {})))
                     if isinstance(args, str):
                         try:
                             args = json.loads(args)
                         except Exception:
                             pass
-                    name, args = _write_as_bash(name, args)
+                    name, args = _write_as_bash(name, args, schemas)
                     return {"name": name, "input": args if isinstance(args, dict) else {}}
                 if "function" in data and isinstance(data["function"], dict):
                     fn = data["function"]
                     name = fn.get("name")
+                    if schemas and name not in schemas:
+                        return None
                     args = fn.get("arguments", {})
                     if isinstance(args, str):
                         try:
                             args = json.loads(args)
                         except Exception:
                             pass
-                    name, args = _write_as_bash(name, args)
+                    name, args = _write_as_bash(name, args, schemas)
                     return {"name": name, "input": args if isinstance(args, dict) else {}}
         except Exception:
             pass
@@ -518,6 +529,16 @@ class ThinkBlockFilter:
                 tool_call = self.buf.find("<tool_call>")
                 think = self.buf.find("<think>")
                 split_pos = -1
+
+                # Security hardening: do not switch from TEXT to TOOL unless tool schemas are present
+                # and <tool_call> appears at a logical boundary (start of line or whitespace)
+                if tool_call != -1 and not self.schemas:
+                    tool_call = -1
+                elif tool_call != -1:
+                    prefix_before_tc = self.buf[:tool_call]
+                    if prefix_before_tc and not prefix_before_tc.endswith(("\n", "\r", " ")):
+                        tool_call = -1
+
                 if tool_call != -1 and think != -1:
                     split_pos = min(tool_call, think)
                 elif tool_call != -1:
@@ -1545,18 +1566,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         else:
                             target_user_msg["content"] = remainder
 
-                # Sanitize system reminders & mid-conversation system injections from Claude Code 2.1.283:
-                # 1. Remove mid-conversation role=="system" messages (e.g. <total_tokens>, # Environment, skill_listing).
-                # 2. Extract static Contents of .../MEMORY.md or CLAUDE.md from messages[0] and place it in data["system"]
-                #    so llama-server creates Mamba-2 Checkpoint 0 AFTER System + MEMORY.md + Tools.
-                # 3. Strip noisy <system-reminder> blocks (when GATEWAY_STRIP_REMINDERS=1, default) so volatile per-turn reminders do not invalidate Mamba-2 checkpoints.
+                # Sanitize system reminders & mid-conversation system injections:
+                # Retain system reminders by default unless explicitly configured via MODCHIP_STRIP_SYSTEM_REMINDERS=1 or GATEWAY_STRIP_REMINDERS=1.
+                strip_reminders = (
+                    os.environ.get("MODCHIP_STRIP_SYSTEM_REMINDERS") == "1"
+                    or GATEWAY_STRIP_REMINDERS
+                )
                 extracted_memory_blocks = []
                 filtered_messages = []
                 for idx_m, msg in enumerate(messages):
                     role_m = msg.get("role", "")
-                    if role_m == "system" and GATEWAY_STRIP_REMINDERS:
+                    if role_m == "system" and strip_reminders:
                         continue
-                    if role_m == "user" and GATEWAY_STRIP_REMINDERS:
+                    if role_m == "user":
                         u_content = msg.get("content")
                         if isinstance(u_content, list):
                             user_parts = []
@@ -1567,6 +1589,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                         if idx_m == 0 and "Contents of " in txt and ("MEMORY.md" in txt or "CLAUDE.md" in txt):
                                             clean_mem = re.sub(r"\n# currentDate\n.*?(?=</system-reminder>)", "", txt, flags=re.S)
                                             extracted_memory_blocks.append(clean_mem)
+                                        elif not strip_reminders:
+                                            user_parts.append(part)
                                     else:
                                         user_parts.append(part)
                                 else:
@@ -1576,12 +1600,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
                             else:
                                 continue
                         elif isinstance(u_content, str) and ("<system-reminder>" in u_content or "<total_tokens>" in u_content):
-                            cleaned_str = re.sub(r"<system-reminder>[\s\S]*?</system-reminder>", "", u_content)
-                            cleaned_str = re.sub(r"<total_tokens>[\s\S]*?</total_tokens>", "", cleaned_str).strip()
-                            if cleaned_str:
-                                msg["content"] = cleaned_str
-                            else:
-                                continue
+                            if strip_reminders:
+                                cleaned_str = re.sub(r"<system-reminder>[\s\S]*?</system-reminder>", "", u_content)
+                                cleaned_str = re.sub(r"<total_tokens>[\s\S]*?</total_tokens>", "", cleaned_str).strip()
+                                if cleaned_str:
+                                    msg["content"] = cleaned_str
+                                else:
+                                    continue
                     filtered_messages.append(msg)
                 messages[:] = filtered_messages
                 data["messages"] = messages
@@ -1619,14 +1644,21 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     master_system_prompt = "You are Claude Code, Anthropic's official CLI for Claude."
 
                 # Keep data["system"] invariant BEFORE <tools> so Slot 0 prefix tokens never diverge.
-                # Preserve x-anthropic-billing-header ONLY when the incoming request came from Claude Code CLI.
-                raw_in_sys = json.dumps(data.get("system", ""))
+                # If the client sent a custom system prompt, preserve it unless MODCHIP_OVERRIDE_SYSTEM_PROMPT=1 is set.
                 unified_system = []
-                if "x-anthropic-billing-header" in raw_in_sys:
-                    m_bh = re.search(r"(x-anthropic-billing-header:[^\"\\]+)", raw_in_sys)
-                    bh_str = m_bh.group(1) if m_bh else "x-anthropic-billing-header: cc_version=2.1.283.49b; cc_entrypoint=cli;"
-                    unified_system.append({"type": "text", "text": bh_str})
-                unified_system.append({"type": "text", "text": master_system_prompt})
+                orig_system = data.get("system")
+                if orig_system and os.environ.get("MODCHIP_OVERRIDE_SYSTEM_PROMPT") != "1":
+                    if isinstance(orig_system, list):
+                        unified_system.extend(orig_system)
+                    elif isinstance(orig_system, str):
+                        unified_system.append({"type": "text", "text": orig_system})
+                else:
+                    raw_in_sys = json.dumps(data.get("system", ""))
+                    if "x-anthropic-billing-header" in raw_in_sys:
+                        m_bh = re.search(r"(x-anthropic-billing-header:[^\"\\]+)", raw_in_sys)
+                        bh_str = m_bh.group(1) if m_bh else "x-anthropic-billing-header: cc_version=2.1.283.49b; cc_entrypoint=cli;"
+                        unified_system.append({"type": "text", "text": bh_str})
+                    unified_system.append({"type": "text", "text": master_system_prompt})
                 data["system"] = unified_system
 
                 # Place centralized directive + extracted MEMORY.md/CLAUDE.md immediately after </tools></IMPORTANT>
