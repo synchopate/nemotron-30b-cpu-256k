@@ -11,7 +11,7 @@
 [![RouteCrack + Stockfish](https://img.shields.io/badge/drafter-Stockfish--PVS%20v2%20(1.64MB%20L3)-d29922?style=flat-square)](speculative/ROUTECRACK_TECHNIQUES.md)
 [![Submit Benchmark](https://img.shields.io/badge/leaderboard-Submit%20Your%20CPU-2ea043?style=flat-square)](https://github.com/synchopate/llama-modchip/issues/new?template=cpu_benchmark_submission.yml)
 
-[**⚡ Quickstart**](#-quickstart) · [**🧩 Supported Models**](#-supported-models--model-specific-optimizations) · [**🖥️ Supported Chips & Platforms**](#️-supported-chips--processor-specific-optimizations) · [**🏆 Leaderboard**](#-community-cpu--hybrid-leaderboard) · [**📄 Preprint PDF (`paper/`)**](paper/llama-modchip-paper.pdf) · [**📐 Architecture**](ARCHITECTURE.md) · [**❓ FAQ**](FAQ.md) · [**🚀 Launch Kit**](docs/marketing-launch-kit/01_LINKEDIN_AND_X_NAS_GUIDE.md)
+[**⚡ Quickstart**](#-quickstart) · [**🧩 Supported Models**](#-supported-models--model-specific-optimizations) · [**🖥️ Supported Chips & Platforms**](#️-supported-chips--processor-specific-optimizations) · [**🏆 Leaderboard**](#-community-cpu--hybrid-leaderboard) · [**📄 Preprint PDF (`paper/`)**](paper/llama-modchip-paper.pdf) · [**📐 Architecture**](ARCHITECTURE.md) · [**❓ FAQ**](FAQ.md)
 
 </div>
 
@@ -22,7 +22,7 @@
 
 <div align="center">
 
-<img src="assets/modchip_demo.svg" alt="llama-modchip Live CPU Telemetry & Stockfish-PVS (M=7) Demo" width="100%" />
+<img src="assets/launch_284b_64gb.gif" alt="llama-modchip v2.4.0 — 284.33B DeepSeek-V4-Flash in 57.61 GiB RAM & 60.4 tok/s Nemotron-30B on Pure CPU" width="100%" />
 
 </div>
 
