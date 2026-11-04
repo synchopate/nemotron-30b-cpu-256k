@@ -2,15 +2,15 @@
 
 # ♟️ llama-modchip
 
-### Run 30B–284B Sparse MoE LLMs on a pure 64 GB CPU at 256K context — from `Nemotron-30B-A3B` in `14.35 GiB` (`20–111 tok/s`) to `DeepSeek-V4-Flash 284B` in `56.56 GiB` (`< 60 GiB` RAM, `9.7–14.7 tok/s`). Zero GPUs required.
+### Run 30B–284B Sparse MoE LLMs on a pure 64 GB CPU (or Hybrid GPU+CPU on Linux, Windows & macOS) at 256K context — from `Nemotron-30B-A3B` in `14.35 GiB` (`25–111 tok/s`) to `DeepSeek-V4-Flash 284B` in `56.56 GiB` (`< 60 GiB` RAM, `9.1–14.7 tok/s`).
 
-[![Release](https://img.shields.io/badge/release-v2.3.0-3fb950?style=flat-square)](RELEASE_NOTES.md)
+[![Release](https://img.shields.io/badge/release-v2.4.0-3fb950?style=flat-square)](RELEASE_NOTES.md)
 [![License](https://img.shields.io/badge/license-Apache%202.0-58a6ff?style=flat-square)](LICENSE)
 [![Technical Paper](https://img.shields.io/badge/paper-ARCHITECTURE.md-bc8cff?style=flat-square)](ARCHITECTURE.md)
 [![RouteCrack + Stockfish](https://img.shields.io/badge/drafter-Stockfish--PVS%20v2%20(1.64MB%20L3)-d29922?style=flat-square)](speculative/ROUTECRACK_TECHNIQUES.md)
 [![Submit Benchmark](https://img.shields.io/badge/leaderboard-Submit%20Your%20CPU-2ea043?style=flat-square)](https://github.com/synchopate/llama-modchip/issues/new?template=benchmark.yml)
 
-[**⚡ Quickstart**](#-quickstart) · [**🐋 DeepSeek-V4-Flash 284B on 64GB CPU**](#-deepseek-v4-flash-28433b-total--1317b-active-first-engine-to-fit-a-284b-frontier-moe-inside--60-gib-ram-at-256k-context) · [**📊 Benchmarks**](#-benchmarks-pure-cpu--zero-gpus) · [**🧠 How It Works**](#-how-it-works) · [**🏆 CPU Leaderboard**](#-community-cpu-leaderboard) · [**📄 Technical Paper**](ARCHITECTURE.md) · [**❓ FAQ**](FAQ.md)
+[**⚡ Quickstart**](#-quickstart) · [**🐋 DeepSeek-V4-Flash 284B on 64GB CPU**](#-deepseek-v4-flash-28433b-total--1317b-active-first-engine-to-fit-a-284b-frontier-moe-inside--60-gib-ram-at-256k-context) · [**🪟 Windows / 🍎 macOS / 🐧 Linux**](#-quickstart) · [**📊 Benchmarks**](#-benchmarks-pure-cpu--zero-gpus) · [**🧠 How It Works**](#-how-it-works) · [**🏆 CPU Leaderboard**](#-community-cpu-leaderboard) · [**📄 Technical Paper**](ARCHITECTURE.md) · [**❓ FAQ**](FAQ.md)
 
 <br/>
 
@@ -45,15 +45,16 @@ cd llama-modchip
 > ```bash
 > curl -sL https://raw.githubusercontent.com/synchopate/llama-modchip/main/scripts/check_cpu_readiness.py | python3
 > ```
+> 🪟 **On Windows 10/11 (NVIDIA CUDA / AMD Vulkan + 16–128 GB RAM)?** Open [`windows/`](windows/README.md) and double-click **[`windows/AVVIA_MODCHIP.bat`](windows/AVVIA_MODCHIP.bat)** (or run `./modchip start` in Git Bash) for automatic GPU+CPU MoE Tensor-Role Splitting (`--n-cpu-moe N --load-mode none`) and 1-click model setup!
 
-### 🧩 Supported Flagship Models (`v2.3.0` — 64 GB CPU Ready at `256K` Context)
+### 🧩 Supported Flagship Models (`v2.4.0` — 64 GB CPU & Hybrid GPU+CPU Ready at `256K` Context)
 
-| Model Family & Profile | Total / Active Params | Architecture & Experts | Disk Size (`GGUF`) | Resident RAM (`VmRSS` @ `256K`) | Warm Slot-0 Restore | Speed on 16C Zen 5 (`0 GPU`) |
+| Model Family & Profile | Total / Active Params | Architecture & Experts | Disk Size (`GGUF`) | Resident RAM (`VmRSS` @ `256K`) | Warm Slot-0 Restore | Speed on 16C Zen 5 (`0 GPU` / Hybrid) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
 | **`NVIDIA-Nemotron-3.5-30B-A3B` (`Fractal-64`)** | `30.2B` / **`3.0B`** | `nemotron_h_moe` (`46 SSM + 6 GQA`, `128` exp) | **`14.35 GiB`** | **`15.40 – 17.27 GiB`** | **`18.9 ms`** (`22.2K` tok) | **`25.0 – 60.4 tok/s`** *(`111.6 tok/s` Threadripper)* |
-| **`NVIDIA-Nemotron-3.5-30B-A3B` (`Fractal-MXFP4` / `Q4_0`)** | `30.2B` / **`3.0B`** | `nemotron_h_moe` (`46 SSM + 6 GQA`, `128` exp) | `15.95` / `17.59 GiB` | `17.46 – 21.71 GiB` | **`18.9 ms`** (`22.2K` tok) | **`26.1 – 60.4 tok/s`** *(`66.5 tok/s` Hybrid Vulkan)* |
-| **🐋 `DeepSeek-V4-Flash-0731-Fractal` (`SwiGLU-H2 + Q2_0`)** | **`284.33B`** / **`13.17B`** | `deepseek2` / MLA (`45L`, `256` routed + `1` shared exp) | **`56.56 GiB`** *(`-20.31 GiB`)* | **`58.9 GiB`** *(Fits in `64 GB`!)* | **`32.6 ms`** (`2,940` tok) | **`6.4 – 9.7 tok/s` avg / `11.5 – 14.7 tok/s` peak** |
-| **`Qwen3-30B-A3B` (`Q4_K_M` + `LLAMA_MOE_TOP_K=4`)** | `30.5B` / `3.3B -> 1.7B` | `qwen3moe` (`48 GQA`, `128` exp, `8 -> 4` active) | `17.28 GiB` | `19.40 GiB` | `24.0 ms` | **`34.80 tok/s`** *(`+38.5%` decode)* |
+| **`NVIDIA-Nemotron-3.5-30B-A3B` (`Fractal-MXFP4` / `Q4_0`)** | `30.2B` / **`3.0B`** | `nemotron_h_moe` (`46 SSM + 6 GQA`, `128` exp) | `15.20` / `17.59 GiB` | `17.46 – 21.71 GiB` | **`18.9 ms`** (`22.2K` tok) | **`26.1 – 60.4 tok/s`** *(`75.1–80.8 tok/s` Hybrid Vulkan)* |
+| **🐋 `DeepSeek-V4-Flash-0731-Fractal` (`SwiGLU-H2 + Q2_0`)** | **`284.33B`** / **`13.17B`** | `deepseek4` / MLA (`43L`, `256` routed + `1` shared exp) | **`56.56 GiB`** *(`-20.31 GiB`)* | **`58.9 GiB`** *(Fits in `64 GB`!)* | **`32.6 ms`** (`2,940` tok) | **`9.06 – 10.12 tok/s` base / `11.5 – 14.7 tok/s` PVS** *(`41.6 tok/s` pp512)* |
+| **`Qwen3-30B-A3B` (`Q4_K_M` / `Q3_K_M` + `LLAMA_MOE_TOP_K=4`)** | `30.5B` / `3.3B -> 1.7B` | `qwen3moe` (`48 GQA`, `128` exp, `8 -> 4` active) | `13.70 – 17.28 GiB` | `14.5 – 19.4 GiB` | `24.0 ms` | **`34.80 tok/s`** *(`+38.5%` decode; Windows 16GB ready)* |
 
 ---
 
@@ -63,12 +64,13 @@ Running a **284.33-billion parameter** frontier Mixture-of-Experts model (`45` l
 
 In **`llama-modchip v2.3.0`** ([`patches/deepseek-v4-flash-fractal-256k.patch`](patches/deepseek-v4-flash-fractal-256k.patch), [`scripts/transcode_dsv4.c`](scripts/transcode_dsv4.c), [`scripts/transcode_dsv4_shard.py`](scripts/transcode_dsv4_shard.py)), we introduce four coupled compression and kernel breakthroughs that shrink `DeepSeek-V4-Flash` from **`76.87 GiB` down to `56.56 GiB` (`-20.31 GiB`)** and run it comfortably inside a **`64 GiB` CPU box (`58.9 GiB` total `VmRSS` at `256K` context)** with both `./modchip chat` and `./modchip claude` (`Claude Code`):
 
-| Metric (`DeepSeek-V4-Flash-0731` @ `256K` Context on `64 GB` Zen 5 CPU) | Standard `IQ2_XXS` (`76.87 GiB`) | **`DeepSeek-V4-Flash-0731-Fractal` (`v2.3.0`)** | Engineering Gain |
+| Metric (`DeepSeek-V4-Flash-0731` @ `256K` Context on `64 GB` Zen 5 CPU) | Standard `IQ2_XXS` (`76.87 GiB`) | **`DeepSeek-V4-Flash-0731-Fractal` (`v2.4.0`)** | Engineering Gain |
 | :--- | :---: | :---: | :---: |
-| **Total GGUF Size on Disk (`4` Shards)** | `76.87 GiB` (`82.54 GB`) | **`56.56 GiB` (`60.73 GB`)** | **`-20.31 GiB` (`-26.4%` disk & RAM)** |
+| **Total GGUF Size on Disk (`3` Shards)** | `76.87 GiB` (`82.54 GB`) | **`56.56 GiB` (`60.73 GB`)** | **`-20.31 GiB` (`-26.4%` disk & RAM)** |
 | **Resident Memory (`VmRSS`) at `-c 262144` (`256K` Context)** | 🔴 **OOM Crash on `64 GB` RAM** | 🟢 **`58.9 GiB` (`61,772 MB` / `64 GiB`)** | **Fits in `64 GB` RAM with `5.1 GiB` headroom!** |
-| **Warm `Claude Code` Turn Latency (`2,940`-tok Compact Tools)** | > 45 s *(or OOM)* | **`32.6 ms` `/dev/shm` Slot 0 Restore** | **Instant Warm Agent Startup** |
-| **Interactive Chat & Agent Decode (`./modchip chat` / `./modchip claude`)** | N/A *(Page Thrashing)* | **`6.44 – 9.67 tok/s` avg / `11.50 – 14.69 tok/s` peak** | **`94.5%` `Stockfish-PVS` draft acceptance** |
+| **Cold Prompt Prefill (`pp512`, AVX-512 `vprorvq` + In-Reg FWHT)** | `24.70 tok/s` (`20.73 s`) | **`41.58 tok/s` (`12.31 s`)** | **`+68.3%` Faster Prefill** |
+| **Pure Single-Token Decode (`N=1`, Zero Speculation)** | `5.91 tok/s` (`169.3 ms/tok`) | **`9.06 tok/s` (`110.3 ms`) Lossless** · **`9.68 tok/s` (`Top-5 L2`)** · **`10.12 tok/s` (`Top-4 L2`)** | **`+53.3%` to `+71.2%` Faster Pure Decode** |
+| **Interactive Chat & Agent Decode (`./modchip chat` / `./modchip claude`)** | N/A *(Page Thrashing)* | **`9.06 – 10.12 tok/s` base / `11.50 – 14.69 tok/s` peak** | **`94.5%` `Stockfish-PVS` draft acceptance + `32.6 ms` Slot 0 Restore** |
 
 ### How We Engineered It (4 Core Breakthroughs):
 1. **🗜️ `SwiGLU-H2` Analytical Second-Order Hessian MoE Compression + `Fractal-64` (`Q2_0`, `3.75 bpw`) MLA Tensor Transcoding ([`scripts/transcode_dsv4.c`](scripts/transcode_dsv4.c))**:
@@ -87,6 +89,11 @@ In **`llama-modchip v2.3.0`** ([`patches/deepseek-v4-flash-fractal-256k.patch`](
    - Retunes the `RouteCrack + Stockfish-PVS` confidence gates (`0.89 / 0.94 / 0.98`) in `common/ngram-map.cpp` for `13.17B`-active 256-expert verification economics (**`94.5%` live draft acceptance**).
    - Fixes a critical speculative rollback state-plane bug in `src/llama-kv-cache-dsv4.cpp` (`dsv4_build_comp_plan` now indexes `std::min(n_rs_seq, rollback + (d - n_seq_tokens)) * state_rows` when `rollback > 0`, and `llama_kv_cache_dsv4::seq_rm` synchronously trims `kv_csa`, `kv_hca`, and `kv_lid`), enabling rock-solid multi-token speculative decoding and clean `<｜end▁of▁sentence｜>` termination on both `./modchip chat` and `./modchip claude`.
    - Adds **Compact Tool Table compression (`MODCHIP_COMPACT_TOOLS=1`)** and dual chat/agent Slot 0 auto-restore (`_last_endpoint_was_chat`) in [`gateway/sse_gateway.py`](gateway/sse_gateway.py), shrinking Claude Code's 40-tool prefix to **`2,940` tokens** and restoring `/dev/shm/dsv4_claude_slot0.bin` in **`32.6 ms`**.
+5. **🧮 `v2.4.0` Kernel & Mathematical Acceleration (`+68.3%` Prefill, `+53.3%–71.2%` Pure Decode, & $L_2$-Quadrature MoE Tail Pruning)**:
+   - **AVX-512 `vprorvq` (`_mm512_rorv_epi64`), In-Register 9-Stage AVX2 FWHT (`GGML_OP_HADAMARD`), Vectorized `HC_PRE`/`HC_POST`, 8-Slot `Q8_K`/`Q8_0` Activation Cache, & Zero-Rebuild Dynamic `CSA/LID` Skip**: Eliminates full 4,551-node graph rebuilds on 7/8ths of decode steps (`ggml_dsv4_skip_csa_comp`), reuses quantized input activations (`s_q8_cache_buf`) and `MUL_MAT_ID` expert row mappings (`g_tls_mmid_ids_valid`), and accelerates `pp512` prefill to **`41.58 tok/s` (`+68.3%`)** and pure lossless `N=1` decode to **`9.06 tok/s` (`110.33 ms/tok`, `+53.3%`)**.
+   - **Cross-Platform Zero-Overhead Runtime $L_2$-Quadrature MoE Tail Pruning (`/tmp/dsv4_moe_cfg.bin` & Windows `%TEMP%\dsv4_moe_cfg.bin`)**: Keeps the 3 deterministic hash-routed layers (`il = 0..2`) at `6/6` experts while pruning tail experts in the 40 learned-router layers (`il = 3..42`) with **$L_2$-quadrature variance-preserving rescaling** ($\alpha_{L_2} = \sqrt{\sum_{i=1}^6 w_i^2 / \sum_{i=1}^k w_i^2}$, which preserves the exact energy ratio against the dense shared expert `ffn_shexp` and cuts KL-divergence by **`-58%`** compared to linear $L_1$ rescaling):
+     - **`Top-5 (il >= 3, L2)`**: **`9.68 tok/s`** (`103.27 ms/tok`), **`99.71%` (`0.99714`) probability cosine similarity**, **`0.0042 nats` KL-divergence (`+0.42%` PPL)**, **`100%` Top-3 token agreement**.
+     - **`Top-4 (il >= 3, L2)`**: **`10.12 tok/s`** (`98.84 ms/tok`, breaking `10 tok/s` on pure CPU!), **`99.59%` (`0.99587`) probability cosine similarity**, **`0.0281 nats` KL-divergence (`+2.85%` PPL)**, **`100%` Top-3 token agreement**.
 
 ---
 
@@ -221,6 +228,7 @@ llama-modchip/
 ├── gateway/sse_gateway.py                     # Agentic SSE Proxy + Compact Tool Table + Dark-Mode Web Chat HUD (:8787)
 ├── kv_cache/                                  # HARP-Cache (/dev/shm) & EAKV + VPI Asymmetric Quantization
 ├── scripts/                                   # build_fractal_moe_gguf.sh, transcode_dsv4.{c,py}, chat.py, llama_modchip.py
+├── windows/                                   # 1-Click Windows 10/11 Hybrid GPU+CPU MoE Pack (AVVIA_MODCHIP.bat, modchip_win.ps1)
 ├── apple-silicon/                             # Apple M4 Pro (24 GB) Metal setup & 128K benchmarks
 └── fedora/                                    # Fedora 44 / AMD Ryzen 7 8745HS (GEEKOM A8) all-in-one script
 ```
@@ -231,7 +239,7 @@ llama-modchip/
 
 ## 🏆 Community CPU Leaderboard
 
-Run **`./modchip bench`** on your machine and **[➕ Submit Your CPU Scorecard (1-Click GitHub Issue)](https://github.com/synchopate/llama-modchip/issues/new?template=benchmark.yml)** to be added below!
+Run **`./modchip bench`** on your machine (or **`windows\BENCHMARK_PC.bat`** on Windows) and **[➕ Submit Your CPU Scorecard (1-Click GitHub Issue)](https://github.com/synchopate/llama-modchip/issues/new?template=benchmark.yml)** to be added below!
 
 | Hardware Platform (`CPU / SoC`) | Cores / Cache | Memory | Prefill (`tok/s`) | Decode — Prose / C++20 | Decode — `Stockfish M=7` Burst | Config & Contributor |
 | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
@@ -240,14 +248,15 @@ Run **`./modchip bench`** on your machine and **[➕ Submit Your CPU Scorecard (
 | **AMD Ryzen 9 9955HX / 9950X (`Zen 5`)** | `16C/32T` (`2 CCDs`, `64 MB` L3) | `64 GB` DDR5 (`0 GPU`) | **`241.0`** *(Peak **`306.8`**)* | **`25.02 – 34.5 tok/s`** *(`Fractal-64` / `MXFP4`)* | **`48.39 avg / 60.40 peak`** *(`len 6.90`)* | `@synchopate` ([`systemd/`](systemd/nemotron-256k.service)) |
 | **Apple M4 Pro (`14-Core SoC`)** | `14C CPU + 20C Metal` | `24 GB` Unified (`0 Swap`) | **`256.0 – 549.0`** | **`47.0 – 48.0 tok/s`** *(128K)* | **`49.0+ tok/s`** | `@jarorosFork` ([`apple-silicon/`](apple-silicon/README.md)) |
 | **AWS Graviton3 `m7g.2xlarge` (`ARM64 Neoverse-V1`)** | `8 vCPU` (`32 MB` L3, `SVE-256`) | `31 GB` DDR5 (`0 GPU`) | **`101.67`** *(`-t 8`)* | **`41.05 tok/s`** *(C++20)* | **`44.97 tok/s`** *(Refactoring)* | `@gerchik` ([Issue #2](https://github.com/synchopate/llama-modchip/issues/2)) |
+| **Windows 11 Hybrid (`i9-9900K + RTX 2080 Ti 11GB`)** | `8C/16T` (`16 MB` L3) + `11 GB` CUDA | `16 GB` DDR4 + `11 GB` GDDR6 | *Auto CUDA 12.4* | **`50–58 tok/s`** *(`14B`) / 30B Hybrid* | **`100+ tok/s`** *(`Nemotron-H-8B` 128K)* | [`windows/`](windows/README.md) |
 | **AMD Ryzen 7 8745HS (`GEEKOM A8`)** | `8C/16T` (`16 MB` L3) | `64 GB` DDR5-5600 | *Verified Fedora 44* | *Verified (`ngram`)* | *Verified (`CPU` & `780M`)* | `@jarorosFork` ([`fedora/`](fedora/README.md)) |
-| **🐋 `DeepSeek-V4-Flash 284B` on Ryzen 9 9955HX** | `16C/32T` (`2 CCDs`, `64 MB` L3) | `64 GB` DDR5 (`58.9 GiB` RSS @ `256K`) | **`32.6 ms` Slot-0** | **`6.44 – 9.67 tok/s`** *(`13.17B` active)* | **`11.50 – 14.69 tok/s`** *(`94.5%` PVS acc)* | `@synchopate` ([`patches/`](patches/deepseek-v4-flash-fractal-256k.patch)) |
-| **Your CPU (`Ryzen / EPYC / Xeon / Graviton / M-Series`)** | *Run `./modchip bench`* | *`>= 24 GB` RAM* | *?* | *?* | **[➕ Submit Scorecard](https://github.com/synchopate/llama-modchip/issues/new?template=benchmark.yml)** | *You!* |
+| **🐋 `DeepSeek-V4-Flash 284B` on Ryzen 9 9955HX** | `16C/32T` (`2 CCDs`, `64 MB` L3) | `64 GB` DDR5 (`58.9 GiB` RSS @ `256K`) | **`41.58 tok/s`** *(`32.6 ms` Slot-0)* | **`9.06 – 10.12 tok/s`** *(`13.17B` active)* | **`11.50 – 14.69 tok/s`** *(`94.5%` PVS acc)* | `@synchopate` ([`patches/`](patches/deepseek-v4-flash-fractal-256k.patch)) |
+| **Your CPU (`Ryzen / EPYC / Xeon / Graviton / M-Series`)** | *Run `./modchip bench`* | *`>= 16–24 GB` RAM* | *?* | *?* | **[➕ Submit Scorecard](https://github.com/synchopate/llama-modchip/issues/new?template=benchmark.yml)** | *You!* |
 
 ---
 
 <div align="center">
 
-📄 **[Read the Full Technical Paper (`ARCHITECTURE.md`)](ARCHITECTURE.md)** · ♟️ **[Explore All 96+ `RouteCrack + Stockfish-PVS` Techniques](speculative/ROUTECRACK_TECHNIQUES.md)** · ❓ **[Engineering FAQ & Xeon/EPYC Scaling (`FAQ.md`)](FAQ.md)** · 🚀 **[Release Notes (`v2.3.0`)](RELEASE_NOTES.md)**
+📄 **[Read the Full Technical Paper (`ARCHITECTURE.md`)](ARCHITECTURE.md)** · ♟️ **[Explore All 96+ `RouteCrack + Stockfish-PVS` Techniques](speculative/ROUTECRACK_TECHNIQUES.md)** · ❓ **[Engineering FAQ & Xeon/EPYC Scaling (`FAQ.md`)](FAQ.md)** · 🚀 **[Release Notes (`v2.4.0`)](RELEASE_NOTES.md)**
 
 </div>

@@ -1723,16 +1723,23 @@ index ea54cfe..ffe3392 100644
              // Convert signs to bytes 0x81 (negative) or 0x01 (positive)
              const uint64_t delta_sign = _pdep_u64(*(const uint32_t*)(qh) & 0x88888888, 0xf0f0f0f0f0f0f0f0ULL);
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 7918845..4133acb 100644
+index 7918845..bc4a66b 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
-@@ -1,3 +1,5 @@
+@@ -1,3 +1,12 @@
++#ifdef _WIN32
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++#else
 +#include <sys/mman.h>
 +#include <fcntl.h>
++#endif
  #define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
  #define _USE_MATH_DEFINES // For M_PI on MSVC
  
-@@ -489,6 +491,8 @@ struct ggml_threadpool {
+@@ -489,6 +498,8 @@ struct ggml_threadpool {
      atomic_int GGML_CACHE_ALIGN n_barrier;
      atomic_int GGML_CACHE_ALIGN n_barrier_passed;
      atomic_int GGML_CACHE_ALIGN current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.
@@ -1741,7 +1748,7 @@ index 7918845..4133acb 100644
  
      // these are atomic as an annotation for thread-sanitizer
      atomic_bool stop;         // Used for stopping the threadpool altogether
-@@ -579,8 +583,11 @@ void ggml_barrier(struct ggml_threadpool * tp) {
+@@ -579,8 +590,11 @@ void ggml_barrier(struct ggml_threadpool * tp) {
      }
  
  #ifdef GGML_USE_OPENMP
@@ -1755,7 +1762,7 @@ index 7918845..4133acb 100644
      int n_passed = atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed);
  
      // enter barrier (full seq-cst fence)
-@@ -607,7 +614,6 @@ void ggml_barrier(struct ggml_threadpool * tp) {
+@@ -607,7 +621,6 @@ void ggml_barrier(struct ggml_threadpool * tp) {
      #else
      atomic_thread_fence(memory_order_seq_cst);
      #endif
@@ -1763,7 +1770,7 @@ index 7918845..4133acb 100644
  }
  
  void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value) {
-@@ -1161,6 +1167,14 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2,
+@@ -1161,6 +1174,14 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2,
  
  // ggml_compute_forward_mul_mat
  
@@ -1778,7 +1785,7 @@ index 7918845..4133acb 100644
  static void ggml_compute_forward_mul_mat_one_chunk(
      const struct ggml_compute_params * params,
      struct ggml_tensor * dst,
-@@ -1192,15 +1206,16 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+@@ -1192,15 +1213,16 @@ static void ggml_compute_forward_mul_mat_one_chunk(
          return;
      }
  
@@ -1798,7 +1805,7 @@ index 7918845..4133acb 100644
  
      const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
  
-@@ -1319,28 +1334,18 @@ void ggml_compute_forward_mul_mat(
+@@ -1319,28 +1341,18 @@ void ggml_compute_forward_mul_mat(
  UseGgmlGemm1:;
  #endif
  
@@ -1831,7 +1838,7 @@ index 7918845..4133acb 100644
          for (int64_t i13 = 0; i13 < ne13; ++i13) {
              for (int64_t i12 = 0; i12 < ne12; ++i12) {
                  for (int64_t i11 = 0; i11 < ne11; ++i11) {
-@@ -1353,19 +1358,20 @@ UseGgmlGemm1:;
+@@ -1353,19 +1365,20 @@ UseGgmlGemm1:;
                  }
              }
          }
@@ -1859,7 +1866,7 @@ index 7918845..4133acb 100644
          const size_t row_size = ggml_row_size(vec_dot_type, ne10);
  
          for (int64_t i13 = 0; i13 < ne13; i13++)
-@@ -1582,28 +1588,18 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -1582,28 +1595,18 @@ static void ggml_compute_forward_mul_mat_id(
  
      GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
  
@@ -1892,7 +1899,7 @@ index 7918845..4133acb 100644
          for (int64_t i13 = 0; i13 < ne13; ++i13) {
              for (int64_t i12 = 0; i12 < ne12; ++i12) {
                  for (int64_t i11 = 0; i11 < ne11; ++i11) {
-@@ -1616,16 +1612,18 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -1616,16 +1619,18 @@ static void ggml_compute_forward_mul_mat_id(
                  }
              }
          }
@@ -1913,7 +1920,7 @@ index 7918845..4133acb 100644
                  const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
  
                  assert(i02 >= 0 && i02 < n_as);
-@@ -1636,14 +1634,25 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -1636,14 +1641,25 @@ static void ggml_compute_forward_mul_mat_id(
          }
      }
  
@@ -1944,7 +1951,7 @@ index 7918845..4133acb 100644
      for (int cur_a = 0; cur_a < n_as; ++cur_a) {
          const int64_t cne1 = matrix_row_counts[cur_a];
  
-@@ -1652,7 +1661,7 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -1652,7 +1668,7 @@ static void ggml_compute_forward_mul_mat_id(
          }
  
          const char * src0_cur = (const char *) src0->data + cur_a * nb02;
@@ -1953,7 +1960,7 @@ index 7918845..4133acb 100644
          const size_t row_size = ggml_row_size(vec_dot_type, ne10);
  
          const int64_t nr0 = ne01;
-@@ -2257,6 +2266,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+@@ -2257,6 +2273,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
          case GGML_OP_SOLVE_TRI:
          case GGML_OP_GATED_DELTA_NET:
          case GGML_OP_DSV4_HC_COMB:
@@ -1963,7 +1970,7 @@ index 7918845..4133acb 100644
          case GGML_OP_DSV4_HC_PRE:
          case GGML_OP_DSV4_HC_POST:
              {
-@@ -3057,6 +3069,66 @@ static int ggml_cpu_try_fuse_ops(
+@@ -3057,6 +3076,66 @@ static int ggml_cpu_try_fuse_ops(
      return 0;
  }
  
@@ -2030,7 +2037,7 @@ index 7918845..4133acb 100644
  static thread_ret_t ggml_graph_compute_thread(void * data) {
      struct ggml_compute_state * state = (struct ggml_compute_state *) data;
      struct ggml_threadpool    * tp    = state->threadpool;
-@@ -3085,11 +3157,68 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3085,11 +3164,92 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
      GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
  #endif
  
@@ -2074,9 +2081,32 @@ index 7918845..4133acb 100644
 +        s_moe_topk = (et && atoi(et) > 0) ? atoi(et) : 6;
 +        const char * ew = getenv("DSV4_MOE_MIN_W");
 +        s_moe_min_w = (ew && atof(ew) > 0.0) ? (float)atof(ew) : 0.0f;
++        int32_t init_cfg[8] = {s_moe_topk, s_moe_topk, (int32_t)(s_moe_min_w * 10000.0f), 3, 43, 1, 0, 0};
++#ifdef _WIN32
++        char cfg_path[MAX_PATH];
++        DWORD tlen = GetTempPathA(MAX_PATH, cfg_path);
++        if (tlen > 0 && tlen < MAX_PATH - 20) {
++            strcat(cfg_path, "dsv4_moe_cfg.bin");
++            HANDLE hFile = CreateFileA(cfg_path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
++            if (hFile != INVALID_HANDLE_VALUE) {
++                if (GetFileSize(hFile, NULL) < 32) {
++                    DWORD written = 0;
++                    WriteFile(hFile, init_cfg, sizeof(init_cfg), &written, NULL);
++                }
++                HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_READWRITE, 0, 32, NULL);
++                if (hMap != NULL) {
++                    void * mp = MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, 32);
++                    if (mp != NULL) {
++                        s_moe_cfg_mmap = (volatile int32_t *) mp;
++                    }
++                    CloseHandle(hMap);
++                }
++                CloseHandle(hFile);
++            }
++        }
++#else
 +        int fd = open("/tmp/dsv4_moe_cfg.bin", O_RDWR | O_CREAT, 0666);
 +        if (fd >= 0) {
-+            int32_t init_cfg[8] = {s_moe_topk, s_moe_topk, (int32_t)(s_moe_min_w * 10000.0f), 3, 43, 0, 0, 0};
 +            if (lseek(fd, 0, SEEK_END) < 32) {
 +                if (write(fd, init_cfg, sizeof(init_cfg)) != sizeof(init_cfg)) {}
 +            }
@@ -2086,6 +2116,7 @@ index 7918845..4133acb 100644
 +            }
 +            close(fd);
 +        }
++#endif
 +    }
 +    size_t last_mmid_q8_off = 0;
 +
@@ -2101,7 +2132,7 @@ index 7918845..4133acb 100644
              continue;
          }
  
-@@ -3097,13 +3226,119 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3097,13 +3257,119 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
              continue;
          }
  
@@ -2221,7 +2252,7 @@ index 7918845..4133acb 100644
          }
  
          if (state->ith == 0 && cplan->abort_callback &&
-@@ -3115,6 +3350,100 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3115,6 +3381,100 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
          if (node_n + 1 < cgraph->n_nodes) {
              ggml_barrier(state->threadpool);
          }
@@ -2247,7 +2278,7 @@ index 7918845..4133acb 100644
 +                const int cfg_mid_start  = s_moe_cfg_mmap ? s_moe_cfg_mmap[3] : 3;
 +                const int cfg_mid_end    = s_moe_cfg_mmap ? s_moe_cfg_mmap[4] : 43;
 +                const int cur_topk       = (il >= cfg_mid_start && il < cfg_mid_end) ? cfg_topk_mid : cfg_topk_early;
-+                const int cfg_scale_mode = s_moe_cfg_mmap ? s_moe_cfg_mmap[5] : 0;
++                const int cfg_scale_mode = s_moe_cfg_mmap ? s_moe_cfg_mmap[5] : 1;
 +                if (il >= 3 && (cur_topk < 6 || cfg_min_w > 0.0f)) {
 +                    float orig_sum = 0.0f;
 +                    float orig_l2  = 0.0f;
@@ -2322,7 +2353,7 @@ index 7918845..4133acb 100644
      }
  
  #ifdef GGML_USE_OPENMP
-@@ -3284,6 +3613,8 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
+@@ -3284,6 +3644,8 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
          threadpool->n_barrier        = 0;
          threadpool->n_barrier_passed = 0;
          threadpool->current_chunk    = 0;
@@ -2331,7 +2362,7 @@ index 7918845..4133acb 100644
          threadpool->stop             = false;
          threadpool->pause            = tpp->paused;
          threadpool->abort            = -1;
-@@ -3376,7 +3707,113 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -3376,7 +3738,113 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
      }
  
  #ifdef GGML_USE_OPENMP
@@ -2446,7 +2477,7 @@ index 7918845..4133acb 100644
          #pragma omp parallel num_threads(n_threads)
          {
              #pragma omp single
-@@ -3392,6 +3829,16 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -3392,6 +3860,16 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
              ggml_thread_apply_priority(threadpool->prio);
              if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
                  ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
@@ -2463,7 +2494,7 @@ index 7918845..4133acb 100644
              }
              ggml_graph_compute_thread(&threadpool->workers[ith]);
          }
-@@ -3893,3 +4340,5 @@ void ggml_cpu_init(void) {
+@@ -3893,3 +4371,5 @@ void ggml_cpu_init(void) {
  
      ggml_critical_section_end();
  }

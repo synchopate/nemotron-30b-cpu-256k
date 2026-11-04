@@ -1,5 +1,5 @@
 ================================================================================
-  llama-modchip v2.3.0 -- Pacchetto Windows "Doppio Clic & Via"
+  llama-modchip v2.4.0 -- Pacchetto Windows "Doppio Clic & Via"
   Ottimizzato per: Intel Core i9-9900K + NVIDIA RTX 2080 Ti (11 GB) + 16 GB RAM
 ================================================================================
 

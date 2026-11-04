@@ -3,7 +3,9 @@ param(
     [int]$Profile = 0,
     [int]$Port = 8080,
     [int]$Ctx = 0,
-    [int]$CpuMoe = -1
+    [int]$CpuMoe = -1,
+    [int]$MoeTopK = 6,
+    [double]$MoeMinW = 0.0
 )
 
 $ErrorActionPreference = "Stop"
@@ -20,8 +22,8 @@ if (-not (Test-Path $ModelDir)) { New-Item -ItemType Directory -Path $ModelDir |
 function Write-Banner {
     Clear-Host
     Write-Host "================================================================================" -ForegroundColor Cyan
-    Write-Host "  llama-modchip v2.3.0 -- Windows Hybrid GPU + CPU MoE Edition" -ForegroundColor Green
-    Write-Host "  Ottimizzato per NVIDIA RTX (8-16 GB VRAM) + Intel/AMD CPU (16-64 GB RAM)" -ForegroundColor White
+    Write-Host "  llama-modchip v2.4.0 -- Windows Hybrid GPU + CPU MoE Edition" -ForegroundColor Green
+    Write-Host "  Ottimizzato per NVIDIA RTX / AMD Vulkan (8-16 GB VRAM) + CPU (16-128 GB RAM)" -ForegroundColor White
     Write-Host "================================================================================" -ForegroundColor Cyan
 }
 
@@ -454,6 +456,29 @@ $serverArgs = @(
 if ($nCpuMoe -gt 0) {
     $serverArgs += @("--n-cpu-moe", "$nCpuMoe")
 }
+
+# Configura il controllo MoE runtime L2-quadrature (%TEMP%\dsv4_moe_cfg.bin + variabili ambiente)
+if ($MoeTopK -lt 6 -or $MoeMinW -gt 0.0) {
+    $env:DSV4_MOE_TOPK = "$MoeTopK"
+    $env:DSV4_MOE_MIN_W = "$MoeMinW"
+    $env:LLAMA_MOE_TOP_K = "$MoeTopK"
+}
+try {
+    $cfgPath = Join-Path ([System.IO.Path]::GetTempPath()) "dsv4_moe_cfg.bin"
+    $ms = New-Object System.IO.MemoryStream
+    $bw = New-Object System.IO.BinaryWriter($ms)
+    $bw.Write([int32]$MoeTopK)
+    $bw.Write([int32]$MoeTopK)
+    $bw.Write([int32]([math]::Round($MoeMinW * 10000)))
+    $bw.Write([int32]3)
+    $bw.Write([int32]43)
+    $bw.Write([int32]1) # L2 quadrature norm-preserving rescaling
+    $bw.Write([int32]0)
+    $bw.Write([int32]0)
+    $bw.Flush()
+    [System.IO.File]::WriteAllBytes($cfgPath, $ms.ToArray())
+    $bw.Close()
+} catch {}
 
 $gpuMoeCount = $selectedModel.TotalMoe - $nCpuMoe
 Write-Host ""

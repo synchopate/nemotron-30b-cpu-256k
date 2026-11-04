@@ -83,25 +83,37 @@ find_any_active_port() {
 }
 
 cmd_setup() {
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-        exec "${REPO_ROOT}/apple-silicon/setup.sh" "$@"
-    else
-        exec "${REPO_ROOT}/install.sh" "$@"
-    fi
+    case "$(uname -s)" in
+        Darwin)
+            exec "${REPO_ROOT}/apple-silicon/setup.sh" "$@"
+            ;;
+        MINGW*|MSYS*|CYGWIN*)
+            exec powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${REPO_ROOT}/windows/modchip_win.ps1" "$@"
+            ;;
+        *)
+            exec "${REPO_ROOT}/install.sh" "$@"
+            ;;
+    esac
 }
 
 cmd_start() {
     local model="${1:-$DEFAULT_MODEL}"
     mkdir -p "$PID_DIR" "${WORKSPACE_DIR}/logs"
 
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-        echo -e "${CYAN}[*] macOS detected — delegating to apple-silicon/ scripts...${RESET}"
-        "${REPO_ROOT}/apple-silicon/run-server.sh" > "${WORKSPACE_DIR}/logs/server.log" 2>&1 &
-        echo $! > "$SERVER_PID_FILE"
-        "${REPO_ROOT}/apple-silicon/run-gateway.sh" > "${WORKSPACE_DIR}/logs/gateway.log" 2>&1 &
-        echo $! > "$GATEWAY_PID_FILE"
-        return 0
-    fi
+    case "$(uname -s)" in
+        Darwin)
+            echo -e "${CYAN}[*] macOS detected — delegating to apple-silicon/ scripts...${RESET}"
+            "${REPO_ROOT}/apple-silicon/run-server.sh" > "${WORKSPACE_DIR}/logs/server.log" 2>&1 &
+            echo $! > "$SERVER_PID_FILE"
+            "${REPO_ROOT}/apple-silicon/run-gateway.sh" > "${WORKSPACE_DIR}/logs/gateway.log" 2>&1 &
+            echo $! > "$GATEWAY_PID_FILE"
+            return 0
+            ;;
+        MINGW*|MSYS*|CYGWIN*)
+            echo -e "${CYAN}[*] Windows detected — launching windows/modchip_win.ps1...${RESET}"
+            exec powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${REPO_ROOT}/windows/modchip_win.ps1" "$@"
+            ;;
+    esac
 
     if [[ ! -f "$model" ]]; then
         echo -e "${YELLOW}[!] Model file not found at: ${model}${RESET}"
@@ -143,7 +155,7 @@ cmd_start() {
     echo ""
 
     echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════════════════════════════════════╗${RESET}"
-    echo -e "${BOLD}${GREEN}║ ♟️  llama-modchip v2.1 is LIVE! Choose how you want to interact:             ║${RESET}"
+    echo -e "${BOLD}${GREEN}║ ♟️  llama-modchip v2.4.0 is LIVE! Choose how you want to interact:           ║${RESET}"
     echo -e "${BOLD}${GREEN}╠══════════════════════════════════════════════════════════════════════════════╣${RESET}"
     echo -e "  🌐 ${BOLD}Live Web Chat & Telemetry HUD${RESET} : ${CYAN}http://127.0.0.1:${GATEWAY_PORT}${RESET}"
     echo -e "  💬 ${BOLD}Interactive Terminal Chat${RESET}     : ${GREEN}./modchip chat${RESET}"
