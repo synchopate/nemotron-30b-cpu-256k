@@ -557,10 +557,10 @@ Measured directly on `Qwen3-30B-A3B-Q4_K_M` (`17.28 GiB`) on the `Ryzen 9 9955HX
 
 ---
 
-### 3.12. Optimization 11: Fitting a `284.33B` Frontier MoE (`DeepSeek-V4-Flash`, `13.17B` Active) in `< 60 GiB` RAM at `256K` Context
+### 3.12. Optimization 12: Fitting a `284.33B` Frontier MoE (`DeepSeek-V4-Flash`, `13.17B` Active) in `< 60 GiB` RAM at `256K` Context
 
-Scaling CPU inference from a `30B` MoE (`3.0B` active) to **`DeepSeek-V4-Flash` (`284.33B` total parameters, `45` layers, `256` routed experts + `1` shared expert per layer, `13.17B` active parameters, Multi-Head Latent Attention + Indexer Compressors)** on a **`64 GiB` DDR5 CPU node** introduces three new physical walls:
-1. **The `64 GiB` Physical RAM Cliff**: Even in `IQ2_XXS`, the 4-shard `DeepSeek-V4-Flash` checkpoint occupies **`76.87 GiB` (`82.54 GB`)** on disk, exceeding a `64 GiB` container/workstation before allocating a single byte of `256K` KV cache or compute buffers.
+Scaling CPU inference from a `30B` MoE (`3.0B` active) to **`DeepSeek-V4-Flash` (`284.33B` total parameters, `43` layers — `3` deterministic hash-routed + `40` learned-router — `256` routed experts + `1` shared expert per layer, `13.17B` active parameters, Multi-Head Latent Attention + Indexer Compressors)** on a **`64 GiB` DDR5 CPU node** introduces three new physical walls:
+1. **The `64 GiB` Physical RAM Cliff**: Even in `IQ2_XXS`, the 4-shard source `DeepSeek-V4-Flash` checkpoint occupies **`76.87 GiB` (`82.54 GB`)** on disk (which our transcoder compacts into `3` GGUF shards totaling **`56.56 GiB`**), exceeding a `64 GiB` container/workstation before allocating a single byte of `256K` KV cache or compute buffers.
 2. **The 256-Expert SwiGLU Degradation Wall**: Naive uncalibrated `IQ1_S` (`1.5625 bpw`) quantization across all 256 routed experts collapses SwiGLU gating accuracy because high-norm activation channels in $W_{\text{gate}}^{(e)} \odot W_{\text{up}}^{(e)}$ are quantized with uniform MSE weight.
 3. **3D Multi-Head `wo_a` L1D Thrashing & MLA Sparse Gather Stalls**: DeepSeek-V4's 3D attention output projection (`wo_a`, `ne02 > 1`) overflows the `48 KB` Zen 5 L1D cache when tiled over `i01` (`TILE_I1 = 32`), and its sparse indexer attention mask (`csa_top_k_mask`) gathers non-contiguous historical latent rows from DDR5.
 

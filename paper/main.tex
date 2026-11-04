@@ -1,0 +1,333 @@
+\documentclass[10pt,twocolumn]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage[margin=0.75in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts,amsthm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{url}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!60!black,
+    citecolor=blue!60!black,
+    urlcolor=blue!70!black,
+    pdftitle={llama-modchip: Hardware-Aware Mathematical and Kernel Co-Design for 30B-284B Sparse MoE Inference at 256K Context on Commodity CPUs},
+    pdfauthor={Paolo Colombo}
+}
+
+\newtheorem{proposition}{Proposition}
+\newtheorem{remark}{Remark}
+
+\setlength{\columnsep}{0.25in}
+\emergencystretch=1.5em
+
+\title{\textbf{\Large \texttt{llama-modchip}: Hardware-Aware Mathematical and Kernel Co-Design for 30B--284B Sparse MoE Inference at 256K Context on Commodity CPUs and GPU+CPU Hybrids}}
+
+\author{
+  \textbf{Paolo Colombo} \\
+  Independent Systems \& Machine Learning Researcher \\
+  \texttt{https://github.com/synchopate/llama-modchip}
+}
+
+\date{November 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Running frontier Sparse Mixture-of-Experts (MoE) language models at a 262,144-token (256K) context window is widely assumed to require multi-GPU clusters with high-bandwidth HBM memory. On commodity CPUs (50--90~GB/s dual-channel DDR5), standard inference engines fail due to four compounding bottlenecks: (1) quantizing 256-expert SwiGLU layers below 2~bits/weight without calibration data collapses reasoning, while standard 2-bit formats exceed 64~GiB RAM on 284B-parameter models; (2) neural draft models (0.5B--1B) for speculative decoding read 2--3~GB of weights per draft cycle, saturating the DDR5 bus and flushing the CPU's victim L3 cache; (3) four-level page-table walks across 4--14~million 4~KB pages thrash the L2 STLB; and (4) naive linear rescaling during dynamic MoE expert pruning distorts the variance ratio against dense shared experts.
+
+We present \texttt{llama-modchip} (\texttt{v2.4.0}), an open-source hardware-aware inference engine that co-designs quantization formats, SIMD kernels, cache/TLB hierarchy management, draftless chess-engine speculative search, and norm-preserving low-rank/MoE mathematics. First, we introduce \textbf{Block-64 2-Level Hierarchical Non-Linear Quantization (\texttt{Fractal-64}, 3.75~bpw)} with single-cycle AVX-512 \texttt{vprorvq} and AVX2 \texttt{vpsllvd+vpmaddwd} sub-scale fusion, paired with \textbf{Analytical Second-Order \texttt{SwiGLU-H2} Hessian Compression}, shrinking the 284.33B-parameter \texttt{DeepSeek-V4-Flash} (13.17B active) from 76.87~GiB to \textbf{56.56~GiB} on disk and \textbf{58.9~GiB total \texttt{VmRSS} at full 256K context} on a single 64~GB CPU. Second, we replace neural draft models with \textbf{\texttt{RouteCrack + Stockfish-PVS v2}}, a 1.64~MB L2/L3-resident speculative engine combining an 8-level FNV-64 hash cascade with 4-way Zobrist transposition tables and Principal Variation Search, achieving \textbf{96.39\% live draft acceptance} (48.39~tok/s average / 60.40~tok/s peak on a 16-core Zen~5 CPU, and \textbf{111.62~tok/s} on a 64-core Threadripper PRO 7985WX) on \texttt{Nemotron-3.5-30B-A3B}. Third, we prove that because routed MoE expert vectors in $\mathbb{R}^{4096}$ are nearly mutually orthogonal, tail expert pruning must use \textbf{$L_2$-quadrature rescaling} rather than linear $L_1$ rescaling, cutting next-token KL-divergence by \textbf{58.1\%} (to 0.0042~nats / $+0.42\%$ PPL at Top-5) and pushing pure single-token CPU decode on \texttt{DeepSeek-V4-Flash 284B} from 5.91~tok/s to \textbf{9.06~tok/s (lossless)}, \textbf{9.68~tok/s (Top-5 $L_2$)}, and \textbf{10.12~tok/s (Top-4 $L_2$)}.
+\end{abstract}
+
+\section{Introduction}
+
+Modern frontier language models increasingly adopt sparse Mixture-of-Experts (MoE) architectures paired with state-space or latent-attention compression to decouple total parameter capacity from per-token active compute. Two prominent examples illustrate this design space:
+\begin{enumerate}
+    \item \textbf{\texttt{NVIDIA-Nemotron-3.5-Lightning-30B-A3B}} \cite{nemotron2025}: A 52-layer hybrid architecture ($30.2\text{B}$ total, $3.0\text{B}$ active parameters) comprising 23 Mamba-2 State-Space Model (SSM) layers, 23 Sparse MoE layers (128 routed experts with top-6 routing plus 1 shared expert), and only 6 Grouped-Query Attention (GQA) layers (2 KV heads per layer, 12 KV heads total).
+    \item \textbf{\texttt{DeepSeek-V4-Flash-0731}} \cite{deepseekv3}: A 43-layer frontier MoE Transformer ($284.33\text{B}$ total, $13.17\text{B}$ active parameters) combining 64-head Multi-Head Latent Attention (MLA, compressed KV latent rank 512, RoPE dimension 64, query LoRA rank 1024, and 8 output head-groups of rank 1024), sparse indexer compressors (\texttt{CSA}/\texttt{LID}/\texttt{HCA}), 4-stream Sinkhorn-20 Hyper-Connections ($\text{hc}=4$), and 256 routed experts (top-6 active plus 1 shared expert per layer), where layers $0..2$ employ deterministic token-ID hash routing (\texttt{tid2eid}) and layers $3..42$ employ learned $\sqrt{\text{softplus}}$ top-$k$ routing.
+\end{enumerate}
+
+In principle, activating only $3.0\text{B}$ to $13.17\text{B}$ parameters per token makes these architectures attractive for local deployment on single-socket workstations without data-center GPUs. Prior systems for consumer hardware, such as PowerInfer \cite{powerinfer} (which exploits ReLU activation sparsity via offline neuron profiling), KTransformers \cite{ktransformers} (which offloads MoE experts to CPU while running attention on a GPU), SqueezeLLM \cite{squeezellm} (sensitivity-based non-uniform quantization requiring calibration gradients), and FlashAttention-2 \cite{dao2023flashattention2} (GPU-centric IO-aware attention tiling), have advanced local inference significantly. However, deploying modern SwiGLU/Mamba-2/MLA MoE models at a full 262,144-token (256K) context window on a pure 64~GB RAM CPU box (or a consumer 8--16~GB GPU + 16--64~GB RAM hybrid) without offline calibration datasets exposes four compounding bottlenecks that neither baseline \texttt{llama.cpp} \cite{llamacpp} nor prior hybrid engines address:
+
+\begin{itemize}
+    \item \textbf{The 64~GiB Capacity \& Non-Divisibility Wall}: Even at aggressive 2-bit quantization (\texttt{IQ2\_XXS}), \texttt{DeepSeek-V4-Flash} requires 76.87~GiB on disk, triggering immediate Linux OOM termination on a 64~GB host. Meanwhile, on \texttt{Nemotron-3.5-30B-A3B}, expert dimensions ($1856 \times 2688$) are not divisible by standard K-quant super-block sizes ($QK_K = 256$), forcing \texttt{llama-quantize} to fall back to 4.5~bpw \texttt{Q4\_0} (17.59~GiB).
+    \item \textbf{The CPU Speculative Bandwidth Paradox}: On HBM3 GPUs (3.35~TB/s), a 1B neural draft model executes 5 steps in $<1$~ms. On dual-channel DDR5 CPUs ($\sim 72$~GB/s), streaming 600~MB of 1B draft weights 5 times reads 3.0~GB from DRAM ($\sim 40$~ms)---slower than executing the 30B MoE target model itself (1.8~GB active), while evicting hot recurrent state and KV blocks from the 64~MB L3 victim cache.
+    \item \textbf{Microarchitectural TLB \& Graph-Rebuild Stalls}: Mapping 18--57~GiB of weights in default 4~KB pages creates 4.5--14.8~million page table entries (PTEs), exceeding the 3,072-entry L2 STLB of AMD Zen~5 by $1,500\times$--$4,800\times$. Furthermore, dynamic compressor topology changes in \texttt{DeepSeek-V4-Flash} trigger full 4,551-node compute-graph rebuilds on 7 out of every 8 decode tokens.
+    \item \textbf{Unexamined Linear \& Orthogonal Redundancy}: Nearly 31\% of per-token DRAM traffic in \texttt{DeepSeek-V4-Flash} (991.6~MB/tok) is spent in the unactivated linear chain $\mathbf{W}_{o,b} \mathbf{W}_{o,a}$, while naive linear weight renormalization during dynamic MoE tail pruning distorts the amplitude ratio between routed experts and the dense shared expert.
+\end{itemize}
+
+\subsection{Contributions}
+This paper makes four tightly coupled contributions, all implemented in open-source C/C++ and verified across x86-64 (AMD Zen~5, 8-CCD Zen~4 Threadripper, Intel AVX2), ARM64 (AWS Graviton3, Apple M4 Pro), and GPU+CPU hybrids (Linux/Windows CUDA \& Vulkan):
+\begin{enumerate}
+    \item \textbf{\texttt{Fractal-64} Quantization, \texttt{SwiGLU-H2} Analytical Hessian Compression, \& AVX-512/AVX2 Kernel Co-Design (\S\ref{sec:quant})}: We design a 30-byte Block-64 hierarchical non-linear format (3.75~bpw) whose 4-bit sub-scales fuse at zero instruction overhead into AVX2 \texttt{vpmaddwd} and AVX-512 \texttt{vprorvq} (\texttt{\_mm512\_rorv\_epi64}), and derive a closed-form second-order SwiGLU Hessian metric that compresses \texttt{DeepSeek-V4-Flash 284B} to 56.56~GiB (58.9~GiB \texttt{VmRSS} at 256K context).
+    \item \textbf{Mathematical Co-Design for \texttt{DeepSeek-V4-Flash}: SVD Spectrum of $\mathbf{W}_{o,b}\mathbf{W}_{o,a}$ \& $L_2$-Quadrature MoE Tail Pruning (\S\ref{sec:math})}: We prove that because routed expert outputs in $\mathbb{R}^{4096}$ are nearly orthogonal, pruned router weights must be rescaled in quadrature ($\alpha_{L_2}$) rather than linearly ($\alpha_{L_1}$), reducing next-token KL-divergence by 58.1\% (to 0.0042~nats at Top-5) while preserving hash-routed lexical layers ($il=0..2$). We also characterize the exact singular value spectrum of $\mathbf{W}_{o,b}\mathbf{W}_{o,a}$ (99.82\% cosine similarity at rank $r=768/1024$).
+    \item \textbf{Draftless Chess-Engine Speculative Decoding (\texttt{RouteCrack + Stockfish-PVS v2}, \S\ref{sec:spec})}: We formulate the CPU-MoE speculative wall-clock equation and introduce a 1.64~MB L2/L3-resident drafter using 4-way Zobrist transposition tables and Principal Variation Search, unlocking Singular Horizon Extensions up to $M=7$ with 98.74\% marginal precision at $D=5..7$.
+    \item \textbf{Cross-Platform Memory Hierarchy \& Hybrid GPU+CPU Orchestration (\S\ref{sec:sys})}: We combine 2~MB Transparent HugePages, bidirectional \texttt{\_MM\_HINT\_NTA} victim-L3 isolation, 3D L1D cache tiling, zero-rebuild dynamic \texttt{CSA/LID} node skipping, 8-slot \texttt{Q8} activation caching, deterministic $4\text{C/CCD}$ multi-chiplet pinning, and live-VRAM Windows/Linux tensor-role splitting (\texttt{--n-cpu-moe}).
+\end{enumerate}
+
+\section{Quantization \& SIMD Co-Design}
+\label{sec:quant}
+
+\subsection{Block-64 \texttt{Fractal-64} (\texttt{Q2\_0}, 3.75~bpw)}
+In \texttt{Nemotron-3.5-30B-A3B}, the MoE projections have inner dimensions $1856 = 29 \times 64$ and $2688 = 42 \times 64$. Because neither is divisible by $QK_K = 256$, standard K-quants (\texttt{Q3\_K}, \texttt{IQ3\_S}) cannot quantize the expert tensors. We introduce \texttt{Fractal-64} (mapped to the 64-weight \texttt{GGML\_TYPE\_Q2\_0} slot), which encodes 64 weights in exactly \textbf{30~bytes (3.75~bits/weight)}:
+\begin{itemize}
+    \item \texttt{ggml\_half d} (2~bytes): FP16 super-block scale.
+    \item \texttt{uint8\_t scales[4]} (4~bytes): Eight 4-bit unsigned sub-scales $m_s \in \{0..15\}$ (representing shifted multipliers $\tilde{m}_s = m_s + 4 \in \{4..19\}$) covering eight 8-weight micro-blocks.
+    \item \texttt{uint8\_t qs[16]} (16~bytes) and \texttt{uint8\_t qh[8]} (8~bytes): Lower 2 bits and upper 1 bit of 64 3-bit indices $q_i \in \{0..7\}$, mapped onto a symmetric non-linear codebook $\mathcal{C} = \{-14, -8, -4, -1, +1, +4, +8, +14\}$ fitted to the empirical Kurtosis of SwiGLU expert weights.
+\end{itemize}
+
+\paragraph{Zero-Overhead SIMD Sub-Scale Fusion.}
+A naive implementation would convert each 8-weight dot product to FP32 before multiplying by $\tilde{m}_s$. Instead, against \texttt{Q8\_0} activations $x_i \in [-127, 127]$, the maximum magnitude of an 8-element inner product is $8 \times 14 \times 127 = 14,224$. However, in our AVX2/AVX-512 kernel (\texttt{ggml\_vec\_dot\_q2\_0\_q8\_0\_generic}), we accumulate pairs of products via \texttt{\_mm256\_maddubs\_epi16} (\texttt{vpmaddubsw}), whose 16-bit signed lanes have a worst-case bound of $2 \times 14 \times 127 = 3,556$. Multiplying by the maximum sub-scale $\tilde{m}_s \le 19$ yields $3,556 \times 19 = 67,564$, whereas \texttt{vpmaddwd} (\texttt{\_mm256\_madd\_epi16(p01, vmult01)}) widens directly to 32-bit signed integers (\texttt{INT32\_MAX} $= 2.14 \times 10^9$) while summing adjacent pairs! Thus, replicating $\tilde{m}_s$ into 16-bit lanes and feeding it as the second operand of \texttt{vpmaddwd} fuses sub-block rescaling and horizontal pairwise reduction in a \textbf{single clock cycle with zero extra instructions}. On Zen~5, extracting the 64-bit upper bit-plane \texttt{qh[8]} is further accelerated via single-instruction AVX-512 variable 64-bit rotation \texttt{\_mm512\_rorv\_epi64} (\texttt{vprorvq}), reducing 10M-block contraction time from 86.5~ms to \textbf{55.8~ms ($+55\%$ speedup)}.
+
+\subsection{Analytical Second-Order \texttt{SwiGLU-H2} Compression for 284B MoE}
+To fit \texttt{DeepSeek-V4-Flash} ($284.33\text{B}$ parameters) inside $<60$~GiB of RAM without a multi-terabyte calibration run, we observe that each routed expert computes a gated bilinear product:
+\begin{equation}
+    \mathbf{h}^{(e)}(\mathbf{x}) = \text{SiLU}\!\left(\mathbf{W}_{\text{gate}}^{(e)} \mathbf{x}\right) \odot \left(\mathbf{W}_{\text{up}}^{(e)} \mathbf{x}\right).
+\end{equation}
+Assuming isotropic unit-variance pre-activations $\mathbb{E}[\mathbf{x}\mathbf{x}^\top] \propto \mathbf{I}$, a second-order Taylor expansion of the reconstruction error $\|\mathbf{h}^{(e)}(\mathbf{x}) - \hat{\mathbf{h}}^{(e)}(\mathbf{x})\|_2^2$ with respect to quantization perturbations $\Delta \mathbf{W}_{\text{gate}}^{(e)}$ and $\Delta \mathbf{W}_{\text{up}}^{(e)}$ yields a closed-form expected diagonal Hessian importance weight for expert $e$, output row $j$:
+\begin{equation}
+    I_{e,j} = \left\|\mathbf{W}_{\text{gate}}^{(e)}[j,:]\right\|_2^2 \cdot \left\|\mathbf{W}_{\text{up}}^{(e)}[j,:]\right\|_2^2.
+\end{equation}
+In \texttt{scripts/transcode\_dsv4.c}, we dequantize the paired Gate and Up expert slices simultaneously, weight \texttt{quantize\_row\_iq1\_s} by $I_{e,j}$ on bulk routed layers, retain high-sensitivity anchor layers ($\{0, 1, 26, 28, 41, 42\}$ in \texttt{IQ2\_XXS}; $\{2, 4, 5, 8, 27, 30, 32, 40\}$ in \texttt{IQ1\_M}), and transcode all dense \texttt{Q8\_0} MLA and Indexer projections (\texttt{attn\_q\_b}, \texttt{attn\_output\_a}, \texttt{attn\_output\_b}, \texttt{attn\_compressor\_*}, \texttt{indexer\_compressor\_*}) to \texttt{Fractal-64} (\texttt{Q2\_0}, 3.75~bpw). This shrinks the 3-shard GGUF from 76.87~GiB down to \textbf{56.56~GiB ($-26.4\%$)} and enables full 256K-context execution in \textbf{58.9~GiB \texttt{VmRSS}} on a 64~GB CPU host.
+
+\begin{table*}[t]
+\centering
+\caption{Exact operator-by-operator single-token decode profile (\texttt{LLAMA\_PROFILE\_OPS}, $N=1$, 4,551 graph nodes) and 512-token prompt prefill (\texttt{pp512}) on \texttt{DeepSeek-V4-Flash-0731-Fractal} (284.33B total / 13.17B active, 3 transcoded GGUF shards $= 56.56$~GiB from the 4-shard 76.87~GiB \texttt{IQ2\_XXS} source) on a single 16C/32T AMD Ryzen 9 9955HX (Zen 5, 0 GPUs).}
+\label{tab:dsv4_profile}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}lcccccc@{}}
+\toprule
+\textbf{Operator / Subsystem (43 Layers)} & \textbf{Types} & \textbf{Calls/Tok} & \textbf{\texttt{v2.3.0} Init} & \textbf{Pre-Micro-Opt} & \textbf{\texttt{v2.4.0} Lossless} & \textbf{\texttt{v2.4.0} \texttt{Top-4 L2}} \\
+\midrule
+1. MLA \& Shared Expert \texttt{MUL\_MAT} (\texttt{wq\_b}, \texttt{wo\_a/b}, \texttt{shexp}) & \texttt{q2\_0} & 512 & 78.40 ms & 62.20 ms & \textbf{61.81 ms} & \textbf{61.81 ms} \\
+2. Routed MoE \texttt{MUL\_MAT\_ID} (Bulk \texttt{SwiGLU-H2}) & \texttt{iq1\_s} & 87 & 25.10 ms & 22.79 ms & \textbf{22.27 ms} & \textbf{15.17 ms} ($-33.4\%$) \\
+3. Routed MoE \texttt{MUL\_MAT\_ID} (Anchor Layers) & \texttt{iq2\_xxs} & 18 & 4.50 ms & 4.04 ms & \textbf{4.01 ms} & \textbf{2.75 ms} ($-31.9\%$) \\
+4. Routed MoE \texttt{MUL\_MAT\_ID} (Mid-Sensitivity Layers) & \texttt{iq1\_m} & 24 & 2.10 ms & 1.81 ms & \textbf{1.80 ms} & \textbf{1.16 ms} ($-35.9\%$) \\
+5. Output Head (\texttt{lm\_head}) + Router Gates & \texttt{q4\_K/q6\_K/f32} & 298 & 11.20 ms & 9.29 ms & \textbf{9.05 ms} & \textbf{9.05 ms} \\
+6. \texttt{HADAMARD} (FWHT), \texttt{RMS\_NORM}, \texttt{HC\_PRE/POST}, \texttt{FA} & \texttt{f32/f16} & 1,810 & 19.60 ms & 10.12 ms & \textbf{9.85 ms} & \textbf{8.90 ms} \\
+7. Graph Rebuild \& Dynamic \texttt{CSA/LID} Compressor Skip & Graph/C++ & 1 & 28.40 ms & 11.67 ms & \textbf{1.54 ms} & \textbf{0.00 ms} \\
+\midrule
+\textbf{Total Single-Token Decode Latency ($N=1$)} & \textbf{All} & \textbf{4,551} & \textbf{169.30 ms} & \textbf{121.92 ms} & \textbf{110.33 ms} & \textbf{98.84 ms} \\
+\textbf{Pure Single-Token Decode Throughput (\texttt{tok/s})} & --- & --- & 5.91 tok/s & 8.20 tok/s & \textbf{9.06 tok/s} ($+53.3\%$) & \textbf{10.12 tok/s} ($+71.2\%$) \\
+\textbf{Batched Prompt Prefill Throughput (\texttt{pp512})} & --- & 5,375 & 24.70 tok/s & 40.91 tok/s & \textbf{41.58 tok/s} ($+68.3\%$) & \textbf{41.58 tok/s} ($+68.3\%$) \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+\section{Mathematical Structure \& Low-Rank / MoE Co-Design}
+\label{sec:math}
+
+\subsection{Spectral Decay of the Unactivated Linear Chain $\mathbf{W}_{o,b}\mathbf{W}_{o,a}$}
+During single-token decode of \texttt{DeepSeek-V4-Flash}, $\sim 3.20$~GB of weights are streamed from DDR5 per token. Profiling reveals that \textbf{31.0\% of all DRAM traffic (991.6~MB/tok, or 23.06~MB/layer across 43 layers)} occurs in the MLA output projection (\texttt{deepseek4.cpp}), which applies two consecutive \texttt{Q2\_0} matrices across $G=8$ head-groups ($r_o = 1024$ inner dimension per group, $d = 4096$ model dimension) with \textbf{zero non-linearity, zero normalization, and zero bias} between them:
+\begin{equation}
+    \mathbf{y}_{\text{attn}} = \sum_{g=1}^{8} \mathbf{W}_{o,b}^{(g)} \!\left( \mathbf{W}_{o,a}^{(g)} \mathbf{x}_g \right),
+\end{equation}
+where $\mathbf{W}_{o,a}^{(g)} \in \mathbb{R}^{1024 \times 4096}$ and $\mathbf{W}_{o,b}^{(g)} \in \mathbb{R}^{4096 \times 1024}$.
+
+De-quantizing the actual GGUF tensors (\texttt{blk.\{0,3,4,10\}.attn\_output\_\{a,b\}.weight}) and computing the exact Singular Value Decomposition $\mathbf{M}_g = \mathbf{W}_{o,b}^{(g)} \mathbf{W}_{o,a}^{(g)} = \mathbf{U}_g \boldsymbol{\Sigma}_g \mathbf{V}_g^\top$ across all 8 head-groups demonstrates rapid spectral decay ($\sigma_0 = 15.398 \to \sigma_{768} = 0.901 \to \sigma_{1023} = 0.048$; in early layers, the bottom 180 singular values fall below $10^{-3}$). As shown in Table~\ref{tab:svd_wo}, rank-768 truncation ($-25.0\%$ DRAM $= -247.9$~MB/tok, saving $\sim 6.9$~ms/tok) retains \textbf{99.64\% of Frobenius energy} and achieves \textbf{0.998204 output cosine similarity}.
+
+\begin{table}[h]
+\centering
+\caption{Exact SVD truncation analysis of the linear operator $\mathbf{M}_g = \mathbf{W}_{o,b}^{(g)} \mathbf{W}_{o,a}^{(g)}$ across 8 head-groups in \texttt{DeepSeek-V4-Flash}.}
+\label{tab:svd_wo}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Rank $r / 1024$} & \textbf{DRAM Saved} & \textbf{Frobenius Energy} & \textbf{Cosine Sim} & \textbf{Rel.\ $L_2$ Err} \\
+\midrule
+$r = 1024$ (Full) & $0\text{ MB/tok}$ & $100.00\%$ & $1.000000$ & $0.00\%$ \\
+$r = 768$ ($-25.0\%$) & $-247.9\text{ MB/tok}$ & $\mathbf{99.64\%}$ & $\mathbf{0.998204}$ & $5.99\%$ \\
+$r = 640$ ($-37.5\%$) & $-371.9\text{ MB/tok}$ & $98.61\%$ & $\mathbf{0.992999}$ & $11.80\%$ \\
+$r = 512$ ($-50.0\%$) & $-495.8\text{ MB/tok}$ & $96.02\%$ & $0.979718$ & $20.02\%$ \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\subsection{Orthogonal Geometry of MoE Tail Pruning \& $L_2$-Quadrature Rescaling}
+In each layer $l \in \{0..42\}$ of \texttt{DeepSeek-V4-Flash}, the FFN block sums one dense shared expert $\mathbf{e}_{\text{shared}}(\mathbf{x})$ and $K=6$ routed experts $\mathbf{e}_{k_1}(\mathbf{x}), \dots, \mathbf{e}_{k_6}(\mathbf{x}) \in \mathbb{R}^{d}$ ($d=4096$):
+\begin{equation}
+    \mathbf{y}_{\text{FFN}}(\mathbf{x}) = \mathbf{e}_{\text{shared}}(\mathbf{x}) + \sum_{i=1}^{K} w_i \, \mathbf{e}_{k_i}(\mathbf{x}), \quad \sum_{i=1}^{K} w_i = 1.5,
+\end{equation}
+where $w_1 \ge w_2 \ge \dots \ge w_K > 0$ are the sorted router weights. Logging $w_{1..6}$ across all 43 layers reveals a fundamental structural dichotomy:
+\begin{enumerate}
+    \item \textbf{Hash-Routed Lexical Layers ($l \in \{0, 1, 2\}$)}: Selected via 6 deterministic token-ID hash tables (\texttt{ffn\_gate\_tid2eid}). Their weights are nearly flat (e.g., $l=2$: $[0.270, 0.261, 0.258, 0.257, 0.255, 0.199]$). Pruning any expert in $l \in \{0,1,2\}$ discards $1/6$th of the token's lexical representation and corrupts numeric/hexadecimal constants. Thus, $l \in \{0,1,2\}$ must remain unpruned ($k=6$).
+    \item \textbf{Learned-Router Layers ($l \in \{3..42\}$)}: Selected via $\sqrt{\text{softplus}}$ top-$k$ routing. The weights obey a steep power law (e.g., $l=19$: $[0.762, 0.202, 0.156, 0.145, 0.119, 0.117]$; $l=8$: $[0.446, 0.386, 0.367, 0.120, 0.092, 0.088]$). Across $l \in \{3..42\}$, the top-4 experts hold $81.2\%$ of $\sum w_i$, the top-5 hold $91.0\%$, and the 6th expert carries only $6\%\text{--}9\%$ ($<4\%$ of total FFN energy including $\mathbf{e}_{\text{shared}}$).
+\end{enumerate}
+
+\begin{proposition}[Suboptimality of Linear $L_1$ Rescaling vs.\ $L_2$-Quadrature Rescaling]
+Let $\mathbf{e}_{k_1}(\mathbf{x}), \dots, \mathbf{e}_{k_K}(\mathbf{x}) \in \mathbb{R}^d$ ($d=4096$) be zero-mean expert outputs with approximately equal second moments $\mathbb{E}\|\mathbf{e}_{k_i}\|_2^2 = \sigma_e^2$ and near-mutual orthogonality $\mathbb{E}\langle \mathbf{e}_{k_i}, \mathbf{e}_{k_j}\rangle \approx 0$ for $i \neq j$, and let $\mathbf{e}_{\text{shared}}(\mathbf{x})$ be orthogonal to the routed experts with $\mathbb{E}\|\mathbf{e}_{\text{shared}}\|_2^2 = \sigma_s^2$. When truncating the routed sum to $1 \le k \le K$ experts with a rescaling factor $\alpha > 0$, $\hat{\mathbf{y}}_{\text{FFN}}(\alpha) = \mathbf{e}_{\text{shared}} + \alpha \sum_{i=1}^k w_i \mathbf{e}_{k_i}$:
+\begin{enumerate}
+    \item The minimum mean-squared error ($L_2$-optimal) projection onto $\text{span}(\mathbf{e}_{k_1}, \dots, \mathbf{e}_{k_k})$ is achieved at $\alpha_{\text{proj}} = 1$, whereas preserving the exact expected squared norm $\mathbb{E}\|\hat{\mathbf{y}}_{\text{FFN}}(\alpha)\|_2^2 = \mathbb{E}\|\mathbf{y}_{\text{FFN}}\|_2^2 = \sigma_s^2 + \sigma_e^2 \sum_{i=1}^K w_i^2$ entering the downstream \texttt{RMSNorm} requires \textbf{$L_2$-quadrature rescaling}:
+    \begin{equation}
+        \alpha_{L_2} = \sqrt{\frac{\sum_{i=1}^{K} w_i^2}{\sum_{i=1}^{k} w_i^2}}.
+    \end{equation}
+    \item Conversely, conventional linear $L_1$-sum rescaling $\alpha_{L_1} = \frac{\sum_{i=1}^K w_i}{\sum_{i=1}^k w_i}$ strictly inflates the variance of the routed MoE branch relative to the unscaled shared expert $\mathbf{e}_{\text{shared}}$ for all $1 \le k < K$ by the factor:
+    \begin{equation}
+        \Gamma(w) = \frac{\alpha_{L_1}^2}{\alpha_{L_2}^2} = \frac{\left(\sum_{i=1}^K w_i\right)^2}{\left(\sum_{i=1}^k w_i\right)^2} \cdot \frac{\sum_{i=1}^k w_i^2}{\sum_{i=1}^K w_i^2} > 1.
+    \end{equation}
+\end{enumerate}
+\end{proposition}
+
+\begin{proof}
+By mutual orthogonality, $\mathbb{E}\|\mathbf{y}_{\text{FFN}} - \hat{\mathbf{y}}_{\text{FFN}}(\alpha)\|_2^2 = \sigma_e^2 \left[(1 - \alpha)^2 \sum_{i=1}^k w_i^2 + \sum_{i=k+1}^K w_i^2\right]$, which is minimized at $\alpha = 1$, while setting $\mathbb{E}\|\sum_{i=1}^k (\alpha w_i) \mathbf{e}_{k_i}\|_2^2 = \sigma_e^2 \alpha^2 \sum_{i=1}^k w_i^2 = \sigma_e^2 \sum_{i=1}^K w_i^2$ yields $\alpha = \alpha_{L_2}$. For typical learned-router weights at $k=4$ ($\sum_{i=1}^6 w_i = 1.50$, $\sum_{i=1}^4 w_i = 1.22$, $\sum_{i=1}^6 w_i^2 = 0.4806$, $\sum_{i=1}^4 w_i^2 = 0.4414$), linear rescaling gives $\alpha_{L_1} = 1.2295$ ($+23.0\%$ amplitude inflation, $\Gamma = 1.388$), whereas quadrature rescaling gives $\alpha_{L_2} = \sqrt{0.4806/0.4414} = 1.0435$ ($+4.35\%$).
+\end{proof}
+
+\begin{remark}[Positive Directional Correlation $\rho$ and Downstream \texttt{RMSNorm} SNR]
+If co-selected experts share a small positive pairwise directional correlation $\rho = \mathbb{E}\langle \mathbf{e}_{k_i}, \mathbf{e}_{k_j}\rangle / \sigma_e^2 \in [0, 1)$ (or a common non-zero mean $\boldsymbol{\mu}$), the exact variance-preserving factor generalizes to
+\[
+\alpha_{\text{gen}}(\rho) = \sqrt{\frac{(1-\rho)\sum_{i=1}^K w_i^2 + \rho\left(\sum_{i=1}^K w_i\right)^2}{(1-\rho)\sum_{i=1}^k w_i^2 + \rho\left(\sum_{i=1}^k w_i\right)^2}},
+\]
+which smoothly interpolates between $\alpha_{L_2}$ ($\rho \to 0$) and $\alpha_{L_1}$ (the degenerate collinear limit $\rho \to 1$). Moreover, although $\alpha_{\text{proj}}=1$ minimizes pre-normalization Euclidean MSE, the FFN output is immediately normalized by $\text{RMSNorm}(\mathbf{r} + \mathbf{y}_{\text{FFN}})$. Leaving $\alpha=1$ reduces the variance of the routed MoE branch relative to the residual stream $\mathbf{r}$ and shared expert $\mathbf{e}_{\text{shared}}$, whereas $\alpha_{L_2}$ preserves the exact signal-to-noise energy ratio between the routed and shared branches prior to \texttt{RMSNorm} division.
+\end{remark}
+
+Table~\ref{tab:moe_pruning} validates Proposition~1 empirically on \texttt{DeepSeek-V4-Flash 284B} on a deterministic code-generation micro-benchmark (24 teacher-forced single-token decode steps over an algorithmic Python/C prompt plus 180-token free generation, where $D_{\text{KL}}(P \| Q)$ and the local perplexity shift $\Delta\text{PPL}_{\text{top-10}} = \exp(D_{\text{KL}}) - 1$ are evaluated over the renormalized top-10 logit support): switching from $\alpha_{L_1}$ to $\alpha_{L_2}$ at $k=4$ \textbf{cuts top-10 next-token KL-divergence by 58.1\%} ($0.0671 \to 0.0281$~nats) and restores 100.0\% Top-3 token agreement, while $k=5$ ($\alpha_{L_2}$) achieves \textbf{9.68~tok/s} with a negligible \textbf{0.0042~nats top-10 KL-divergence ($+0.42\%$ local $\Delta\text{PPL}_{\text{top-10}}$)} and \textbf{0.99714 probability cosine similarity}.
+
+\begin{table*}[t]
+\centering
+\caption{Empirical quality vs.\ decode speed of runtime MoE tail pruning on \texttt{DeepSeek-V4-Flash 284B} ($l \in \{0..2\}$ kept at $6/6$ experts; evaluated over 24 teacher-forced code-generation decode steps + 180-token free generation on 16C Zen~5, with $D_{\text{KL}}$ and $\Delta\text{PPL}_{\text{top-10}} = \exp(D_{\text{KL}})-1$ measured on the renormalized top-10 logit support).}
+\label{tab:moe_pruning}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}lccccccc@{}}
+\toprule
+\textbf{Runtime MoE Configuration} & \textbf{Decode (\texttt{tok/s})} & \textbf{Latency} & \textbf{Speedup vs.\ Init} & \textbf{Prob CosSim} & \textbf{Top-10 $D_{\text{KL}}$ (nats)} & \textbf{Local $\Delta\text{PPL}_{\text{top-10}}$} & \textbf{Top-1 / Top-3 Match} \\
+\midrule
+0. \texttt{v2.3.0} Initial Baseline ($N=1$) & 5.91 tok/s & 169.30 ms & $1.00\times$ & 1.00000 & 0.0000 & $+0.00\%$ & $100.0\% / 100.0\%$ \\
+1. \textbf{\texttt{v2.4.0} Lossless (\texttt{Top-6} All, Default)} & \textbf{9.06 tok/s} & \textbf{110.33 ms} & $\mathbf{+53.3\%}$ & \textbf{1.00000} & \textbf{0.0000} & $\mathbf{+0.00\%}$ & $\mathbf{100.0\% / 100.0\%}$ \\
+2. \textbf{Adaptive Tail ($w_i < 0.11$, $\alpha_{L_2}$)} & \textbf{9.52 tok/s} & \textbf{105.02 ms} & $\mathbf{+61.1\%}$ & \textbf{0.99634} & \textbf{0.0047} & $\mathbf{+0.47\%}$ & $\mathbf{95.8\% / 100.0\%}$ \\
+3. \textbf{Sweet-Spot (\texttt{Top-5} on $l \ge 3$, $\alpha_{L_2}$)} & \textbf{9.68 tok/s} & \textbf{103.27 ms} & $\mathbf{+63.8\%}$ & \textbf{0.99714} & \textbf{0.0042} & $\mathbf{+0.42\%}$ & $\mathbf{95.8\% / 100.0\%}$ \\
+4. \textbf{Hybrid \texttt{6/4/6} ($l \in [16,39]$ at 4, $\alpha_{L_2}$)} & \textbf{9.83 tok/s} & \textbf{101.74 ms} & $\mathbf{+66.3\%}$ & \textbf{0.99660} & \textbf{0.0184} & $\mathbf{+1.86\%}$ & $\mathbf{95.8\% / 100.0\%}$ \\
+5. \textbf{Hybrid \texttt{5/4/5} ($l \in [12,40]$ at 4, $\alpha_{L_2}$)} & \textbf{9.95 tok/s} & \textbf{100.55 ms} & $\mathbf{+68.4\%}$ & \textbf{0.99463} & \textbf{0.0215} & $\mathbf{+2.17\%}$ & $\mathbf{95.8\% / 100.0\%}$ \\
+6. \textbf{Turbo \texttt{10+} (\texttt{Top-4} on $l \ge 3$, $\alpha_{L_2}$)} & \textbf{10.12 tok/s} & \textbf{98.84 ms} & $\mathbf{+71.2\%}$ & \textbf{0.99587} & \textbf{0.0281} & $\mathbf{+2.85\%}$ & $\mathbf{95.8\% / 100.0\%}$ \\
+\midrule
+\textit{Ablation: \texttt{Top-4} with Linear $L_1$ Rescaling ($\alpha_{L_1}$)} & 10.10 tok/s & 98.97 ms & $+70.9\%$ & 0.98698 & 0.0671 & $+6.94\%$ & $95.8\% / 95.8\%$ \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+\section{Draftless Speculative Decoding: \texttt{RouteCrack + Stockfish-PVS v2}}
+\label{sec:spec}
+
+\subsection{The CPU-MoE Speculative Golden Equation}
+In standard speculative decoding \cite{leviathan2023fast}, $D$ draft tokens are verified in a single batched target forward pass. On a GPU where $D \le 8$ lies inside the compute-bound roof, verification time equals a single-token step ($c_{\text{gpu}} \approx 0$). On a memory-bandwidth-bound CPU hosting a Sparse MoE, each additional token in a verification batch activates additional routed experts from DDR5 ($\sim 0.30\times$ single-token latency per drafted token on \texttt{Nemotron-3.5-30B-A3B}), and any rejected draft token triggers an 18.4~MB Mamba-2 recurrent state rollback (\texttt{slot.spec\_ckpt}). Consequently, net wall-clock gain over $A$ accepted tokens and $W = D - A$ wasted tokens obeys:
+\begin{equation}
+    \text{WallGain}_{\text{CPU}} = A - 0.30\, D = 0.70\, A - 0.30\, W.
+\end{equation}
+A 1B neural draft model reading 600~MB per step incurs $\sim 40$~ms of DDR5 latency for $D=5$ and flushes the 64~MB L3 cache, yielding ~11.5~tok/s (slower than non-speculative decoding).
+
+\subsection{\texttt{StockfishDrafter}: 192~KB L2 Zobrist TT \& Principal Variation Search}
+To achieve high recall without DRAM traffic, \texttt{RouteCrack} (\texttt{rc\_predictor.h}) pairs a static 8-level FNV-64 hash cascade, an online session trie (\texttt{rc\_trie\_v2.h}), and an 11,382-entry multi-token macro codebook with \textbf{\texttt{StockfishDrafter} (\texttt{rc\_stockfish.h})} \cite{stockfish}. \texttt{StockfishDrafter} maintains three lockless 4-way bucketed Zobrist transposition tables (\texttt{tt5}, \texttt{tt4}, \texttt{tt3} $= 3 \times 64\text{ KB} = 192\text{ KB}$, $<19\%$ of Core~0's 1~MB L2 cache on Zen~5) with 32-bit verification keys, verified \texttt{best\_move}, explicit \texttt{refuted\_move} tracking, and history gravity ($\in [-512, +512]$).
+
+Crucially, because static cascade tables and live-session Zobrist transposition tables have \textit{uncorrelated error modes}, gating uncertain candidates on their orthogonal agreement unlocks four previously unusable high-recall predictors: (1) Online Session Trie Rescue (92.19\% marginal precision), (2) Top-4 Cascade Disambiguation, (3) Multi-Token Macro Codebook chains (96.44\% precision), and (4) \textbf{Singular Horizon Extension up to $M=7$ tokens/step} (98.74\% marginal precision at $D=5..7$). As shown in Table~\ref{tab:synergy} (evaluated across 77,456 held-out tokens in \texttt{test\_synergy.cpp}), \texttt{Stockfish-PVS v2} adds \textbf{$+223$ accepted tokens with zero net additional wasted tokens ($W=892 \to 892$, 100.0\% net marginal precision)} and eliminates 32 Mamba-2 rollbacks.
+
+\begin{table}[h]
+\centering
+\caption{Held-out ablation across 77,456 \texttt{Nemotron-3.5} tokens (351 contexts, \texttt{speculative/cpp/test\_synergy.cpp}).}
+\label{tab:synergy}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+\textbf{Drafter Configuration} & \textbf{Draft $D$} & \textbf{Acc $A$} & \textbf{Waste $W$} & \textbf{Rollbacks} & \textbf{WallGain} \\
+\midrule
+1. \texttt{RouteCrack} ($M=5$) & 6,332 & 5,440 & 892 & 482 & $+3,540.4$ \\
+2. \texttt{+ Stockfish-PVS v1} & 6,329 & 5,459 & \textbf{870} & 461 & $+3,560.3$ \\
+3. \textbf{\texttt{+ Stockfish-PVS v2 ($M=7$)}} & \textbf{6,555} & \textbf{5,663} & \textbf{892} & \textbf{450} & $\mathbf{+3,696.5}$ \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+\section{Microarchitectural \& Multi-Platform Systems Co-Design}
+\label{sec:sys}
+
+\subsection{Kernel \& Graph Optimizations in \texttt{ggml-cpu}}
+\begin{enumerate}
+    \item \textbf{Zero-Rebuild Dynamic \texttt{CSA/LID} Skip (\texttt{ggml\_dsv4\_skip\_csa\_comp})}: In \texttt{DeepSeek-V4-Flash}, \texttt{CSA/LID} compressor blocks execute only once every 8 tokens during decode. Instead of rebuilding the 4,551-node compute graph when transitioning between compressor and non-compressor steps, we build the superset graph once, tag dummy compressor nodes with \texttt{flags |= 0x100}, and skip them in $O(1)$ inside \texttt{ggml\_graph\_compute\_thread}, eliminating 26.8~ms/tok of graph allocation overhead.
+    \item \textbf{8-Slot Thread-Local \texttt{Q8\_K}/\texttt{Q8\_0} Activation Cache \& \texttt{MUL\_MAT\_ID} Row-Group Reuse}: When multiple projections share the same FP32 input tensor (e.g., \texttt{wq\_a} + \texttt{wkv\_a}, or \texttt{up\_exps} + \texttt{gate\_exps} + \texttt{shexp}), \texttt{s\_q8\_cache\_buf} quantizes the activation once and reuses it across subsequent contractions, while \texttt{g\_tls\_mmid\_ids\_valid} reuses the bucketed expert row mapping between \texttt{up\_exps} and \texttt{gate\_exps}.
+    \item \textbf{In-Register 9-Stage AVX2 Fast Walsh-Hadamard Transform \& Vectorized \texttt{HC\_PRE/POST}}: \texttt{DeepSeek-V4-Flash} invokes a 512-point FWHT (\texttt{GGML\_OP\_HADAMARD}) 396 times per token. We keep all 9 butterfly stages ($s = 1, 2, \dots, 256$) inside AVX2 \texttt{YMM} registers using lane permutes (\texttt{\_mm256\_permute2f128\_ps}, \texttt{\_mm256\_shuffle\_ps}) and vectorize the 4-stream Sinkhorn-20 Hyper-Connections (\texttt{HC\_PRE/POST}), cutting non-matrix operator time in half ($19.60 \to 9.85$~ms/tok).
+    \item \textbf{2~MB Transparent HugePages, 3D L1D Tiling, \& Bidirectional \texttt{\_MM\_HINT\_NTA} L3 Isolation}: Allocating weight maps and compute arenas with 2~MB-aligned \texttt{MADV\_HUGEPAGE} expands Zen~5 L2 STLB coverage to 6.14~GB (eliminating 99.6\% of page-table walks). Streaming cold MoE weights and KV tokens older than \texttt{LLAMA\_KV\_L3\_WINDOW} (2,048 on Nemotron; 1,024 on DeepSeek MLA with 8-step sparse lookahead prefetching) via \texttt{\_mm\_prefetch(..., \_MM\_HINT\_NTA)} prevents L3 victim-cache pollution.
+    \item \textbf{Cross-Platform Thread-Safe Runtime Control (\texttt{Linux/macOS} \texttt{mmap} \& \texttt{Windows \_WIN32})}: Runtime MoE parameters ($k_{\text{early}}, k_{\text{mid}}, w_{\min}, \text{scale\_mode}$) are initialized on thread~0 with release-acquire atomic synchronization (\texttt{atomic\_int s\_moe\_topk}, \texttt{s\_shared\_moe\_skip\_mask}) and read from a 32-byte shared file mapping (\texttt{/tmp/dsv4\_moe\_cfg.bin} with \texttt{O\_NOFOLLOW} and \texttt{DSV4\_MOE\_CFG\_PATH} override via POSIX \texttt{mmap}, and \texttt{\%TEMP\%\textbackslash dsv4\_moe\_cfg.bin} via Win32 \texttt{CreateFileMappingA}/\texttt{MapViewOfFile}), enabling sub-nanosecond ($0.3$~ns) L1-cached inspection with zero syscalls per token while resetting the skip mask across batched prefill passes ($N > 1$).
+\end{enumerate}
+
+\begin{table*}[t]
+\centering
+\caption{Multi-platform verification across x86-64 (Zen~5, 8-CCD Zen~4 Threadripper), ARM64 (AWS Graviton3, Apple M4 Pro), and GPU+CPU Hybrids (Linux/Windows Vulkan \& CUDA) on \texttt{Nemotron-3.5-30B-A3B} and \texttt{DeepSeek-V4-Flash 284B}.}
+\label{tab:platforms}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}llllccc@{}}
+\toprule
+\textbf{Hardware Platform} & \textbf{Cores / Cache / GPU} & \textbf{Memory} & \textbf{Model \& Profile} & \textbf{Prefill (\texttt{tok/s})} & \textbf{Base / Cold Decode} & \textbf{Warm / Burst Decode} \\
+\midrule
+AMD Threadripper PRO 7985WX & 64C/128T (8 CCDs, 256MB L3) & 256GB 8-Ch DDR5 & Nemotron-30B (\texttt{-t 32} 4C/CCD) & \textbf{386.00} & \textbf{73.84 -- 80.14} & \textbf{111.62 tok/s} \\
+AMD 7945HX3D + RX 9070 XT & 16C (128MB L3) + 16GB Vulkan & 94GB DDR5 + 16GB & Nemotron-30B (\texttt{MXFP4} 256K) & \textbf{563.00} & \textbf{75.10 tok/s} & \textbf{80.80 tok/s} \\
+AMD Ryzen 9 9955HX (Zen 5) & 16C/32T (2 CCDs, 64MB L3) & 64GB DDR5 (0 GPU) & Nemotron-30B (\texttt{Fractal-64}) & \textbf{241.0 -- 306.8} & \textbf{25.02 -- 34.52} & \textbf{48.39 / 60.40 tok/s} \\
+Apple M4 Pro (Unified SoC) & 14C CPU + 20C Metal GPU & 24GB Unified (0 Swap) & Nemotron-30B (128K Ctx) & \textbf{256.0 -- 549.0} & \textbf{47.0 -- 48.0} & \textbf{49.0+ tok/s} \\
+AWS Graviton3 \texttt{m7g.2xlarge} & 8 vCPU ARM64 Neoverse-V1 & 31GB DDR5 (0 GPU) & Nemotron-30B (\texttt{-t 8}) & \textbf{101.67} & \textbf{41.05 tok/s} & \textbf{44.97 tok/s} \\
+Intel i9-9900K + RTX 2080 Ti & 8C/16T + 11GB CUDA (Win 11) & 16GB DDR4 + 11GB & Qwen3-14B / Nemotron-8B / 30B & Auto CUDA 12.4 & \textbf{50.0 -- 58.0} & \textbf{100+ tok/s} (8B) \\
+AMD Ryzen 9 9955HX (Zen 5) & 16C/32T (2 CCDs, 64MB L3) & 64GB DDR5 (58.9GiB RSS) & \textbf{DeepSeek-V4 284B (\texttt{Fractal})} & \textbf{41.58} (32.6ms Slot0) & \textbf{9.06 -- 10.12} & \textbf{11.50 -- 14.69 tok/s} \\
+\bottomrule
+\end{tabular}%
+}
+\end{table*}
+
+\subsection{Multi-Chiplet Scaling \& Hybrid GPU+CPU Tensor-Role Splitting}
+Table~\ref{tab:platforms} summarizes cross-platform scaling:
+\begin{itemize}
+    \item \textbf{8-CCD Threadripper PRO 7985WX ($4\text{C/CCD}$ Law)}: Launching 64 threads (8C/CCD) across 8 CCDs saturates the Infinity Fabric with atomic work-stealing traffic, dropping decode speed from 80.14~tok/s to 51.80~tok/s. Selecting 4 physical cores per CCD (\texttt{-t 32}) via sysfs L3 topology discovery yields \textbf{386.00~tok/s prefill}, \textbf{80.14~tok/s cold decode}, and \textbf{111.62~tok/s warm decode}.
+    \item \textbf{Hybrid GPU+CPU Tensor-Role Splitting (\texttt{-ngl 99 --n-cpu-moe $N$ --load-mode none})}: On 11--16~GB GPUs (Linux Vulkan or Windows CUDA), offloading by tensor role keeps 100\% of the dense backbone, KV cache, and Mamba-2 \texttt{SSM\_SCAN} in high-bandwidth VRAM while placing $N$ sparse MoE layers in System RAM. On an AMD RX 9070 XT 16GB, \texttt{Fractal-MXFP4} (15.2~GiB) achieves \textbf{75.1~tok/s (new code) / 80.8~tok/s (in-context refactor)} at 256K context, outperforming \texttt{Q4\_0} (69.7 / 76.2~tok/s at 16.1~GiB) while saving 0.9~GB of VRAM. On Windows 10/11 (\texttt{windows/modchip\_win.ps1}), live free VRAM is queried via \texttt{nvidia-smi} with a 550~MB WDDM safety reserve to prevent PCIe GTT paging.
+\end{itemize}
+
+\section{Limitations \& Negative Results}
+\begin{enumerate}
+    \item \textbf{CPU-Only Scope of \texttt{Fractal-64} (\texttt{Q2\_0})}: Because \texttt{Fractal-64} repurposes the \texttt{Q2\_0} type ID with a custom 30-byte Block-64 layout supported in \texttt{ggml-cpu}, offloading \texttt{Q2\_0} MoE tensors to Vulkan/CUDA GPUs without a matching GPU shader produces invalid outputs; hybrid GPU+CPU setups should use \texttt{Fractal-MXFP4} or \texttt{Q4\_0}, which have native Vulkan and CUDA shaders.
+    \item \textbf{Non-Temporal Prefetching on 50-Byte Unaligned \texttt{iq1\_s} Blocks}: Issuing \texttt{\_MM\_HINT\_NTA} inside \texttt{ggml\_vec\_dot\_iq1\_s\_q8\_K} degraded \texttt{iq1\_s} throughput by $\sim 5\%$ because \texttt{sizeof(block\_iq1\_s)} $= 50$~bytes ($<64$-byte cache line), causing premature eviction of cache lines straddling adjacent blocks.
+    \item \textbf{Catastrophic Cliff Below Top-4 Routing}: While $L_2$-quadrature pruning from Top-6 to Top-5 ($+0.42\%$ PPL) or Top-4 ($+2.85\%$ PPL) preserves generation quality, truncating to Top-2 alters the covariance spectrum across 43--52 layers and causes EOS suppression.
+\end{enumerate}
+
+\section{Conclusion}
+By co-designing hierarchical non-linear quantization (\texttt{Fractal-64} and analytical \texttt{SwiGLU-H2}), AVX-512/AVX2 kernels, L2/L3-resident chess-engine speculative search (\texttt{Stockfish-PVS v2}), and $L_2$-quadrature MoE / low-rank mathematics, \texttt{llama-modchip} enables frontier 30B--284B Sparse MoE inference at 256K context on commodity 64~GB CPUs and consumer GPU+CPU hybrids. Full source code, C/C++ patches, and reproducible benchmarks are available at \url{https://github.com/synchopate/llama-modchip}.
+
+\begin{thebibliography}{9}
+
+\bibitem{nemotron2025}
+NVIDIA, ``Nemotron-H and Nemotron-3.5: Hybrid Mamba-Transformer Mixture-of-Experts Models for Long-Context Reasoning,'' \emph{arXiv preprint}, 2025.
+
+\bibitem{deepseekv3}
+DeepSeek-AI, ``DeepSeek-V3 / V4 Technical Report: Multi-Head Latent Attention and Auxiliary-Loss-Free Load Balancing,'' \emph{arXiv preprint arXiv:2412.19437}, 2024--2025.
+
+\bibitem{llamacpp}
+G.~Gerganov et al., ``\texttt{llama.cpp}: LLM Inference in C/C++,'' \url{https://github.com/ggml-org/llama.cpp}, 2023--2026.
+
+\bibitem{leviathan2023fast}
+Y.~Leviathan, M.~Kalman, and Y.~Matias, ``Fast Inference from Transformers via Speculative Decoding,'' in \emph{Proc.\ ICML}, 2023.
+
+\bibitem{stockfish}
+T.~Romstad, M.~Costalba, J.~Kiiski, et al., ``Stockfish: Open-Source Chess Engine (Principal Variation Search and Zobrist Transposition Tables),'' \url{https://stockfishchess.org}, 2008--2026.
+
+\bibitem{powerinfer}
+Y.~Song et al., ``PowerInfer: Fast Large Language Model Serving with a Consumer-Grade GPU,'' in \emph{Proc.\ ACM SOSP}, 2024.
+
+\bibitem{ktransformers}
+H.~Chen et al., ``KTransformers: Unleashing the Full Potential of CPU/GPU Hybrid Inference for MoE Models,'' \emph{arXiv preprint}, 2024--2025.
+
+\bibitem{squeezellm}
+S.~Kim et al., ``SqueezeLLM: Dense-and-Sparse Quantization,'' in \emph{Proc.\ ICML}, 2024.
+
+\bibitem{dao2023flashattention2}
+T.~Dao, ``FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning,'' in \emph{Proc.\ ICLR}, 2024.
+
+\end{thebibliography}
+
+\end{document}

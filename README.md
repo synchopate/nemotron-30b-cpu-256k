@@ -6,11 +6,12 @@
 
 [![Release](https://img.shields.io/badge/release-v2.4.0-3fb950?style=flat-square)](RELEASE_NOTES.md)
 [![License](https://img.shields.io/badge/license-Apache%202.0-58a6ff?style=flat-square)](LICENSE)
+[![arXiv Preprint PDF](https://img.shields.io/badge/arXiv%20PDF-llama--modchip--paper.pdf-b31b1b?style=flat-square)](paper/llama-modchip-paper.pdf)
 [![Technical Paper](https://img.shields.io/badge/paper-ARCHITECTURE.md-bc8cff?style=flat-square)](ARCHITECTURE.md)
 [![RouteCrack + Stockfish](https://img.shields.io/badge/drafter-Stockfish--PVS%20v2%20(1.64MB%20L3)-d29922?style=flat-square)](speculative/ROUTECRACK_TECHNIQUES.md)
 [![Submit Benchmark](https://img.shields.io/badge/leaderboard-Submit%20Your%20CPU-2ea043?style=flat-square)](https://github.com/synchopate/llama-modchip/issues/new?template=benchmark.yml)
 
-[**⚡ Quickstart**](#-quickstart) · [**🧩 Supported Models**](#-supported-models--model-specific-optimizations) · [**🖥️ Supported Chips & Platforms**](#️-supported-chips--processor-specific-optimizations) · [**🏆 Leaderboard**](#-community-cpu--hybrid-leaderboard) · [**📄 Technical Paper**](ARCHITECTURE.md) · [**❓ FAQ**](FAQ.md)
+[**⚡ Quickstart**](#-quickstart) · [**🧩 Supported Models**](#-supported-models--model-specific-optimizations) · [**🖥️ Supported Chips & Platforms**](#️-supported-chips--processor-specific-optimizations) · [**🏆 Leaderboard**](#-community-cpu--hybrid-leaderboard) · [**📄 Preprint PDF (`paper/`)**](paper/llama-modchip-paper.pdf) · [**📐 Architecture**](ARCHITECTURE.md) · [**❓ FAQ**](FAQ.md)
 
 <br/>
 

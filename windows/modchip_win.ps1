@@ -476,8 +476,13 @@ try {
     $bw.Write([int32]0)
     $bw.Write([int32]0)
     $bw.Flush()
-    [System.IO.File]::WriteAllBytes($cfgPath, $ms.ToArray())
+    $bytes = $ms.ToArray()
     $bw.Close()
+    # In-place FileShare::ReadWrite update so live updates succeed even while llama-server.exe holds MapViewOfFile
+    $fs = New-Object System.IO.FileStream($cfgPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
+    $fs.Write($bytes, 0, $bytes.Length)
+    $fs.Flush()
+    $fs.Close()
 } catch {}
 
 $gpuMoeCount = $selectedModel.TotalMoe - $nCpuMoe
@@ -494,7 +499,7 @@ if ($selectedModel.TotalMoe -gt 0) {
     Write-Host ("  - Offload GPU        : 100% su {0} (-ngl 99, 0 GB RAM di sistema)" -f $hw.GpuName) -ForegroundColor Cyan
 }
 Write-Host ("  - Thread CPU Fisici  : -t {0} (Evita HyperThreading per non saturare il bus DDR4)" -f $hw.PhysCores) -ForegroundColor White
-Write-Host ("  - Speculative Engine : Draftless N-Gram Cascade (m=5, draft-max=6)" -f $hw.PhysCores) -ForegroundColor White
+Write-Host "  - Speculative Engine : Draftless N-Gram Cascade (m=5, draft-max=6)" -ForegroundColor White
 Write-Host "--------------------------------------------------------------------------------" -ForegroundColor DarkGray
 Write-Host ("  -> Web Chat UI       : http://127.0.0.1:{0}  (Si aprira' nel browser appena pronto!)" -f $Port) -ForegroundColor Yellow
 Write-Host ("  -> OpenAI API Locale : http://127.0.0.1:{0}/v1 (Per VS Code Continue / Cline / Cursor)" -f $Port) -ForegroundColor Yellow

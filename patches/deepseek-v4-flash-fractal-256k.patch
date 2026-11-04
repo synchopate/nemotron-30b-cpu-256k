@@ -1723,7 +1723,7 @@ index ea54cfe..ffe3392 100644
              // Convert signs to bytes 0x81 (negative) or 0x01 (positive)
              const uint64_t delta_sign = _pdep_u64(*(const uint32_t*)(qh) & 0x88888888, 0xf0f0f0f0f0f0f0f0ULL);
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 7918845..bc4a66b 100644
+index 7918845..c2a47f4 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
 @@ -1,3 +1,12 @@
@@ -2037,7 +2037,7 @@ index 7918845..bc4a66b 100644
  static thread_ret_t ggml_graph_compute_thread(void * data) {
      struct ggml_compute_state * state = (struct ggml_compute_state *) data;
      struct ggml_threadpool    * tp    = state->threadpool;
-@@ -3085,11 +3164,92 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3085,11 +3164,112 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
      GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
  #endif
  
@@ -2072,51 +2072,71 @@ index 7918845..bc4a66b 100644
 +    uintptr_t last_mmid_ids_base_start = 0;
 +    uintptr_t last_mmid_ids_base_end = 0;
 +    int64_t last_mmid_ne0 = 0, last_mmid_ne1 = 0, last_mmid_nas = 0;
-+    static int s_shared_moe_skip_mask = 0;
-+    static int s_moe_topk = -1;
-+    static float s_moe_min_w = -1.0f;
++    static atomic_int s_shared_moe_skip_mask = 0;
++    static atomic_int s_moe_topk = -1;
++    static float s_moe_min_w = 0.0f;
 +    static volatile int32_t * s_moe_cfg_mmap = NULL;
-+    if (s_moe_topk == -1) {
-+        const char * et = getenv("DSV4_MOE_TOPK");
-+        s_moe_topk = (et && atoi(et) > 0) ? atoi(et) : 6;
-+        const char * ew = getenv("DSV4_MOE_MIN_W");
-+        s_moe_min_w = (ew && atof(ew) > 0.0) ? (float)atof(ew) : 0.0f;
-+        int32_t init_cfg[8] = {s_moe_topk, s_moe_topk, (int32_t)(s_moe_min_w * 10000.0f), 3, 43, 1, 0, 0};
++    if (state->ith == 0) {
++        atomic_store_explicit(&s_shared_moe_skip_mask, 0, memory_order_release);
++        if (atomic_load_explicit(&s_moe_topk, memory_order_relaxed) == -1) {
++            const char * et = getenv("DSV4_MOE_TOPK");
++            const int tk = (et && atoi(et) > 0) ? atoi(et) : 6;
++            const char * ew = getenv("DSV4_MOE_MIN_W");
++            s_moe_min_w = (ew && atof(ew) > 0.0) ? (float)atof(ew) : 0.0f;
++            int32_t init_cfg[8] = {tk, tk, (int32_t)(s_moe_min_w * 10000.0f), 3, 43, 1, 0, 0};
 +#ifdef _WIN32
-+        char cfg_path[MAX_PATH];
-+        DWORD tlen = GetTempPathA(MAX_PATH, cfg_path);
-+        if (tlen > 0 && tlen < MAX_PATH - 20) {
-+            strcat(cfg_path, "dsv4_moe_cfg.bin");
-+            HANDLE hFile = CreateFileA(cfg_path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-+            if (hFile != INVALID_HANDLE_VALUE) {
-+                if (GetFileSize(hFile, NULL) < 32) {
-+                    DWORD written = 0;
-+                    WriteFile(hFile, init_cfg, sizeof(init_cfg), &written, NULL);
++            char cfg_path[MAX_PATH];
++            DWORD tlen = GetTempPathA(MAX_PATH, cfg_path);
++            if (tlen > 0 && tlen < MAX_PATH - 24) {
++                strcat(cfg_path, "dsv4_moe_cfg.bin");
++                HANDLE hFile = CreateFileA(cfg_path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
++                if (hFile != INVALID_HANDLE_VALUE) {
++                    if (GetFileSize(hFile, NULL) < 32) {
++                        DWORD written = 0;
++                        WriteFile(hFile, init_cfg, sizeof(init_cfg), &written, NULL);
++                    }
++                    HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_READWRITE, 0, 32, NULL);
++                    if (hMap != NULL) {
++                        void * mp = MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, 32);
++                        if (mp != NULL) {
++                            s_moe_cfg_mmap = (volatile int32_t *) mp;
++                        }
++                        CloseHandle(hMap);
++                    }
++                    CloseHandle(hFile);
 +                }
-+                HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_READWRITE, 0, 32, NULL);
-+                if (hMap != NULL) {
-+                    void * mp = MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, 32);
-+                    if (mp != NULL) {
++            }
++#else
++            const char * custom_cfg = getenv("DSV4_MOE_CFG_PATH");
++            const char * cfg_path = (custom_cfg && custom_cfg[0]) ? custom_cfg : "/tmp/dsv4_moe_cfg.bin";
++            int open_flags = O_RDWR | O_CREAT;
++#ifdef O_NOFOLLOW
++            open_flags |= O_NOFOLLOW;
++#endif
++            int fd = open(cfg_path, open_flags, 0666);
++            if (fd >= 0) {
++                (void) fchmod(fd, 0666);
++                if (lseek(fd, 0, SEEK_END) < 32) {
++                    if (write(fd, init_cfg, sizeof(init_cfg)) != sizeof(init_cfg)) {}
++                }
++                void * mp = mmap(NULL, 32, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++                if (mp != MAP_FAILED) {
++                    s_moe_cfg_mmap = (volatile int32_t *) mp;
++                }
++                close(fd);
++            } else {
++                fd = open(cfg_path, O_RDONLY);
++                if (fd >= 0) {
++                    void * mp = mmap(NULL, 32, PROT_READ, MAP_SHARED, fd, 0);
++                    if (mp != MAP_FAILED) {
 +                        s_moe_cfg_mmap = (volatile int32_t *) mp;
 +                    }
-+                    CloseHandle(hMap);
++                    close(fd);
 +                }
-+                CloseHandle(hFile);
 +            }
-+        }
-+#else
-+        int fd = open("/tmp/dsv4_moe_cfg.bin", O_RDWR | O_CREAT, 0666);
-+        if (fd >= 0) {
-+            if (lseek(fd, 0, SEEK_END) < 32) {
-+                if (write(fd, init_cfg, sizeof(init_cfg)) != sizeof(init_cfg)) {}
-+            }
-+            void * mp = mmap(NULL, 32, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-+            if (mp != MAP_FAILED) {
-+                s_moe_cfg_mmap = (volatile int32_t *) mp;
-+            }
-+            close(fd);
-+        }
 +#endif
++            atomic_store_explicit(&s_moe_topk, tk, memory_order_release);
++        }
 +    }
 +    size_t last_mmid_q8_off = 0;
 +
@@ -2132,7 +2152,7 @@ index 7918845..bc4a66b 100644
              continue;
          }
  
-@@ -3097,13 +3257,119 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3097,13 +3277,119 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
              continue;
          }
  
@@ -2204,7 +2224,7 @@ index 7918845..bc4a66b 100644
 +                        }
 +                    }
 +                    if (node->op == GGML_OP_MUL_MAT_ID) {
-+                        g_tls_moe_skip_mask = s_shared_moe_skip_mask;
++                        g_tls_moe_skip_mask = atomic_load_explicit(&s_shared_moe_skip_mask, memory_order_acquire);
 +                        const struct ggml_tensor * ids = node->src[2];
 +                        const size_t q8_off = (src1->type != vdt) ? ggml_row_size(vdt, ggml_nelements(src1)) : 0;
 +                        if (last_mmid_ids_data == (uintptr_t) ids->data &&
@@ -2252,67 +2272,73 @@ index 7918845..bc4a66b 100644
          }
  
          if (state->ith == 0 && cplan->abort_callback &&
-@@ -3115,6 +3381,100 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3115,6 +3401,106 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
          if (node_n + 1 < cgraph->n_nodes) {
              ggml_barrier(state->threadpool);
          }
-+        if (node->op == GGML_OP_SCALE && node->ne[0] == 1 && node->ne[1] == 6 && node->ne[2] == 1) {
++        if (node->op == GGML_OP_SCALE && node->ne[0] == 1 && node->ne[1] == 6) {
 +            if (state->ith == 0) {
-+                int il = -1;
-+                const char * dash = strrchr(node->name, '-');
-+                if (dash) {
-+                    il = atoi(dash + 1);
-+                }
-+                float * mw = (float *) node->data;
-+                int order[6] = {0, 1, 2, 3, 4, 5};
-+                for (int a = 0; a < 5; ++a) {
-+                    for (int b = a + 1; b < 6; ++b) {
-+                        if (mw[order[b]] > mw[order[a]]) {
-+                            int tmp = order[a]; order[a] = order[b]; order[b] = tmp;
++                if (node->ne[2] == 1) {
++                    int il = -1;
++                    const char * dash = strrchr(node->name, '-');
++                    if (dash) {
++                        il = atoi(dash + 1);
++                    }
++                    float * mw = (float *) node->data;
++                    int order[6] = {0, 1, 2, 3, 4, 5};
++                    for (int a = 0; a < 5; ++a) {
++                        for (int b = a + 1; b < 6; ++b) {
++                            if (mw[order[b]] > mw[order[a]]) {
++                                int tmp = order[a]; order[a] = order[b]; order[b] = tmp;
++                            }
 +                        }
 +                    }
-+                }
-+                const int cfg_topk_early = s_moe_cfg_mmap ? s_moe_cfg_mmap[0] : s_moe_topk;
-+                const int cfg_topk_mid   = s_moe_cfg_mmap ? s_moe_cfg_mmap[1] : s_moe_topk;
-+                const float cfg_min_w    = s_moe_cfg_mmap ? (s_moe_cfg_mmap[2] * 0.0001f) : s_moe_min_w;
-+                const int cfg_mid_start  = s_moe_cfg_mmap ? s_moe_cfg_mmap[3] : 3;
-+                const int cfg_mid_end    = s_moe_cfg_mmap ? s_moe_cfg_mmap[4] : 43;
-+                const int cur_topk       = (il >= cfg_mid_start && il < cfg_mid_end) ? cfg_topk_mid : cfg_topk_early;
-+                const int cfg_scale_mode = s_moe_cfg_mmap ? s_moe_cfg_mmap[5] : 1;
-+                if (il >= 3 && (cur_topk < 6 || cfg_min_w > 0.0f)) {
-+                    float orig_sum = 0.0f;
-+                    float orig_l2  = 0.0f;
-+                    for (int k = 0; k < 6; ++k) {
-+                        orig_sum += mw[k];
-+                        orig_l2  += mw[k] * mw[k];
-+                    }
-+                    float kept_sum = 0.0f;
-+                    float kept_l2  = 0.0f;
-+                    int skip_mask = 0;
-+                    for (int r = 0; r < 6; ++r) {
-+                        int idx = order[r];
-+                        if (r >= cur_topk || (r > 0 && mw[idx] < cfg_min_w)) {
-+                            mw[idx] = 0.0f;
-+                            skip_mask |= (1 << idx);
-+                        } else {
-+                            kept_sum += mw[idx];
-+                            kept_l2  += mw[idx] * mw[idx];
-+                        }
-+                    }
-+                    if (cfg_scale_mode == 1 && kept_l2 > 0.0f && kept_l2 < orig_l2) {
-+                        const float rescale = sqrtf(orig_l2 / kept_l2);
++                    const int def_tk         = atomic_load_explicit(&s_moe_topk, memory_order_acquire);
++                    const int cfg_topk_early = s_moe_cfg_mmap ? s_moe_cfg_mmap[0] : def_tk;
++                    const int cfg_topk_mid   = s_moe_cfg_mmap ? s_moe_cfg_mmap[1] : def_tk;
++                    const float cfg_min_w    = s_moe_cfg_mmap ? (s_moe_cfg_mmap[2] * 0.0001f) : s_moe_min_w;
++                    const int cfg_mid_start  = s_moe_cfg_mmap ? s_moe_cfg_mmap[3] : 3;
++                    const int cfg_mid_end    = s_moe_cfg_mmap ? s_moe_cfg_mmap[4] : 43;
++                    int cur_topk             = (il >= cfg_mid_start && il < cfg_mid_end) ? cfg_topk_mid : cfg_topk_early;
++                    if (cur_topk < 1) cur_topk = 1;
++                    const int cfg_scale_mode = s_moe_cfg_mmap ? s_moe_cfg_mmap[5] : 1;
++                    if (il >= 3 && (cur_topk < 6 || cfg_min_w > 0.0f)) {
++                        float orig_sum = 0.0f;
++                        float orig_l2  = 0.0f;
 +                        for (int k = 0; k < 6; ++k) {
-+                            mw[k] *= rescale;
++                            orig_sum += mw[k];
++                            orig_l2  += mw[k] * mw[k];
 +                        }
-+                    } else if (cfg_scale_mode == 2 && kept_sum > 0.0f && kept_sum < orig_sum) {
-+                        const float rescale = orig_sum / kept_sum;
-+                        for (int k = 0; k < 6; ++k) {
-+                            mw[k] *= rescale;
++                        float kept_sum = 0.0f;
++                        float kept_l2  = 0.0f;
++                        int skip_mask = 0;
++                        for (int r = 0; r < 6; ++r) {
++                            int idx = order[r];
++                            if (r >= cur_topk || (r > 0 && mw[idx] < cfg_min_w)) {
++                                mw[idx] = 0.0f;
++                                skip_mask |= (1 << idx);
++                            } else {
++                                kept_sum += mw[idx];
++                                kept_l2  += mw[idx] * mw[idx];
++                            }
 +                        }
++                        if (cfg_scale_mode == 1 && kept_l2 > 0.0f && kept_l2 < orig_l2) {
++                            const float rescale = sqrtf(orig_l2 / kept_l2);
++                            for (int k = 0; k < 6; ++k) {
++                                mw[k] *= rescale;
++                            }
++                        } else if (cfg_scale_mode == 2 && kept_sum > 0.0f && kept_sum < orig_sum) {
++                            const float rescale = orig_sum / kept_sum;
++                            for (int k = 0; k < 6; ++k) {
++                                mw[k] *= rescale;
++                            }
++                        }
++                        atomic_store_explicit(&s_shared_moe_skip_mask, skip_mask, memory_order_release);
++                    } else {
++                        atomic_store_explicit(&s_shared_moe_skip_mask, 0, memory_order_release);
 +                    }
-+                    s_shared_moe_skip_mask = skip_mask;
 +                } else {
-+                    s_shared_moe_skip_mask = 0;
++                    atomic_store_explicit(&s_shared_moe_skip_mask, 0, memory_order_release);
 +                }
 +            }
 +            ggml_barrier(state->threadpool);
@@ -2353,7 +2379,7 @@ index 7918845..bc4a66b 100644
      }
  
  #ifdef GGML_USE_OPENMP
-@@ -3284,6 +3644,8 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
+@@ -3284,6 +3670,8 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
          threadpool->n_barrier        = 0;
          threadpool->n_barrier_passed = 0;
          threadpool->current_chunk    = 0;
@@ -2362,7 +2388,7 @@ index 7918845..bc4a66b 100644
          threadpool->stop             = false;
          threadpool->pause            = tpp->paused;
          threadpool->abort            = -1;
-@@ -3376,7 +3738,113 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -3376,7 +3764,113 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
      }
  
  #ifdef GGML_USE_OPENMP
@@ -2477,7 +2503,7 @@ index 7918845..bc4a66b 100644
          #pragma omp parallel num_threads(n_threads)
          {
              #pragma omp single
-@@ -3392,6 +3860,16 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -3392,6 +3886,16 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
              ggml_thread_apply_priority(threadpool->prio);
              if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
                  ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
@@ -2494,7 +2520,7 @@ index 7918845..bc4a66b 100644
              }
              ggml_graph_compute_thread(&threadpool->workers[ith]);
          }
-@@ -3893,3 +4371,5 @@ void ggml_cpu_init(void) {
+@@ -3893,3 +4397,5 @@ void ggml_cpu_init(void) {
  
      ggml_critical_section_end();
  }
