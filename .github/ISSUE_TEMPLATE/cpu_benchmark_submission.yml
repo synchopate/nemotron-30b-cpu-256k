@@ -1,0 +1,58 @@
+name: "📊 Submit CPU Benchmark (./modchip bench / check_cpu_readiness.py)"
+description: "Share your CPU or Hybrid GPU+CPU scorecard to be added to the Official llama-modchip Leaderboard!"
+title: "[Benchmark] <CPU Model> — <tok/s> on <Model>"
+labels: ["benchmark", "leaderboard"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ### 🏆 Submit Your CPU or Hybrid GPU+CPU Scorecard!
+        Run either the 2-second zero-download readiness check:
+        ```bash
+        curl -sL https://raw.githubusercontent.com/synchopate/llama-modchip/main/scripts/check_cpu_readiness.py | python3
+        ```
+        or the live 30-second model benchmark:
+        ```bash
+        ./modchip bench
+        ```
+        and paste your output below!
+
+  - type: input
+    id: cpu_model
+    attributes:
+      label: "CPU Model & Architecture (plus optional GPU if Hybrid)"
+      description: "e.g., AMD Ryzen 9 9955HX / 9950X (Zen 5, 16C/32T), Threadripper PRO 7985WX, AWS Graviton3/4, Apple M4 Pro"
+      placeholder: "AMD Ryzen 9 9955HX (16C/32T Zen 5, 64 MB L3, 0 GPUs)"
+    validations:
+      required: true
+
+  - type: input
+    id: ram_spec
+    attributes:
+      label: "Total System RAM & Memory Speed"
+      description: "e.g., 64 GB DDR5-5600 Dual-Channel, 128 GB DDR5-6000, 24 GB Unified"
+      placeholder: "64 GB DDR5-5600"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: model_tested
+    attributes:
+      label: "Model / Tool Tested"
+      options:
+        - "DeepSeek-V4-Flash-0731-Fractal (284.33B Total / 13.17B Active, 56.56 GiB)"
+        - "NVIDIA-Nemotron-3.5-30B-A3B-Fractal-64 (30.2B Total / 3.0B Active, 14.35 GiB)"
+        - "NVIDIA-Nemotron-3.5-30B-A3B-Fractal-MXFP4 (15.95 GiB)"
+        - "Qwen3-30B-A3B / Qwen3-14B"
+        - "2-Second CPU Readiness Check (check_cpu_readiness.py)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: terminal_output
+    attributes:
+      label: "Terminal Output Paste"
+      description: "Paste the full output of ./modchip bench or check_cpu_readiness.py"
+      render: shell
+    validations:
+      required: true

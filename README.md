@@ -1,19 +1,26 @@
 <div align="center">
 
-# ♟️ llama-modchip
+# ♟️🐋 llama-modchip (v2.4.0)
 
-### Run 30B–284B Sparse MoE LLMs on a 64 GB CPU (or Hybrid GPU+CPU on Linux, Windows & macOS) at 256K context — from `Nemotron-30B-A3B` in `14.35 GiB` (`25–111 tok/s`) to `DeepSeek-V4-Flash 284B` in `56.56 GiB` (`< 60 GiB` RAM, `9.1–14.7 tok/s`).
+### Break the 64 GB RAM Wall: Run 284B DeepSeek-V4-Flash (< 59 GiB RAM) & 30B MoEs (up to 111 tok/s) at 256K Context on Pure CPU — Zero GPUs Required.
 
 [![Release](https://img.shields.io/badge/release-v2.4.0-3fb950?style=flat-square)](RELEASE_NOTES.md)
 [![License](https://img.shields.io/badge/license-Apache%202.0-58a6ff?style=flat-square)](LICENSE)
 [![arXiv Preprint PDF](https://img.shields.io/badge/arXiv%20PDF-llama--modchip--paper.pdf-b31b1b?style=flat-square)](paper/llama-modchip-paper.pdf)
 [![Technical Paper](https://img.shields.io/badge/paper-ARCHITECTURE.md-bc8cff?style=flat-square)](ARCHITECTURE.md)
 [![RouteCrack + Stockfish](https://img.shields.io/badge/drafter-Stockfish--PVS%20v2%20(1.64MB%20L3)-d29922?style=flat-square)](speculative/ROUTECRACK_TECHNIQUES.md)
-[![Submit Benchmark](https://img.shields.io/badge/leaderboard-Submit%20Your%20CPU-2ea043?style=flat-square)](https://github.com/synchopate/llama-modchip/issues/new?template=benchmark.yml)
+[![Submit Benchmark](https://img.shields.io/badge/leaderboard-Submit%20Your%20CPU-2ea043?style=flat-square)](https://github.com/synchopate/llama-modchip/issues/new?template=cpu_benchmark_submission.yml)
 
-[**⚡ Quickstart**](#-quickstart) · [**🧩 Supported Models**](#-supported-models--model-specific-optimizations) · [**🖥️ Supported Chips & Platforms**](#️-supported-chips--processor-specific-optimizations) · [**🏆 Leaderboard**](#-community-cpu--hybrid-leaderboard) · [**📄 Preprint PDF (`paper/`)**](paper/llama-modchip-paper.pdf) · [**📐 Architecture**](ARCHITECTURE.md) · [**❓ FAQ**](FAQ.md)
+[**⚡ Quickstart**](#-quickstart) · [**🧩 Supported Models**](#-supported-models--model-specific-optimizations) · [**🖥️ Supported Chips & Platforms**](#️-supported-chips--processor-specific-optimizations) · [**🏆 Leaderboard**](#-community-cpu--hybrid-leaderboard) · [**📄 Preprint PDF (`paper/`)**](paper/llama-modchip-paper.pdf) · [**📐 Architecture**](ARCHITECTURE.md) · [**❓ FAQ**](FAQ.md) · [**🚀 Launch Kit**](docs/marketing-launch-kit/01_LINKEDIN_AND_X_NAS_GUIDE.md)
 
-<br/>
+</div>
+
+> **TL;DR — The 3 Paradigm-Breaking Pillars of `llama-modchip`:**
+> - 🐋 **284.33B Frontier MoE in a 64 GB CPU Box:** Shrinks `DeepSeek-V4-Flash` from `76.87 GiB` (which crashes in OOM on 64 GB Linux) down to **`56.56 GiB` on disk / `57.61–58.9 GiB` `VmRSS` at full 256K context** (**`44.36 tok/s` prefill**, **`9.06–10.74 tok/s` pure CPU decode**, **`11.5–14.7 tok/s` with PVS**) using closed-form **Analytical `SwiGLU-H2` Second-Order Hessian Compression** + **`Fractal-64` (`Q2_0`, `3.75 bpw`) MLA transcoding** + **4-Level Register (`ZMM` AVX-512BW) + L1D (`32 KB`) + L2 (`1 MB`) + L3 (`64 MB`) Whole-Model Tiling** + **$L_2$-Quadrature MoE Pruning**.
+> - ⚡ **30B MoE at GPU Speeds on Pure CPU:** Runs `NVIDIA-Nemotron-3.5-30B-A3B` in **`14.35 GiB`** at **`25.0–60.4 tok/s`** on 16-core Zen 5 (**`111.6 tok/s`** on Threadripper, **`80.8 tok/s`** on AMD Vulkan Hybrid, **`44.97 tok/s`** on AWS Graviton3 ARM64) via a **`1.64 MB` `Stockfish-PVS v2 + RouteCrack` L2/L3 Drafter (`96.4%` acceptance)** and `_MM_HINT_NTA` L3 cache isolation (`HARPCache`).
+> - 🤖 **Zero-API Claude Code (`./modchip claude`):** Eliminates the 45-second CPU agent prompt re-evaluation bottleneck via **`/dev/shm` Slot-0 KV Warm Restore (`18.9 ms` on Nemotron-30B / `13.1–32.6 ms` on DeepSeek-284B)** with all 40 Claude Code tools active.
+
+<div align="center">
 
 <img src="assets/modchip_demo.svg" alt="llama-modchip Live CPU Telemetry & Stockfish-PVS (M=7) Demo" width="100%" />
 
@@ -43,8 +50,13 @@ Open **[`windows/`](windows/README.md)** and double-click **[`windows/AVVIA_MODC
 | **`./modchip quantize`** | 🗜️ Transcodes `BF16`/`Q4_0`/`IQ2_XXS` GGUFs into **`Fractal-64`** (`3.75 bpw`) or **`Fractal-MXFP4`** (`4.25 bpw`) |
 | **`./modchip status` / `stop`** | 🔍 Inspects CPU readiness, `2MB HugePages`, and `/dev/shm` IPC, or stops background services |
 
-> 💡 **Estimate your CPU's speed in 2 seconds without downloading anything:**  
-> `curl -sL https://raw.githubusercontent.com/synchopate/llama-modchip/main/scripts/check_cpu_readiness.py | python3`
+### 🏆 Can your CPU run a 284B Frontier MoE in 64 GB RAM? Test in 2 seconds (Zero Downloads):
+
+```bash
+curl -sL https://raw.githubusercontent.com/synchopate/llama-modchip/main/scripts/check_cpu_readiness.py | python3
+```
+
+👉 **Paste your terminal scorecard in a [📊 1-Click GitHub Benchmark Issue](https://github.com/synchopate/llama-modchip/issues/new?template=cpu_benchmark_submission.yml) or [GitHub Discussions](https://github.com/synchopate/llama-modchip/discussions) to be added to the Official Community CPU Leaderboard!**
 
 ---
 
@@ -146,8 +158,19 @@ llama-modchip/
 
 ---
 
+## 🏢 Enterprise & Hardware Sponsorships
+
+`llama-modchip` demonstrates that modern multi-core CPUs and compact Mini-PCs with 64–128 GB of DDR5 RAM can run **284B Frontier MoEs (`DeepSeek-V4-Flash`)** and **30B Hybrid MoEs (`Nemotron-3.5-30B-A3B`)** locally at full `256K` context—eliminating $30,000+ multi-GPU hardware requirements for air-gapped enterprise code intelligence, security auditing, and autonomous agent fleets.
+
+We actively partner with **hardware manufacturers, cloud silicon teams, and AI research labs** to build and validate architecture-specific kernel patches:
+- 🖥️ **CPU & Workstation OEMs (`AMD Ryzen AI / Threadripper / EPYC`, `Minisforum`, `Framework`, `System76`, `Apple`, `Intel`)**: Sponsor a physical test unit or workstation to receive dedicated L1D/L2/L3 cache-tiling & SIMD kernels and permanent verification on the **Official README CPU Leaderboard**.
+- ☁️ **Cloud & ARM64 Silicon Teams (`AWS Graviton4`, `AmpereOne`, `Google Axion`, `Azure Cobalt`)**: Sponsor cloud compute credits to validate `SVE2` / `SME` / multi-socket NUMA kernels.
+- 🤝 **Enterprise Support & Custom Model Transcoding**: Reach out via [GitHub Issues](https://github.com/synchopate/llama-modchip/issues) or [GitHub Sponsors](https://github.com/sponsors/synchopate) to sponsor custom `SwiGLU-H2 + Fractal-64` model transcoding and on-premise deployment.
+
+---
+
 <div align="center">
 
-📖 **[Nemotron Deep-Dive (`docs/NEMOTRON_OPTIMIZATIONS.md`)](docs/NEMOTRON_OPTIMIZATIONS.md)** · 🐋 **[DeepSeek-V4 284B Deep-Dive (`docs/DEEPSEEK_V4_OPTIMIZATIONS.md`)](docs/DEEPSEEK_V4_OPTIMIZATIONS.md)** · 🖥️ **[Hardware & Chip Matrix (`docs/HARDWARE_OPTIMIZATIONS.md`)](docs/HARDWARE_OPTIMIZATIONS.md)** · 📄 **[Full Paper (`ARCHITECTURE.md`)](ARCHITECTURE.md)** · ❓ **[FAQ (`FAQ.md`)](FAQ.md)**
+📖 **[Nemotron Deep-Dive (`docs/NEMOTRON_OPTIMIZATIONS.md`)](docs/NEMOTRON_OPTIMIZATIONS.md)** · 🐋 **[DeepSeek-V4 284B Deep-Dive (`docs/DEEPSEEK_V4_OPTIMIZATIONS.md`)](docs/DEEPSEEK_V4_OPTIMIZATIONS.md)** · 🖥️ **[Hardware & Chip Matrix (`docs/HARDWARE_OPTIMIZATIONS.md`)](docs/HARDWARE_OPTIMIZATIONS.md)** · 📄 **[Full Paper (`ARCHITECTURE.md`)](ARCHITECTURE.md)** · ❓ **[FAQ (`FAQ.md`)](FAQ.md)** · 🚀 **[Marketing Launch Kit (`docs/marketing-launch-kit/`)](docs/marketing-launch-kit/01_LINKEDIN_AND_X_NAS_GUIDE.md)**
 
 </div>
