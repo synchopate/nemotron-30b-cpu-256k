@@ -1,1450 +1,3 @@
-diff --git a/common/common.h b/common/common.h
-index 4811345..6c6ef0a 100644
---- a/common/common.h
-+++ b/common/common.h
-@@ -384,11 +384,10 @@ struct common_params_speculative {
-     }
- 
-     uint32_t need_n_rs_seq() const {
--        bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
--            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
--        });
--
--        return needs_rs_seq ? draft.n_max : 0u;
-+        if (!types.empty()) {
-+            return std::max<uint32_t>(draft.n_max, 8u);
-+        }
-+        return 0u;
-     }
- };
- 
-diff --git a/common/ngram-map.cpp b/common/ngram-map.cpp
-index d1cb451..228c3cf 100644
---- a/common/ngram-map.cpp
-+++ b/common/ngram-map.cpp
-@@ -1,536 +1,974 @@
--#include "common.h"
--#include "log.h"
- #include "ngram-map.h"
-+#include "rc_predictor.h"
-+#include "rc_stockfish.h"
- 
--#include <cinttypes>
--#include <cstdint>
- #include <cstdio>
--#include <sstream>
--
--// prime number used for LCG hash function (32 bit), it is near (sqrt(5) - 1)/2 * 2^32.
--#define LCG_FACTOR 2654435761UL
--
--// Compute the LCG hash of a n-gram of size len at offset start.
--static uint32_t common_ngram_map_hash(const llama_tokens & tokens, size_t start, size_t len) {
--    uint32_t hash = 0;
--    for (size_t i = 0; i < len; ++i) {
--        hash = hash * LCG_FACTOR + tokens[start + i];
--    }
--    return hash;
--}
--
--// Print the values of a sublist of `llama_tokens & inp` to a string in the form [v0, v1, v2, ...].
--static std::string common_tokens_to_str(const llama_tokens & inp, size_t start, size_t length) {
--    std::ostringstream oss;
--    oss << '[';
--    for (size_t i = 0; i < length; ++i) {
--        if (i > 0) {
--            oss << ", ";
-+#include <cstdlib>
-+#include <cstring>
-+#include <cmath>
-+#include <algorithm>
-+#include <mutex>
-+#include <vector>
-+#if defined(__linux__)
-+#include <fcntl.h>
-+#include <sys/mman.h>
-+#include <unistd.h>
-+#endif
-+
-+// ============================================================================
-+// RouteCrack + Two-Zone Context Speculative Engine for Nemotron-3.5-30B
-+// ============================================================================
-+// Combines:
-+//   1. RouteCrack Offline+Online Cryptanalysis Engine (RCPredictor):
-+//      - 8-level FNV-64 Hash Cascade (k=10,8,6,5,4,3,2,1) trained on 3.7M
-+//        Nemotron-3.5-30B tokens (Claude Code tool calls, Italian prose, code)
-+//      - 300 Deterministic Hot-Token Context Rules
-+//      - 11,382 Macro-Token Codebook chains
-+//      - Online Context Trie (rc_trie_v2) pre-warmed on 80K real Nemotron
-+//        tokens + updated incrementally on every generated token
-+//      - Online PPM (Prediction by Partial Matching, k=2..6)
-+//      - Online Skipgram ((t-3, t-1) -> t)
-+//   2. Two-Zone In-Context N-gram Matcher (Hot Zone 1024 + Prefix Zone)
-+//      cross-validated by RouteCrack ensemble agreement to prevent Mamba-2
-+//      recurrent state rollbacks.
-+// ============================================================================
-+
-+namespace {
-+
-+// Live-tunable Shared Memory Control Block (/dev/shm/llama_modchip.bin)
-+struct rc_modchip_shm_t {
-+    uint32_t magic;            // 0x4D4F4443 ("MODC")
-+    uint32_t version;          // 1
-+    int32_t  l3_window;
-+    int32_t  attn_window;
-+    int32_t  attn_sinks;
-+    int32_t  swa_stride;
-+    int32_t  disable_chunking;
-+    int32_t  rc_enabled;       // 1 = enabled, 0 = disabled
-+    int32_t  rc_cert_d0;       // RouteCrack certainty gate d=0 (default 84)
-+    int32_t  rc_cert_d1;       // RouteCrack certainty gate d=1 (default 92)
-+    int32_t  rc_cert_d2;       // RouteCrack certainty gate d=2 (default 96)
-+    int32_t  moe_top_k;
-+};
-+
-+static const rc_modchip_shm_t * get_rc_modchip_shm() {
-+#if defined(__linux__)
-+    static const rc_modchip_shm_t * shm_ptr = nullptr;
-+    static bool tried = false;
-+    if (!tried) {
-+        tried = true;
-+        int fd = open("/dev/shm/llama_modchip.bin", O_RDONLY);
-+        if (fd >= 0) {
-+            void * p = mmap(nullptr, sizeof(rc_modchip_shm_t), PROT_READ, MAP_SHARED, fd, 0);
-+            close(fd);
-+            if (p != MAP_FAILED) {
-+                shm_ptr = reinterpret_cast<const rc_modchip_shm_t *>(p);
-+            }
-         }
--        oss << inp[start + i];
-     }
--    oss << ']';
--    return oss.str();
-+    if (shm_ptr && shm_ptr->magic == 0x4D4F4443u) {
-+        return shm_ptr;
-+    }
-+#endif
-+    return nullptr;
- }
- 
-+struct RouteCrackNemotronEngine {
-+    std::mutex mtx;
-+    bool initialized = false;
-+    RCPredictor pred;
-+    StockfishDrafter sf;
- 
--// n-gram simple
--//
--
--/**
-- * Perform speculative generation using the model's own token history.
-- * Searches for a matching pattern in the token history and returns draft tokens.
-- *
-- * @param state     Current state of this implementation
-- * @param tokens    Token history to search in
-- * @param sampled   Last sampled token
-- * @return Vector of draft tokens, empty if no matching pattern is found
-- */
--llama_tokens common_ngram_simple_draft(
--        const common_ngram_simple_config & config,
--        const llama_tokens & tokens, llama_token sampled) {
--
--    // Simple implementation of self-speculative decoding without a draft model.
--    //
--    const size_t cur_len = tokens.size();
-+    // Track last context size to only feed newly added tokens incrementally
-+    size_t last_inp_size = 0;
- 
--    const size_t n_draft_min = config.size_ngram; // size of n-gram to lookup in token history
--    const size_t n_draft_max = config.size_mgram; // the m-gram following the found n-gram is used for draft
-+    void init_once() {
-+        if (initialized) return;
-+        initialized = true;
- 
--    // vector for tokens we want to verify.
--    // return empty vector if there is no match.
--    llama_tokens draft_tokens;
-+        pred.init();
-+        sf.init();
- 
--    // We need at least n_draft_min + n_draft_max + 1 tokens.
--    if (cur_len <= static_cast<size_t>(n_draft_min + n_draft_max + 1)) {
--        return draft_tokens;
--    }
-+        const char * base_dir = std::getenv("RC_TABLES_DIR");
-+        if (!base_dir || !base_dir[0]) {
-+            base_dir = "./workspace/routecrack";
-+        }
- 
--    // pattern search
--    llama_tokens pattern;
--    pattern.reserve(n_draft_min);
--    for (size_t j = cur_len - n_draft_min + 1; j < cur_len; ++j) {
--        pattern.push_back(tokens[j]);
--    }
--    pattern.push_back(sampled); // add the last token to the pattern
-+        const int ks[8] = {10, 8, 6, 5, 4, 3, 2, 1};
-+        for (int i = 0; i < 8; ++i) {
-+            char path[512];
-+            std::snprintf(path, sizeof(path), "%s/hc_top4_k%d.bin", base_dir, ks[i]);
-+            pred.load_cascade(path);
-+        }
- 
--    size_t match_pos = 0; // we ignore position 0, position 0 == no match
--                          // search backwards, but skip the current match (we are currently there)
--    for (size_t j = cur_len - n_draft_min - 1; j > 0; --j) {
--        bool match = true;
--        for (size_t k = 0; k < pattern.size(); ++k) {
--            if (tokens[j + k] != pattern[k]) {
--                match = false;
--                break;
--            }
-+        {
-+            char path[512];
-+            std::snprintf(path, sizeof(path), "%s/hot_rules.bin", base_dir);
-+            pred.hot_rules.load(path);
-         }
--        if (match) {
--            match_pos = j;
--            break;
-+        {
-+            char path[512];
-+            std::snprintf(path, sizeof(path), "%s/macro_codebook.bin", base_dir);
-+            pred.macro.load(path);
-         }
--    }
--    if (match_pos == 0) {
--        return draft_tokens;
--    }
--
--    const size_t copy_max = std::min(
--            n_draft_max,
--            cur_len - (match_pos + n_draft_min)
--            );
--    if (copy_max < n_draft_min) {
--        return draft_tokens;
--    }
--    LOG_DBG("%s: #tokens = %zu: found matching pattern at pos %zu, length %zu, draft length %zu\n",
--            __func__, cur_len,
--            match_pos, pattern.size(), copy_max);
--
--    draft_tokens.reserve(copy_max);
--    for (size_t j = 0; j < copy_max; ++j) {
--        draft_tokens.push_back(tokens[match_pos + n_draft_min + j]);
--    }
--    return draft_tokens;
--}
- 
-+        // Pre-warm online Trie + PPM + Skipgram + Stockfish 192KB L2 Zobrist TT with recent Nemotron warm corpus (80K tokens)
-+        {
-+            char path[512];
-+            std::snprintf(path, sizeof(path), "%s/corpus_nemotron_warm.bin", base_dir);
-+            FILE * f = std::fopen(path, "rb");
-+            if (f) {
-+                std::fseek(f, 0, SEEK_END);
-+                long sz = std::ftell(f);
-+                long n_toks = sz / 4;
-+                long warm_n = std::min<long>(n_toks, 80000);
-+                std::fseek(f, (n_toks - warm_n) * 4, SEEK_SET);
-+                std::vector<int32_t> buf(warm_n);
-+                if (std::fread(buf.data(), 4, warm_n, f) == (size_t)warm_n) {
-+                    for (long j = 12; j < warm_n; ++j) {
-+                        learn_incremental_nolock(&buf[j - 11], 12);
-+                        sf.observe(&buf[j - 11], 11, buf[j], -1);
-+                    }
-+                }
-+                std::fclose(f);
-+            }
-+        }
- 
--// n-gram map
--//
--
--// maximum number of counted values of a ngram map value.
--#define COMMON_NGRAM_MAX_VALUE_COUNT 16380
--
--void common_ngram_map_begin(
--    common_ngram_map & map, const llama_tokens & tokens) {
--    size_t size_begin = tokens.size();
-+        std::fprintf(stderr,
-+            "[RouteCrack+Stockfish-PVS] Initialized: %d cascade tables, %u hot rules, %u macro entries, %u warm trie nodes, 192KB L2 Zobrist TT\n",
-+            pred.n_cascade, pred.hot_rules.n_rules, pred.macro.n_entries, pred.trie.used);
-+    }
-+
-+    // Incrementally learn ONLY the n-grams ending at ctx[len - 1]
-+    inline void learn_incremental_nolock(const int32_t * ctx, int len) {
-+        if (len < 2) return;
-+        int32_t actual = ctx[len - 1];
-+
-+        // 1. Update PPM for k=2..6 ending at ctx[len - 1]
-+        for (int k = RC_PPM_K_MIN; k <= RC_PPM_K_MAX && k < len; ++k) {
-+            int ti = k - RC_PPM_K_MIN;
-+            uint64_t h = rc_fnv64(ctx + len - 1 - k, k);
-+            if (h == 0) h = 1;
-+            uint32_t slot = (uint32_t)(h & RC_PPM_MASK);
-+            for (int probe = 0; probe < 8; ++probe) {
-+                uint32_t idx = (slot + probe) & RC_PPM_MASK;
-+                RCPPMEntry & e = pred.ppm.tables[ti][idx];
-+                if (e.ctx_hash == 0) {
-+                    e.ctx_hash = h;
-+                    e.preds[0] = actual;
-+                    e.counts[0] = 1;
-+                    e.n_preds = 1;
-+                    e.total_cnt = 1;
-+                    break;
-+                }
-+                if (e.ctx_hash == h) {
-+                    e.total_cnt++;
-+                    bool found = false;
-+                    for (int p = 0; p < e.n_preds; ++p) {
-+                        if (e.preds[p] == actual) {
-+                            e.counts[p]++;
-+                            while (p > 0 && e.counts[p] > e.counts[p - 1]) {
-+                                std::swap(e.preds[p], e.preds[p - 1]);
-+                                std::swap(e.counts[p], e.counts[p - 1]);
-+                                p--;
-+                            }
-+                            found = true;
-+                            break;
-+                        }
-+                    }
-+                    if (!found && e.n_preds < RC_PPM_TOPK) {
-+                        e.preds[e.n_preds] = actual;
-+                        e.counts[e.n_preds] = 1;
-+                        e.n_preds++;
-+                    }
-+                    break;
-+                }
-+            }
-+        }
- 
--    LOG_DBG("%s: begin, idx_last_draft=%zu, new begin=%zu, #keys=%zu\n", __func__,
--            map.idx_last_check, size_begin, map.keys.size());
-+        // 2. Update Skipgram: (len-4, len-2) -> len-1
-+        if (len >= 4) {
-+            uint64_t h = RCSkipgram::skip_hash(ctx[len - 4], ctx[len - 2]);
-+            uint32_t slot = (uint32_t)(h & RC_SKIP_MASK);
-+            for (int probe = 0; probe < 8; ++probe) {
-+                uint32_t idx = (slot + probe) & RC_SKIP_MASK;
-+                if (pred.skipgram.table[idx].hash == 0) {
-+                    pred.skipgram.table[idx] = {h, actual, 1, 1};
-+                    break;
-+                }
-+                if (pred.skipgram.table[idx].hash == h) {
-+                    pred.skipgram.table[idx].total++;
-+                    if (actual == pred.skipgram.table[idx].pred) {
-+                        pred.skipgram.table[idx].hits++;
-+                    }
-+                    break;
-+                }
-+            }
-+        }
- 
--    size_t idx_begin_cleanup = map.size_last_begin;
--    if (idx_begin_cleanup > size_begin) {
--        if (size_begin > (size_t) map.size_key + map.size_value) {
--            idx_begin_cleanup = size_begin - map.size_key - map.size_value;
--        } else {
--            idx_begin_cleanup = 0;
-+        // 3. Update Online Trie for depth 3..10 ending at ctx[len - 1]
-+        int max_d = std::min(len, 10);
-+        for (int d = 3; d <= max_d; ++d) {
-+            int start = len - d;
-+            RCTrieNode * cursor = pred.trie.root_ptr;
-+            for (int j = start; j < len; ++j) {
-+                auto it = cursor->children.find(ctx[j]);
-+                if (it == cursor->children.end()) {
-+                    RCTrieNode * child = pred.trie.alloc_node_ptr(ctx[j], cursor);
-+                    cursor->children[ctx[j]] = child;
-+                    child->freq = 1;
-+                    cursor = child;
-+                } else {
-+                    if (j == len - 1) it->second->freq++;
-+                    cursor = it->second;
-+                }
-+            }
-         }
--        LOG_INF("%s: shrink cleanup begin: %zu -> %zu\n", __func__, map.size_last_begin, idx_begin_cleanup);
-     }
- 
--    size_t count_map_entries_upd = 0;
--    if (!map.key_map.empty() && size_begin < map.idx_last_check) {
--        if (map.show_key_map_stats) {
--            // Print statistics of hash map map_key.
--            size_t count_nonzero = 0;
--            uint32_t min_idx = UINT32_MAX;
--            uint32_t max_idx = 0;
--            for (size_t i = 0; i < map.key_map.size(); ++i) {
--                uint32_t key_idx = map.key_map[i];
--                if (key_idx != 0) {
--                    ++count_nonzero;
--                    if (key_idx < min_idx) min_idx = key_idx;
--                    if (key_idx > max_idx) max_idx = key_idx;
-+    // Query RouteCrack ensemble for next-token prediction + calibrated certainty (0..100),
-+    // or verify an in-context candidate token (verify_cand >= 0).
-+    inline void query_rc_nolock(
-+        const int32_t * ctx_ptr, int ctx_len,
-+        int32_t & out_tok, int & out_cert, int32_t verify_cand = -1,
-+        int * out_casc_k = nullptr, int * out_agree = nullptr) {
-+
-+        int32_t casc_tok = -1, casc_conf = 0, casc_k = 0;
-+        const RCHashEntry * casc_ent = nullptr;
-+        bool cand_in_casc = false;
-+        for (int c = 0; c < pred.n_cascade; ++c) {
-+            int ck = pred.cascade_k[c];
-+            if (ctx_len >= ck) {
-+                uint64_t h = rc_fnv64(ctx_ptr + ctx_len - ck, ck);
-+                int idx = pred.cascade[c].find_idx(h);
-+                if (idx >= 0) {
-+                    const auto & ent = pred.cascade[c].entries[idx];
-+                    casc_ent  = &ent;
-+                    casc_tok  = ent.pred[0];
-+                    casc_conf = ent.conf[0];
-+                    casc_k    = ck;
-+                    if (verify_cand >= 0) {
-+                        for (int p = 0; p < ent.n_preds; ++p) {
-+                            if (ent.pred[p] == verify_cand) cand_in_casc = true;
-+                        }
-+                    }
-+                    break;
-                 }
-             }
--            if (count_nonzero == 0) {
--                min_idx = 0;
--            }
--            LOG_INF("%s: key_map stats: entries=%zu, min_idx=%u, max_idx=%u, key_map_last_idx=%u\n",
--                    __func__, count_nonzero, min_idx, max_idx, map.key_map_last_idx);
-         }
- 
--        // Update the map from hash to key index (clear outdated entries).
--        for (size_t i = 0; i < map.key_map.size(); ++i) {
--            uint32_t key_idx = map.key_map[i];
--            if (key_idx != 0 && key_idx >= idx_begin_cleanup) {
--                map.key_map[i] = 0;
--                count_map_entries_upd++;
-+        float trie_conf = 0.0f;
-+        int trie_obs = 0, trie_depth = 0;
-+        int32_t trie_tok = pred.trie.predict_confident(ctx_ptr, ctx_len, &trie_conf, &trie_obs, &trie_depth);
-+
-+        int32_t ppm_out[4];
-+        float ppm_scores[4];
-+        int n_ppm = pred.ppm.predict(ctx_ptr, ctx_len, ppm_out, ppm_scores, 4);
-+        int32_t ppm_tok = (n_ppm > 0) ? ppm_out[0] : -1;
-+
-+        int32_t skip_tok = (ctx_len >= 3) ? pred.skipgram.predict(ctx_ptr[ctx_len - 3], ctx_ptr[ctx_len - 1]) : -1;
-+
-+        int32_t hot_tok = -1;
-+        int hot_conf = 0;
-+        if (ctx_len >= 1 && pred.hot_rules.n_rules > 0) {
-+            int lo = 0, hi = (int)pred.hot_rules.n_rules - 1;
-+            int32_t prev = ctx_ptr[ctx_len - 1];
-+            while (lo <= hi) {
-+                int mid = (lo + hi) / 2;
-+                if (pred.hot_rules.rules[mid].predecessor == prev) {
-+                    hot_tok  = pred.hot_rules.rules[mid].prediction;
-+                    hot_conf = pred.hot_rules.rules[mid].confidence;
-+                    break;
-+                }
-+                if (pred.hot_rules.rules[mid].predecessor < prev) lo = mid + 1;
-+                else hi = mid - 1;
-             }
-         }
--        map.key_map_last_idx = (idx_begin_cleanup > 0) ? (uint32_t) (idx_begin_cleanup - 1) : 0;
--    }
--
--    if (size_begin < map.idx_last_check && !map.keys.empty()) {
--        size_t count_keys = map.keys.size();
--        size_t count_keys_del = 0;
--        size_t count_values_del = 0;
--        for (int32_t i = map.keys.size() - 1; i >= 0; --i) {
--            common_ngram_map_key & key = map.keys[i];
--            if (key.key_idx >= idx_begin_cleanup) {
--                // Delete the key.
--                LOG_DBG("%s: delete key %d at index %zu (>= idx_begin_cleanup=%zu)\n", __func__, i, key.key_idx, idx_begin_cleanup);
--                map.keys.erase(map.keys.begin() + i);
--                count_keys_del++;
--                continue;
--            }
--            if (map.key_only) {
--                continue;
--            }
- 
--            // Check the indices of the values.
--            for (int16_t j = COMMON_NGRAM_MAX_VALUES - 1; j >= 0; --j) {
--                common_ngram_map_value & value = key.values[j];
--                if (value.value_idx != 0 && value.value_idx >= idx_begin_cleanup) {
--                    // Delete the value.
--                    count_values_del++;
--
--                    // Move all values after this value to the left.
--                    for (uint16_t k = j; k < COMMON_NGRAM_MAX_VALUES - 1; ++k) {
--                        key.values[k] = key.values[k + 1];
-+        // RouteCrack Technique #2: Top-4 Cascade Candidate Disambiguation via Stockfish Orthogonal Session TT
-+        if (casc_ent && casc_ent->n_preds > 1) {
-+            const SFTTBucket * b5 = sf.probe5(ctx_ptr, ctx_len);
-+            const SFTTBucket * b4 = sf.probe4(ctx_ptr, ctx_len);
-+            bool top1_refuted = (b5 && b5->refuted_move == casc_tok && b5->best_move != casc_tok && b5->history < 0) ||
-+                                (b4 && b4->refuted_move == casc_tok && b4->best_move != casc_tok && b4->history <= -64);
-+            if (top1_refuted || casc_conf < 80) {
-+                for (int p = 1; p < casc_ent->n_preds; ++p) {
-+                    int32_t alt = casc_ent->pred[p];
-+                    int alt_c   = casc_ent->conf[p];
-+                    if (alt < 0 || alt_c < 20) continue;
-+                    bool tt5_match = (b5 && b5->best_move == alt && b5->wins >= 3 && b5->history >= 160);
-+                    bool tt4_match = (b4 && b4->best_move == alt && b4->wins >= 4 && b4->history >= 200);
-+                    bool session_match = (trie_tok == alt && trie_depth >= 4 && trie_conf >= 0.80f) && (ppm_tok == alt);
-+                    if ((tt5_match || tt4_match) && session_match) {
-+                        casc_tok  = alt;
-+                        casc_conf = 84;
-+                        break;
-                     }
--                    // Clear the last value.
--                    key.values[COMMON_NGRAM_MAX_VALUES - 1].value_idx = 0;
--                    key.values[COMMON_NGRAM_MAX_VALUES - 1].value_num = 0;
-                 }
-             }
--            if (key.values[0].value_idx == 0) {
--                // No values left, delete the key.
--                LOG_DBG("%s: delete key %d at index %zu (no values left)\n", __func__, i, key.key_idx);
--                map.keys.erase(map.keys.begin() + i);
--                count_keys_del++;
--            }
-         }
- 
--        LOG_INF("%s: refresh map: idx_last_draft=%zu, new begin=%zu, #keys_checked=%zu, #keys_del=%zu, #values_del=%zu, #hashes_upd=%zu\n", __func__,
--                map.idx_last_check, size_begin,
--                count_keys, count_keys_del, count_values_del, count_map_entries_upd);
-+        if (out_casc_k) *out_casc_k = casc_k;
-+
-+        if (verify_cand >= 0) {
-+            int agree = 0;
-+            if (casc_tok == verify_cand || cand_in_casc) agree++;
-+            if (trie_tok == verify_cand) agree++;
-+            if (ppm_tok == verify_cand) agree++;
-+            if (skip_tok == verify_cand) agree++;
-+            if (hot_tok == verify_cand) agree++;
-+            out_tok  = verify_cand;
-+            out_cert = agree; // number of RC predictors backing the in-context candidate
-+            if (out_agree) *out_agree = agree;
-+            return;
-+        }
-+
-+        out_tok  = -1;
-+        out_cert = 0;
-+        if (out_agree) *out_agree = 0;
-+        if (casc_tok >= 0) {
-+            int agree = 1;
-+            if (trie_tok == casc_tok && trie_depth >= 2) agree++;
-+            if (ppm_tok == casc_tok) agree++;
-+            if (skip_tok == casc_tok) agree++;
-+            if (hot_tok == casc_tok) agree++;
-+            out_cert = casc_conf + (casc_k >= 6 ? 4 : 0) + (agree >= 3 ? 6 : (agree == 2 ? 3 : 0));
-+            if (casc_k == 1 && casc_conf < 90) out_cert = 0;
-+            out_tok = casc_tok;
-+            if (out_agree) *out_agree = agree;
-+        } else if (trie_tok >= 0 && trie_depth >= 4 && trie_obs >= 3 && trie_conf >= 0.88f) {
-+            out_tok  = trie_tok;
-+            out_cert = (int)(trie_conf * 100.0f);
-+            if (out_agree) *out_agree = 1 + (ppm_tok == trie_tok ? 1 : 0) + (skip_tok == trie_tok ? 1 : 0);
-+        } else if (hot_tok >= 0 && hot_conf >= 90 && (ppm_tok == hot_tok || skip_tok == hot_tok)) {
-+            out_tok  = hot_tok;
-+            out_cert = hot_conf;
-+            if (out_agree) *out_agree = 2;
-+        }
-+
-+        // RouteCrack Technique #1: Online Session Trie v2 Rescue gated by Stockfish Zobrist TT
-+        // Fixes shadowing where a low-confidence k=1..3 cascade match prevented deep session trie matches from firing.
-+        if (out_cert < 84 && trie_tok >= 0 && trie_depth >= 4 && trie_obs >= 4 && trie_conf >= 0.92f) {
-+            const SFTTBucket * b5 = sf.probe5(ctx_ptr, ctx_len);
-+            const SFTTBucket * b4 = sf.probe4(ctx_ptr, ctx_len);
-+            const SFTTBucket * b3 = sf.probe3(ctx_ptr, ctx_len);
-+            bool refuted = (b5 && b5->refuted_move == trie_tok && b5->best_move != trie_tok) ||
-+                           (b4 && b4->refuted_move == trie_tok && b4->best_move != trie_tok) ||
-+                           (b3 && b3->refuted_move == trie_tok && b3->best_move != trie_tok && b3->history <= -64);
-+            bool tt_confirmed = (b5 && b5->best_move == trie_tok && b5->wins >= 2) ||
-+                                (b4 && b4->best_move == trie_tok && b4->wins >= 3);
-+            int t_agree = 1 + (ppm_tok == trie_tok ? 1 : 0) + (skip_tok == trie_tok ? 1 : 0) + (cand_in_casc || casc_tok == trie_tok ? 1 : 0);
-+            if (!refuted && ((tt_confirmed && t_agree >= 2) || (trie_depth >= 6 && trie_obs >= 5 && t_agree >= 3))) {
-+                out_tok  = trie_tok;
-+                out_cert = std::min(95, (int)(trie_conf * 92.0f) + (tt_confirmed ? 4 : 0));
-+                if (out_agree) *out_agree = t_agree;
-+            }
-+        }
-     }
-+};
- 
--    map.idx_last_check = size_begin;
--    map.size_last_begin = size_begin;
-+static RouteCrackNemotronEngine & get_rc_engine() {
-+    static RouteCrackNemotronEngine eng;
-+    return eng;
- }
- 
--void common_ngram_map_draft(common_ngram_map & map,
--        const llama_tokens & inp, llama_token sampled,
--        llama_tokens & draft) {
--    // reset last key and value.
--    map.last_draft_created   = false;
--    map.last_draft_key_idx   = 0;
--    map.last_draft_value_idx = 0;
--
--    const size_t cur_len = inp.size();
--    const uint16_t n = map.size_key;
--    const uint16_t m = map.size_value;
--    if (cur_len < static_cast<size_t>(2 * n + m)) {
--        return;
--    }
--    if (cur_len >= static_cast<size_t>(UINT32_MAX)) {
--        // key_map uses uint32_t instead of size_t.
--        GGML_ABORT("%s: cur_len exceeds UINT32_MAX: %zu", __func__, cur_len);
-+// Pre-initialize RouteCrack tables at library load time so the first request pays zero disk I/O
-+struct RCPreheater {
-+    RCPreheater() {
-+        auto & eng = get_rc_engine();
-+        std::lock_guard<std::mutex> lock(eng.mtx);
-+        eng.init_once();
-     }
-+};
-+static RCPreheater g_rc_preheater;
- 
--    if (map.idx_last_check > cur_len) {
--        // Should not happen because of common_ngram_map_begin().
--        GGML_ABORT("%s: map.idx_last_check > cur_len: %zu > %zu", __func__, map.idx_last_check, cur_len);
--    }
--    map.idx_last_check = cur_len;
-+} // anonymous namespace
- 
--    // search pattern, the key n-gram
--    std::vector<llama_token> key_tokens;
--    key_tokens.reserve(n);
--    for (size_t j = cur_len - n + 1; j < cur_len; ++j) {
--        key_tokens.push_back(inp[j]);
--    }
--    key_tokens.push_back(sampled);
- 
--    // search for the key in the map
--    size_t match_pos = 0;
--    if (map.size_last_begin > cur_len) {
--        GGML_ABORT("%s: map.size_last_begin > cur_len: %zu > %zu", __func__, map.size_last_begin, cur_len);
--    }
--    if (!map.key_map.empty()) {
--        // Search for the key in the map key_map from hash of ngrams to index of ngram.
--        uint32_t idx_hash = (common_ngram_map_hash(key_tokens, 0, n) % map.key_map.size());
--        uint32_t idx_key = map.key_map[idx_hash];
--        if (idx_key != 0 && idx_key < cur_len - n - m - 1) {
--            // Check if the key matches the key at idx_key (because of possible collisions).
--            bool match = true;
--            for (size_t k = 0; k < n; ++k) {
--                if (inp[idx_key + k] != key_tokens[k]) {
--                    match = false;
--                    break;
-+// ============================================================================
-+// common_ngram_simple_draft:
-+// Full RouteCrack + Stockfish-PVS v2 Sweet Spot (192KB L2 Zobrist TT +
-+// Quiescence Lookahead + MacroCodebook 4-tok Chains + Singular Horizon M=7)
-+// ============================================================================
-+llama_tokens common_ngram_simple_draft(
-+    const common_ngram_simple_config & config,
-+    const llama_tokens & inp,
-+    const llama_token sampled) {
-+
-+    llama_tokens draft;
-+    const size_t inp_size = inp.size();
-+    const uint16_t size_mgram = config.size_mgram;
-+    if (size_mgram == 0 || inp_size < 12) {
-+        return draft;
-+    }
-+
-+    static const int env_rc_en = []() {
-+        const char * e = std::getenv("LLAMA_RC_ENABLED");
-+        return e ? std::atoi(e) : 1;
-+    }();
-+    static const int env_c0 = []() {
-+        const char * e = std::getenv("LLAMA_RC_CERT_D0");
-+        return e ? std::atoi(e) : 84;
-+    }();
-+    static const int env_c1 = []() {
-+        const char * e = std::getenv("LLAMA_RC_CERT_D1");
-+        return e ? std::atoi(e) : 92;
-+    }();
-+    static const int env_c2 = []() {
-+        const char * e = std::getenv("LLAMA_RC_CERT_D2");
-+        return e ? std::atoi(e) : 96;
-+    }();
-+
-+    const rc_modchip_shm_t * shm = get_rc_modchip_shm();
-+    const int rc_en = shm ? shm->rc_enabled : env_rc_en;
-+    if (!rc_en) {
-+        return draft;
-+    }
-+    const int cert_d0 = (shm && shm->rc_cert_d0 > 0) ? shm->rc_cert_d0 : env_c0;
-+    const int cert_d1 = (shm && shm->rc_cert_d1 > 0) ? shm->rc_cert_d1 : env_c1;
-+    const int cert_d2 = (shm && shm->rc_cert_d2 > 0) ? shm->rc_cert_d2 : env_c2;
-+
-+    auto & rc = get_rc_engine();
-+    std::lock_guard<std::mutex> lock(rc.mtx);
-+    if (!rc.initialized) {
-+        rc.init_once();
-+    }
-+
-+    // Build contiguous tail window ending with `sampled`
-+    int32_t tail_win[28];
-+    const int win_n = 12;
-+    for (int i = 0; i < win_n - 1; ++i) {
-+        tail_win[i] = (int32_t)inp[inp_size - (win_n - 1) + i];
-+    }
-+    tail_win[win_n - 1] = (int32_t)sampled;
-+
-+    // Incrementally feed newly accepted/sampled tokens (and warm prompt tokens!) to online learners + Stockfish Zobrist TT
-+    if (inp_size != rc.last_inp_size) {
-+        size_t delta = (inp_size > rc.last_inp_size && inp_size - rc.last_inp_size <= 8)
-+                       ? (inp_size - rc.last_inp_size)
-+                       : std::min<size_t>(inp_size, 4096);
-+        int step_idx = 0;
-+        for (size_t d = delta; d >= 1; --d, ++step_idx) {
-+            int32_t d_tok = (step_idx < rc.sf.last_draft_len) ? rc.sf.last_draft[step_idx] : -1;
-+            if (d == 1) {
-+                rc.learn_incremental_nolock(tail_win, win_n);
-+                rc.sf.observe(tail_win, win_n - 1, tail_win[win_n - 1], d_tok);
-+            } else if (inp_size + 1 - d >= 12) {
-+                int32_t hist_win[12];
-+                size_t end_pos = inp_size + 1 - d;
-+                for (int i = 0; i < 12; ++i) {
-+                    hist_win[i] = (int32_t)inp[end_pos - 12 + i];
-                 }
--            }
--            LOG_DBG("%s: key hash %x -> idx_key %d: match %d\n", __func__, idx_hash, idx_key, match ? 1 : 0);
--            if (match) {
--                match_pos = idx_key;
-+                rc.learn_incremental_nolock(hist_win, 12);
-+                rc.sf.observe(hist_win, 11, hist_win[11], d_tok);
-             }
-         }
--    }
--    if (match_pos == 0 && map.size_last_begin > (size_t) (n + m + 1)) {
--        // Search for the key in [1, map.size_last_begin - n - m -1], descending.
--        for (size_t j = map.size_last_begin - n - m - 1; j > map.key_map_last_idx; --j) {
--            // Check if the key matches the key.
--            bool match = true;
--            for (size_t k = 0; k < n; ++k) {
--                if (inp[j + k] != key_tokens[k]) {
--                    match = false;
--                    break;
--                }
-+        rc.last_inp_size = inp_size;
-+    }
-+
-+    // ------------------------------------------------------------------------
-+    // Stage 1: In-Context Suffix Scan (Hot Zone 16384 + Prefix Zone 24576)
-+    //          + Stockfish Multi-Branch Conflict Disambiguation
-+    //          + Singular Horizon Extension (Sweet Spot up to M=7)
-+    // ------------------------------------------------------------------------
-+    const size_t hot_start = (inp_size > 16384) ? (inp_size - 16384) : 3;
-+    const int32_t p0 = (int32_t)sampled;
-+    const int32_t p1 = (int32_t)inp[inp_size - 1];
-+    const int32_t p2 = (int32_t)inp[inp_size - 2];
-+
-+    size_t best_j = 0, best_k = 0, hits = 0, consensus_len = 7;
-+    size_t second_j = 0, second_k = 0, true_consensus_hits = 0;
-+
-+    // Helper lambda to check a match ending at inp[j] == p0, inp[j-1] == p1, inp[j-2] == p2
-+    auto eval_match = [&](size_t j, bool is_hot_zone) {
-+        size_t k = 3;
-+        while (k < 12 && j >= k && inp_size >= k && inp[j - k] == inp[inp_size - k]) {
-+            k++;
-+        }
-+        const bool online_only = (rc.pred.n_cascade == 0);
-+        if (!is_hot_zone && k < (online_only ? 3 : 5)) return;
-+        if (!online_only && is_hot_zone && j + 256 < inp_size && k < 4) return;
-+
-+        hits++;
-+        if (best_j == 0) {
-+            best_j = j;
-+            best_k = k;
-+            true_consensus_hits = 1;
-+        } else {
-+            size_t agree = 0;
-+            while (agree < consensus_len &&
-+                   j + 1 + agree < inp_size &&
-+                   best_j + 1 + agree < inp_size &&
-+                   inp[j + 1 + agree] == inp[best_j + 1 + agree]) {
-+                agree++;
-             }
--            if (match) {
--               match_pos = j;
--               break;
-+            if (k >= best_k && agree > 0) {
-+                best_j = j;
-+                best_k = k;
-+                consensus_len = std::min(consensus_len, agree);
-+                true_consensus_hits++;
-+            } else if (k + 1 >= best_k) {
-+                if (agree == 0 && second_j == 0) {
-+                    second_j = j;
-+                    second_k = k;
-+                }
-+                if (agree > 0) true_consensus_hits++;
-+                consensus_len = std::min(consensus_len, agree);
-             }
-         }
-+    };
-+
-+    // Scan Hot Zone (recent 16384 tokens) backwards
-+    for (size_t j = inp_size - 1; j >= hot_start; --j) {
-+        if (inp[j] == p0 && inp[j - 1] == p1 && inp[j - 2] == p2) {
-+            eval_match(j, true);
-+            if (hits >= 5) break;
-+        }
-+        if (j == 3) break;
-     }
--    if (match_pos == 0) {
--        // In case of a reasoning chat, the part after size_last_begin may be deleted/reordered later.
--        //
--        // Search in [size_last_begin, cur_len - n - m - 1], descending.
--        for (size_t j = cur_len - n - m - 1; j > map.size_last_begin && j > map.key_map_last_idx; --j) {
--            bool match = true;
--            for (size_t k = 0; k < n; ++k) {
--                if (inp[j + k] != key_tokens[k]) {
--                    match = false;
--                    break;
--                }
--            }
--            if (match) {
--               match_pos = j;
--               break;
-+
-+    // If no hot-zone match, scan Prefix Zone (first 24576 tokens: system prompt & 40 tool schemas)
-+    if (best_j == 0 && hot_start > 16) {
-+        const size_t prefix_end = std::min<size_t>(hot_start - 1, 24576);
-+        for (size_t j = prefix_end; j >= 6; --j) {
-+            if (inp[j] == p0 && inp[j - 1] == p1 && inp[j - 2] == p2) {
-+                eval_match(j, false);
-+                if (hits >= 3) break;
-             }
-+            if (j == 6) break;
-         }
-     }
--    if (match_pos > 0) {
--        LOG_DBG("%s: cur_len = %zu, n = %d, m = %d, sz_tkns = %zu, sampled = %d, match_pos = %zu\n", __func__,
--            cur_len, n, m, key_tokens.size(), sampled, match_pos);
-+
-+    int cur_win_len = win_n;
-+
-+    // Stockfish Multi-Branch Disambiguation when two context matches conflict (consensus_len == 0)
-+    if (best_j > 0 && consensus_len == 0 && second_j > 0 && best_j + 1 < inp_size && second_j + 1 < inp_size) {
-+        int32_t c1 = (int32_t)inp[best_j + 1];
-+        int32_t c2 = (int32_t)inp[second_j + 1];
-+        int32_t dummy_t = -1;
-+        int agree1 = 0, agree2 = 0;
-+        rc.query_rc_nolock(tail_win, cur_win_len, dummy_t, agree1, c1);
-+        rc.query_rc_nolock(tail_win, cur_win_len, dummy_t, agree2, c2);
-+        const SFTTBucket * b4 = rc.sf.probe4(tail_win, cur_win_len);
-+        bool c1_tt = (b4 && b4->best_move == c1 && b4->wins >= 2);
-+        bool c2_tt = (b4 && b4->best_move == c2 && b4->wins >= 2);
-+        if (agree1 >= 3 && agree2 == 0 && c1_tt) {
-+            consensus_len = 1;
-+        } else if (agree2 >= 3 && agree1 == 0 && c2_tt) {
-+            best_j = second_j;
-+            best_k = second_k;
-+            consensus_len = 1;
-+        }
-     }
- 
--    if (!map.key_map.empty()) {
--        // Add hashes of new ngrams in key_map.
--        //
--        // Use the same order as above.
--        if (map.size_last_begin > (size_t) (n + m + 1)) {
--            for (size_t j = map.size_last_begin - n - m - 1; j > map.key_map_last_idx; --j) {
--                // compute hash and store index of ngram at idx j in the map.
--                uint32_t idx_hash = (common_ngram_map_hash(inp, j, n) % map.key_map.size());
--                if (map.key_map[idx_hash] == 0) {
--                    map.key_map[idx_hash] = j; // collisions may occur
-+    if (best_j > 0 && consensus_len > 0) {
-+        const bool online_only = (rc.pred.n_cascade == 0);
-+        size_t base_m = 0;
-+        if (online_only) {
-+            // High-precision gating for 256-expert MoE (each drafted token activates ~5.5 new experts/layer)
-+            if (best_k >= 8)      base_m = (true_consensus_hits >= 2) ? 4 : 3;
-+            else if (best_k >= 6) base_m = (hits >= 2) ? 3 : 2;
-+            else if (best_k == 5) base_m = (hits >= 2 || best_j + 1024 >= inp_size) ? 2 : 1;
-+            else if (best_k == 4 && (hits >= 2 || best_j + 512 >= inp_size)) base_m = (hits >= 2) ? 2 : 1;
-+            else if (best_k == 3 && hits >= 2 && best_j + 256 >= inp_size)   base_m = 1;
-+        } else {
-+            if (best_k >= 8)      base_m = 5;
-+            else if (best_k >= 7) base_m = (hits >= 2) ? 5 : 4;
-+            else if (best_k >= 5) base_m = (hits >= 2) ? 4 : 3;
-+            else if (best_k == 4) base_m = (hits >= 2) ? 2 : 1;
-+            else if (best_k == 3) {
-+                if (hits >= 2) base_m = 1;
-+                else if (best_j + 128 >= inp_size) {
-+                    int32_t cand = (int32_t)inp[best_j + 1];
-+                    const SFTTBucket * b5 = rc.sf.probe5(tail_win, cur_win_len);
-+                    if (b5 && b5->best_move == cand && b5->wins >= 2 && b5->history >= 128) base_m = 1;
-                 }
-             }
-         }
- 
--        for (size_t j = cur_len - n - m - 1; j > map.size_last_begin && j > map.key_map_last_idx; --j) {
--            // compute hash and store index of ngram at idx j in the map.
--            uint32_t idx_hash = (common_ngram_map_hash(inp, j, n) % map.key_map.size());
--            if (map.key_map[idx_hash] == 0) {
--                map.key_map[idx_hash] = j;
-+        // RouteCrack Technique #17 + Stockfish Singular Horizon Extension (capped for 256-expert MoE online_only)
-+        size_t ext_cap = online_only ? base_m :
-+                         ((best_k >= 10 || (best_k >= 8 && true_consensus_hits >= 2)) ? 7 :
-+                          (best_k >= 7  && true_consensus_hits >= 2) ? 6 : base_m);
-+        size_t max_m = std::min<size_t>(ext_cap, std::min<size_t>(consensus_len, size_mgram));
-+
-+        for (size_t i = 0; i < max_m && best_j + 1 + i < inp_size; ++i) {
-+            int32_t cand = (int32_t)inp[best_j + 1 + i];
-+            // Stockfish 3-gram Zobrist Refutation Guard on single-hit matches
-+            const SFTTBucket * b3 = rc.sf.probe3(tail_win, cur_win_len);
-+            if (b3 && b3->refuted_move == cand && b3->best_move != cand && b3->history <= -64 && best_k <= 5 && hits == 1) {
-+                break;
-+            }
-+            // If best_k <= 5 and hits == 1 on Mamba-2 (with offline cascade), require RouteCrack or Zobrist TT backing
-+            if (!online_only && hits == 1 && best_k <= 5) {
-+                int32_t rc_t = -1;
-+                int rc_agree = 0;
-+                rc.query_rc_nolock(tail_win, cur_win_len, rc_t, rc_agree, cand);
-+                const SFTTBucket * b5 = rc.sf.probe5(tail_win, cur_win_len);
-+                const SFTTBucket * b4 = rc.sf.probe4(tail_win, cur_win_len);
-+                bool tt_backed = (b5 && b5->best_move == cand && b5->wins >= 2) ||
-+                                 (b4 && b4->best_move == cand && b4->wins >= 3);
-+                if (best_k == 4 && i == 0 && rc_agree == 0 && !tt_backed) break;
-+                if (i >= 1 && rc_agree == 0 && !tt_backed) break;
-             }
-+            // For Singular Horizon Extension steps (i >= base_m), require active RouteCrack or Stockfish TT confirmation
-+            if (i >= base_m) {
-+                int32_t rc_t = -1;
-+                int rc_agree = 0;
-+                rc.query_rc_nolock(tail_win, cur_win_len, rc_t, rc_agree, cand);
-+                const SFTTBucket * b5 = rc.sf.probe5(tail_win, cur_win_len);
-+                const SFTTBucket * b4 = rc.sf.probe4(tail_win, cur_win_len);
-+                bool refuted = (b5 && b5->refuted_move == cand && b5->best_move != cand) ||
-+                               (b4 && b4->refuted_move == cand && b4->best_move != cand);
-+                bool tt_ok = (b5 && b5->best_move == cand && b5->wins >= 2) ||
-+                             (b4 && b4->best_move == cand && b4->wins >= 2);
-+                int req_agree = (best_k >= 11) ? 1 : 2;
-+                if (refuted || (rc_agree < req_agree && !tt_ok)) break;
-+            }
-+            draft.push_back((llama_token)cand);
-+            tail_win[cur_win_len++] = cand;
-         }
--        map.key_map_last_idx = std::max(static_cast<uint32_t>(cur_len - n - m - 1), map.key_map_last_idx);
-     }
- 
--    if (match_pos == 0) {
--        return;
-+    // ------------------------------------------------------------------------
-+    // Stage 2: Stockfish PVS + Multi-Order Zobrist TT + 1-Ply Quiescence Lookahead
-+    //          + RouteCrack Technique #5/#89 (4-Token Macro Codebook Chains)
-+    // ------------------------------------------------------------------------
-+    const RCMacroEntry * active_macro = nullptr;
-+    const int macro_start_d = (int)draft.size();
-+    if (rc.pred.macro.entries && rc.pred.macro.n_entries > 0) {
-+        for (int mk = std::min(cur_win_len, 6); mk >= 5; --mk) {
-+            uint64_t mh = rc_fnv64(tail_win + cur_win_len - mk, mk);
-+            int midx = rc.pred.macro.find(mh);
-+            if (midx >= 0 && rc.pred.macro.entries[midx].conf >= 92 && rc.pred.macro.entries[midx].cont_len >= 3) {
-+                active_macro = &rc.pred.macro.entries[midx];
-+                break;
-+            }
-+        }
-     }
- 
--    // We have a match, now we look for the statistics of the key.
--    size_t key_offset = map.keys.size(); // offset in the map
--    // We iterate through the std::vector<common_ngram_map_key> map->keys.
--    for (size_t i = 0; i < map.keys.size(); ++i) {
--        bool match = true;
--        for (size_t j = 0; j < n; ++j) {
--            if (inp[map.keys[i].key_idx + j] != key_tokens[j]) {
--                match = false;
--                break;
-+    const int max_rc_draft = std::min<int>((int)size_mgram, active_macro ? std::min(4, macro_start_d + 4) : 3);
-+    for (int d = (int)draft.size(); d < max_rc_draft; ++d) {
-+        int32_t chosen = -1;
-+        int cert = 0, casc_k = 0, agree = 0;
-+        rc.query_rc_nolock(tail_win, cur_win_len, chosen, cert, -1, &casc_k, &agree);
-+
-+        if (active_macro) {
-+            int m_step = d - macro_start_d;
-+            if (m_step >= 0 && m_step < active_macro->cont_len) {
-+                if (chosen == active_macro->continuation[m_step]) {
-+                    cert = std::max(cert, (int)active_macro->conf + (m_step >= 1 ? 4 : 0));
-+                } else {
-+                    active_macro = nullptr;
-+                }
-+            }
-+        }
-+
-+        const SFTTBucket * b5 = rc.sf.probe5(tail_win, cur_win_len);
-+        const SFTTBucket * b4 = rc.sf.probe4(tail_win, cur_win_len);
-+        const SFTTBucket * b3 = rc.sf.probe3(tail_win, cur_win_len);
-+
-+        // 1. Zobrist 5-gram & 4-gram Exact Session TT (Killer Move & Refutation)
-+        if (b5) {
-+            if (chosen >= 0 && b5->refuted_move == chosen && b5->best_move != chosen && b5->history < 0) {
-+                if (b5->wins >= 3 && b5->history >= 128) {
-+                    chosen = b5->best_move;
-+                    cert = 88 + std::min<int>(8, b5->wins);
-+                } else {
-+                    cert -= 12;
-+                }
-+            } else if (chosen == b5->best_move && b5->wins >= 2) {
-+                cert += 4;
-+            } else if (chosen < 0 && b5->best_move >= 0 && b5->wins >= 3 && b5->history >= 160) {
-+                int32_t kt = -1; int k_agree = 0;
-+                rc.query_rc_nolock(tail_win, cur_win_len, kt, k_agree, b5->best_move);
-+                if (k_agree >= 1) {
-+                    chosen = b5->best_move;
-+                    cert = 86 + std::min<int>(8, b5->wins);
-+                }
-+            }
-+        } else if (b4) {
-+            if (chosen >= 0 && b4->refuted_move == chosen && b4->best_move != chosen && b4->history <= -64) {
-+                cert -= 10;
-+            } else if (chosen == b4->best_move && b4->wins >= 3 && b4->history >= 160) {
-+                cert += 4;
-+            } else if (chosen < 0 && b4->best_move >= 0 && b4->wins >= 4 && b4->history >= 200) {
-+                int32_t kt = -1; int k_agree = 0;
-+                rc.query_rc_nolock(tail_win, cur_win_len, kt, k_agree, b4->best_move);
-+                if (k_agree >= 2) {
-+                    chosen = b4->best_move;
-+                    cert = 86;
-+                }
-+            }
-+        }
-+        if (b3 && chosen >= 0 && casc_k <= 3) {
-+            if (b3->refuted_move == chosen && b3->best_move != chosen && b3->history <= -64) {
-+                cert -= 10;
-+            } else if (b3->best_move == chosen && b3->wins >= 3 && b3->history >= 192) {
-+                cert += 3;
-             }
-         }
--        if (match) {
--            key_offset = i;
-+
-+        // 2. Stockfish 1-Ply Quiescence Lookahead (resolve 1-ply Horizon Effect)
-+        const int min_req = (d == 0) ? cert_d0 : (d == 1 ? cert_d1 : cert_d2);
-+        if (chosen >= 0 && cert >= min_req - 2 && cert < min_req) {
-+            tail_win[cur_win_len] = chosen;
-+            int32_t next_tok = -1; int next_cert = 0, next_k = 0, next_agree = 0;
-+            rc.query_rc_nolock(tail_win, cur_win_len + 1, next_tok, next_cert, -1, &next_k, &next_agree);
-+            const SFTTBucket * nb5 = rc.sf.probe5(tail_win, cur_win_len + 1);
-+            if (next_tok >= 0 && next_k >= 6 && next_cert >= 95 && next_agree >= 3 &&
-+                nb5 && nb5->best_move == next_tok && nb5->wins >= 2) {
-+                cert = min_req;
-+            }
-+        }
-+
-+        if (chosen >= 0 && cert >= min_req) {
-+            draft.push_back((llama_token)chosen);
-+            tail_win[cur_win_len++] = chosen;
-+        } else {
-             break;
-         }
-     }
--    if (key_offset == map.keys.size()) {
--        // We create a new key-entry, it will get offset key_offset.
--        common_ngram_map_key new_key;
--        new_key.key_idx = match_pos;
--        new_key.stat_idx = 0;
--        new_key.key_num = 0;
--        for (int i = 0; i < COMMON_NGRAM_MAX_VALUES; ++i) {
--            new_key.values[i].value_num = 0;
--            new_key.values[i].n_accepted = m;
-+
-+    rc.sf.last_draft_len = std::min<int>((int)draft.size(), 8);
-+    for (int i = 0; i < rc.sf.last_draft_len; ++i) {
-+        rc.sf.last_draft[i] = (int32_t)draft[i];
-+    }
-+
-+    return draft;
-+}
-+
-+
-+// ============================================================================
-+// n-gram map implementation (with RouteCrack fallback)
-+// ============================================================================
-+
-+static size_t common_ngram_hash(const llama_token * tokens, const uint16_t len) {
-+    size_t hash = (size_t) tokens[0];
-+    for (int i = 1; i < len; ++i) {
-+        hash ^= (hash << 4) + (size_t) tokens[i];
-+    }
-+    return hash % COMMON_NGRAM_HASH_MAP_SIZE;
-+}
-+
-+static bool common_ngram_compare(const llama_tokens & tokens, size_t idx1, size_t idx2, uint16_t len) {
-+    for (uint16_t i = 0; i < len; ++i) {
-+        if (tokens[idx1 + i] != tokens[idx2 + i]) {
-+            return false;
-         }
--        map.keys.push_back(new_key);
-     }
-+    return true;
-+}
- 
--    // our key n-gram:
--    common_ngram_map_key & curr_key = map.keys[key_offset];
-+static int64_t common_ngram_find_key(
-+    const common_ngram_map & map, const llama_tokens & tokens,
-+    const size_t key_idx, const uint16_t len) {
- 
--    // update number of key hits
--    curr_key.key_num = (uint16_t) std::min((int) map.keys[key_offset].key_num + 1,
--            (int) COMMON_NGRAM_MAX_VALUE_COUNT);
-+    for (size_t i = 0; i < map.keys.size(); ++i) {
-+        if (common_ngram_compare(tokens, map.keys[i].key_idx, key_idx, len)) {
-+            return i;
-+        }
-+    }
-+    return -1;
-+}
- 
--    if (map.key_only) {
--        // simple mode:
--        // Fill in the draft with the m tokens following the key.
--        // We work with value values[0] only.
--        int n_draft_tokens = std::min((int) m, (int) curr_key.values[0].n_accepted);
-+static int64_t common_ngram_Insert_value(
-+    common_ngram_map_key & key, const llama_tokens & tokens,
-+    const size_t value_idx, const uint16_t len) {
- 
--        for (int i = 0; i < n_draft_tokens; ++i) {
--            draft.push_back(inp[match_pos + n + i]);
-+    for (uint16_t i = 0; i < COMMON_NGRAM_MAX_VALUES; ++i) {
-+        if (key.values[i].value_num == 0) {
-+            key.values[i] = {value_idx, 1, -1};
-+            return i;
-+        }
-+        if (common_ngram_compare(tokens, key.values[i].value_idx, value_idx, len)) {
-+            ++key.values[i].value_num;
-+            return i;
-         }
-+    }
-+    return -1;
-+}
- 
--        LOG_DBG("%s: key_idx = %zu, key_offset = %zu, key_num = %d, draft.size = %zu\n", __func__,
--                curr_key.key_idx, key_offset, curr_key.key_num, draft.size());
-+static void common_ngram_update_key_stats(
-+    common_ngram_map & map, common_ngram_map_key & key, const llama_tokens & inp) {
- 
--        map.last_draft_created   = true;
--        map.last_draft_key_idx   = key_offset;
--        map.last_draft_value_idx = 0; // value 0 is used for simple mode
--        return;
-+    const uint16_t size_key   = map.size_key;
-+    const uint16_t size_value = map.size_value;
-+    const size_t   key_idx    = key.key_idx;
-+
-+    for (size_t idx = key.stat_idx + 1; idx < inp.size() - size_key - size_value; ++idx) {
-+        if (common_ngram_compare(inp, key_idx, idx, size_key)) {
-+            ++key.key_num;
-+            common_ngram_Insert_value(key, inp, idx + size_key, size_value);
-+        }
-     }
-+    key.stat_idx = inp.size() - size_key - size_value - 1;
-+}
- 
--    if (curr_key.key_num < map.min_hits) {
--        // not enough hits to consider this a good draft
--        LOG_DBG("%s: key_offset = %zu, key_num = %d, min_hits = %d, no draft\n", __func__,
--                key_offset, curr_key.key_num, map.min_hits);
-+static void common_ngram_update_keys_KeyMap(common_ngram_map & map, const llama_tokens & inp) {
-+    const uint16_t size_key   = map.size_key;
-+    const uint16_t size_value = map.size_value;
-+    const size_t   inp_size   = inp.size();
-+
-+    if (inp_size < size_key + size_value) {
-         return;
-     }
- 
--    // complex mode: examine the different m-grams after this key n-gram.
--    //
-+    const size_t idx_max = inp_size - size_key - size_value;
-+    for (uint32_t idx = map.key_map_last_idx + 1; idx < idx_max; ++idx) {
-+        const size_t   hash    = common_ngram_hash(&inp[idx], size_key);
-+        const uint32_t map_idx = map.key_map[hash];
- 
--    // determine all (max COMMON_NGRAM_MAX_VALUES) m-grams after the key n-gram.
--    for (size_t i = curr_key.stat_idx; i <= match_pos; ++i) {
--        // begins the key n-gram at index i?
--        bool match_key = true;
--        for (size_t k = 0; k < n; ++k) {
--            if (inp[i + k] != key_tokens[k]) {
--                match_key = false;
--                break;
--            }
--        }
--        if (!match_key) {
--            continue;
--        }
--
--        // Do we haven a existing value m-gram or a new one after the key at index i?
--        size_t idx_begin_value_key = i + n;
--        int idx_value = -1;
--        for (int v = 0; v < COMMON_NGRAM_MAX_VALUES; ++v) {
--            size_t idx_begin_value_v = curr_key.values[v].value_idx;
--            if (idx_begin_value_v == 0) {
--                // We found an empty value slot => we found a new value m-gram after the key n-gram.
--                curr_key.values[v].value_idx = idx_begin_value_key;
--                curr_key.values[v].value_num = 0;
--                curr_key.values[v].n_accepted = m;
--                idx_value = v;
--                break;
--            }
--            bool match = true;
--            for (size_t j = 0; j < m; ++j) {
--                if (inp[idx_begin_value_key + j] != inp[idx_begin_value_v + j]) {
--                    match = false;
--                    break;
-+        if (map_idx == 0) {
-+            map.key_map[hash] = idx;
-+        } else {
-+            if (common_ngram_compare(inp, map_idx, idx, size_key)) {
-+                int64_t keys_idx = common_ngram_find_key(map, inp, map_idx, size_key);
-+                if (keys_idx == -1) {
-+                    common_ngram_map_key key = {map_idx, idx, 2, {}};
-+                    if (!map.key_only) {
-+                        key.values[0] = {map_idx + size_key, 1, -1};
-+                        common_ngram_Insert_value(key, inp, idx + size_key, size_value);
-+                    }
-+                    map.keys.push_back(key);
-+                } else {
-+                    common_ngram_map_key & key = map.keys[keys_idx];
-+                    ++key.key_num;
-+                    key.stat_idx = idx;
-+                    if (!map.key_only) {
-+                        common_ngram_Insert_value(key, inp, idx + size_key, size_value);
-+                    }
-                 }
-             }
--            if (match) {
--                // We found an existing value m-gram after the key n-gram.
--                idx_value = v;
--                break;
--            }
--        }
--        if (idx_value >= 0) {
--            // We found a value m-gram of the key n-gram.
--            curr_key.values[idx_value].value_num = (uint16_t) std::min((int) curr_key.values[idx_value].value_num + 1,
--                    (int) COMMON_NGRAM_MAX_VALUE_COUNT);
-         }
-     }
--    // the statistics are updated up to match_pos.
--    curr_key.stat_idx = match_pos;
-+    map.key_map_last_idx = idx_max > 0 ? idx_max - 1 : 0;
-+}
-+
-+static void common_ngram_PrintKeyMapStats(common_ngram_map & map, const llama_tokens & inp) {
-+    int n_occupied_buckets = 0;
-+    for (uint32_t idx : map.key_map) {
-+        if (idx != 0) ++n_occupied_buckets;
-+    }
-+    printf(" Common_ngram_map: inp.size=%zu, occupied buckets=%d, keys.size=%zu\n",
-+           inp.size(), n_occupied_buckets, map.keys.size());
-+}
- 
--    // Do we have a value we could use for the draft?
--    uint16_t max_occur = 0;
--    int slot_max = 0;
--    for (int v = 0; v < COMMON_NGRAM_MAX_VALUES; ++v) {
--        uint16_t curr_occur = curr_key.values[v].value_num;
--        if (curr_occur > max_occur) {
--            max_occur = curr_occur;
--            slot_max = v;
-+static uint16_t get_best_value_idx(const common_ngram_map_key & key, uint16_t min_hits) {
-+    int16_t  best_idx      = -1;
-+    uint16_t max_num       = min_hits - 1;
-+    int16_t  best_accepted = -2;
-+
-+    for (uint16_t i = 0; i < COMMON_NGRAM_MAX_VALUES; ++i) {
-+        const common_ngram_map_value & value = key.values[i];
-+        if (value.value_num == 0) break;
-+        if (value.n_accepted == 0) continue;
-+
-+        if ((value.n_accepted > best_accepted) ||
-+            (value.n_accepted == best_accepted && value.value_num > max_num)) {
-+            best_idx      = i;
-+            max_num       = value.value_num;
-+            best_accepted = value.n_accepted;
-         }
-     }
--    // What is sum of the other occurrences?
--    uint32_t sum_occur = 0;
--    for (int v = 0; v < COMMON_NGRAM_MAX_VALUES; ++v) {
--        if (v == slot_max) {
--            continue;
-+    return best_idx;
-+}
-+
-+static bool compare_key_with_sampled(
-+    const llama_tokens & inp, const llama_token sampled,
-+    const size_t key_idx, const uint16_t size_key) {
-+
-+    return common_ngram_compare(inp, key_idx, inp.size() - size_key + 1, size_key - 1) &&
-+           inp[key_idx + size_key - 1] == sampled;
-+}
-+
-+void common_ngram_map_begin(common_ngram_map & map, const llama_tokens & inp) {
-+    const size_t size_CheckBegin = 100;
-+
-+    if ((inp.size() < map.size_last_begin) ||
-+        (map.size_last_begin >= size_CheckBegin &&
-+         !common_ngram_compare(inp, 0, 0, size_CheckBegin))) {
-+        map.keys.clear();
-+        map.idx_last_check = 0;
-+        if (!map.key_map.empty()) {
-+            std::fill(map.key_map.begin(), map.key_map.end(), 0);
-+            map.key_map_last_idx = 0;
-         }
--        uint16_t curr_occur = curr_key.values[v].value_num;
--        sum_occur += curr_occur;
-     }
-+    map.size_last_begin = inp.size();
- 
--    LOG_DBG("%s: key_offset = %zu, max_occur = %d, sum_occur = %d, slot_max = %d [%zu/%d, %zu/%d, %zu/%d, %zu/%d]\n", __func__,
--            key_offset,
--            max_occur, sum_occur, slot_max,
--            curr_key.values[0].value_idx, curr_key.values[0].value_num,
--            curr_key.values[1].value_idx, curr_key.values[1].value_num,
--            curr_key.values[2].value_idx, curr_key.values[2].value_num,
--            curr_key.values[3].value_idx, curr_key.values[3].value_num
--        );
--    // Print the tokens of the four values (if idx != 0), use LOG_INF
--    for (int v = 0; v < COMMON_NGRAM_MAX_VALUES; ++v) {
--        if (curr_key.values[v].value_idx != 0) {
--            LOG_DBG("%s: value[%d] = %s\n", __func__, v, common_tokens_to_str(inp, curr_key.values[v].value_idx, m).c_str());
-+    if (!map.key_map.empty()) {
-+        common_ngram_update_keys_KeyMap(map, inp);
-+        if (map.show_key_map_stats) {
-+            common_ngram_PrintKeyMapStats(map, inp);
-         }
-     }
-+}
-+
-+void common_ngram_map_draft(
-+    common_ngram_map & map, const llama_tokens & inp,
-+    const llama_token sampled, llama_tokens & draft) {
-+
-+    const uint16_t size_key   = map.size_key;
-+    const uint16_t size_value = map.size_value;
-+    const uint16_t min_hits   = map.min_hits;
-+    const size_t   inp_size   = inp.size();
- 
--    if (sum_occur > 0 && max_occur < 2 * sum_occur) {
--        // The most frequent value is not much more frequent than the other values.
--        // We do not use the draft.
-+    map.last_draft_created   = false;
-+    map.last_draft_key_idx   = 0;
-+    map.last_draft_value_idx = 0;
-+
-+    if (inp_size < size_key + size_value) {
-         return;
-     }
- 
--    // We use the most frequent value values[slot_max] for the draft.
--    // Fill in the draft with the m tokens following the key.
--    int n_draft_tokens = std::min((int) m, (int) curr_key.values[slot_max].n_accepted);
--
--    for (int i = 0; i < n_draft_tokens; ++i) {
--        draft.push_back(inp[match_pos + n + i]);
-+    if (!map.key_map.empty()) {
-+        common_ngram_update_keys_KeyMap(map, inp);
-     }
- 
--    LOG_DBG("%s: key_offset = %zu, slot_max = %d, key_num = %d, draft.size = %zu\n", __func__,
--            key_offset, slot_max,
--            curr_key.key_num, draft.size());
-+    for (size_t k = 0; k < map.keys.size(); ++k) {
-+        common_ngram_map_key & key = map.keys[k];
- 
--    map.last_draft_created   = true;
--    map.last_draft_key_idx   = key_offset;
--    map.last_draft_value_idx = slot_max; // value used for draft generation.
--}
-+        if (compare_key_with_sampled(inp, sampled, key.key_idx, size_key)) {
-+            if (map.key_only) {
-+                if (key.values[0].value_num == 0) {
-+                    key.key_num = 1;
-+                    key.values[0] = {key.key_idx + size_key, 1, -1};
-+                    key.stat_idx = key.key_idx;
-+                }
-+                common_ngram_update_key_stats(map, key, inp);
-+            }
- 
--void common_ngram_map_accept(common_ngram_map & map, uint16_t n_accepted) {
--    if (!map.last_draft_created) {
--        return;
--    }
-+            if (key.key_num < min_hits) return;
- 
--    // find the key and its chosen value.
--    const size_t key_idx = map.last_draft_key_idx;
--    const size_t val_idx = map.last_draft_value_idx;
-+            const uint16_t best_value_idx = get_best_value_idx(key, min_hits);
-+            if (best_value_idx < COMMON_NGRAM_MAX_VALUES) {
-+                map.last_draft_created   = true;
-+                map.last_draft_key_idx   = k;
-+                map.last_draft_value_idx = best_value_idx;
- 
--    // find key corresponding to key_idx.
--    common_ngram_map_key & curr_key = map.keys[key_idx];
--    // find value corresponding to val_idx.
--    struct common_ngram_map_value & curr_value = curr_key.values[val_idx]; // value used for draft generation.
-+                size_t draft_idx = key.values[best_value_idx].value_idx;
-+                for (int j = 0; j < size_value; ++j) {
-+                    draft.push_back(inp[draft_idx + j]);
-+                }
-+                return;
-+            }
-+        }
-+    }
- 
--    // update the value statistics
--    LOG_DBG("common_ngram_map_send_accepted: n_accepted = %d, prev value_num = %d\n",
--            n_accepted, curr_value.n_accepted);
--    curr_value.n_accepted = n_accepted;
-+    // Fallback to RouteCrack + Two-Zone Context predictor when ngram_map finds no match
-+    if (draft.empty()) {
-+        common_ngram_simple_config scfg = { size_key, size_value };
-+        draft = common_ngram_simple_draft(scfg, inp, sampled);
-+    }
-+}
-+
-+void common_ngram_map_accept(common_ngram_map & map, uint16_t n_accepted) {
-+    if (map.last_draft_created) {
-+        if (n_accepted > map.size_value) {
-+            n_accepted = map.size_value;
-+        }
-+        map.keys[map.last_draft_key_idx].values[map.last_draft_value_idx].n_accepted = n_accepted;
-+        map.last_draft_created = false;
-+    }
- }
-diff --git a/ggml/src/ggml-common.h b/ggml/src/ggml-common.h
-index 83f9118..adf71e9 100644
---- a/ggml/src/ggml-common.h
-+++ b/ggml/src/ggml-common.h
-@@ -186,10 +186,12 @@ static_assert(sizeof(block_q1_0) == sizeof(ggml_half) + QK1_0 / 8, "wrong q1_0 b
- 
- #define QK2_0 64
- typedef struct {
--    ggml_half d;              // delta (scale)
--    uint8_t qs[QK2_0 / 4];   // 2 bits per element
-+    ggml_half d;              // master FP16 super-block scale (2 bytes)
-+    uint8_t scales[4];        // 8 x 4-bit shifted sub-scales (low/high nibbles) for 8x8 sub-blocks, mult = (4 + s) in {4..19}
-+    uint8_t qs[16];           // lower 2 bits for 64 3-bit fractal indices
-+    uint8_t qh[8];            // upper 1 bit for 64 3-bit fractal indices
- } block_q2_0;
--static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
-+static_assert(sizeof(block_q2_0) == 30, "wrong q2_0 block size/padding");
- 
- #define QK4_0 32
- typedef struct {
 diff --git a/ggml/src/ggml-cpu/arch/x86/quants.c b/ggml/src/ggml-cpu/arch/x86/quants.c
 index ea54cfe..ffe3392 100644
 --- a/ggml/src/ggml-cpu/arch/x86/quants.c
@@ -1723,7 +276,7 @@ index ea54cfe..ffe3392 100644
              // Convert signs to bytes 0x81 (negative) or 0x01 (positive)
              const uint64_t delta_sign = _pdep_u64(*(const uint32_t*)(qh) & 0x88888888, 0xf0f0f0f0f0f0f0f0ULL);
 diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 7918845..c2a47f4 100644
+index 7918845..01b9eb6 100644
 --- a/ggml/src/ggml-cpu/ggml-cpu.c
 +++ b/ggml/src/ggml-cpu/ggml-cpu.c
 @@ -1,3 +1,12 @@
@@ -1770,7 +323,7 @@ index 7918845..c2a47f4 100644
  }
  
  void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value) {
-@@ -1161,6 +1174,14 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2,
+@@ -1161,6 +1174,86 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2,
  
  // ggml_compute_forward_mul_mat
  
@@ -1781,11 +334,83 @@ index 7918845..c2a47f4 100644
 +static __thread bool   g_tls_q8_valid = false;
 +static __thread bool   g_tls_mmid_ids_valid = false;
 +static __thread int g_tls_moe_skip_mask = 0;
++static __thread const float * g_tls_swiglu_gate_data = NULL;
++static __thread size_t        g_tls_swiglu_gate_nb1  = 0;
++static __thread int           g_tls_swiglu_keep_128  = 0;
++
++static inline float ggml_swiglu_gate_mask_128(
++        const float * gate_col,
++        int64_t ir0_start,
++        int64_t ir0_end,
++        int keep_128,
++        uint8_t * keep_mask) {
++    const int n = (int)(ir0_end - ir0_start);
++    const int k_keep = (keep_128 * n) >> 7;
++    if (n <= 0 || n > 128 || k_keep <= 0 || k_keep >= n) {
++        if (n > 0 && n <= 128) memset(keep_mask, 1, n);
++        return 1.0f;
++    }
++    float s2[128];
++    float sorted_s2[128];
++    float orig_l2 = 0.0f;
++    const float * g = gate_col + ir0_start;
++    for (int i = 0; i < n; ++i) {
++        const float x = g[i];
++        const float silu = x / (1.0f + expf(-x));
++        const float v2 = silu * silu;
++        s2[i] = v2;
++        sorted_s2[i] = v2;
++        orig_l2 += v2;
++    }
++    const int target = n - k_keep;
++    int left = 0, right = n - 1;
++    while (left < right) {
++        const float pivot = sorted_s2[(left + right) >> 1];
++        int i = left, j = right;
++        while (i <= j) {
++            while (sorted_s2[i] < pivot) i++;
++            while (sorted_s2[j] > pivot) j--;
++            if (i <= j) {
++                const float t = sorted_s2[i];
++                sorted_s2[i] = sorted_s2[j];
++                sorted_s2[j] = t;
++                i++;
++                j--;
++            }
++        }
++        if (target <= j) right = j;
++        else if (target >= i) left = i;
++        else break;
++    }
++    const float thresh = sorted_s2[target];
++    float kept_l2 = 0.0f;
++    int kept_cnt = 0;
++    for (int i = 0; i < n; ++i) {
++        if (s2[i] > thresh) {
++            keep_mask[i] = 1;
++            kept_l2 += s2[i];
++            kept_cnt++;
++        } else {
++            keep_mask[i] = 0;
++        }
++    }
++    for (int i = 0; i < n && kept_cnt < k_keep; ++i) {
++        if (!keep_mask[i] && s2[i] >= thresh) {
++            keep_mask[i] = 1;
++            kept_l2 += s2[i];
++            kept_cnt++;
++        }
++    }
++    if (kept_l2 > 1e-20f && kept_l2 < orig_l2) {
++        return sqrtf(orig_l2 / kept_l2);
++    }
++    return 1.0f;
++}
 +
  static void ggml_compute_forward_mul_mat_one_chunk(
      const struct ggml_compute_params * params,
      struct ggml_tensor * dst,
-@@ -1192,15 +1213,16 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+@@ -1192,15 +1285,16 @@ static void ggml_compute_forward_mul_mat_one_chunk(
          return;
      }
  
@@ -1805,7 +430,42 @@ index 7918845..c2a47f4 100644
  
      const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
  
-@@ -1319,28 +1341,18 @@ void ggml_compute_forward_mul_mat(
+@@ -1208,6 +1302,18 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+     // 16 * 2, accounting for mmla kernels
+     float tmp[32];
+ 
++    uint8_t swiglu_keep_mask[128];
++    float   swiglu_alpha = 1.0f;
++    const bool use_swiglu_skip = (g_tls_swiglu_gate_data != NULL &&
++                                  g_tls_swiglu_keep_128 > 0 && g_tls_swiglu_keep_128 < 128 &&
++                                  num_rows_per_vec_dot == 1 &&
++                                  ir1_start == 0 && ir1_end == 1 &&
++                                  (ir0_end - ir0_start) <= 128);
++    if (use_swiglu_skip) {
++        swiglu_alpha = ggml_swiglu_gate_mask_128(
++            g_tls_swiglu_gate_data, ir0_start, ir0_end, g_tls_swiglu_keep_128, swiglu_keep_mask);
++    }
++
+     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += num_rows_per_vec_dot) {
+@@ -1240,6 +1346,15 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+                 //}
+ 
+                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
++                    if (use_swiglu_skip) {
++                        if (!swiglu_keep_mask[ir0 - ir0_start]) {
++                            tmp[ir0 - iir0] = 0.0f;
++                            continue;
++                        }
++                        vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_row + ir0 * nb01, 0, src1_col, 0, 1);
++                        tmp[ir0 - iir0] *= swiglu_alpha;
++                        continue;
++                    }
+                     vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
+                 }
+ 
+@@ -1319,28 +1434,18 @@ void ggml_compute_forward_mul_mat(
  UseGgmlGemm1:;
  #endif
  
@@ -1838,7 +498,7 @@ index 7918845..c2a47f4 100644
          for (int64_t i13 = 0; i13 < ne13; ++i13) {
              for (int64_t i12 = 0; i12 < ne12; ++i12) {
                  for (int64_t i11 = 0; i11 < ne11; ++i11) {
-@@ -1353,19 +1365,20 @@ UseGgmlGemm1:;
+@@ -1353,19 +1458,20 @@ UseGgmlGemm1:;
                  }
              }
          }
@@ -1866,7 +526,43 @@ index 7918845..c2a47f4 100644
          const size_t row_size = ggml_row_size(vec_dot_type, ne10);
  
          for (int64_t i13 = 0; i13 < ne13; i13++)
-@@ -1582,28 +1595,18 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -1488,6 +1594,19 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
+ 
+     float tmp[16];
+ 
++    uint8_t swiglu_keep_mask[128];
++    float   swiglu_alpha = 1.0f;
++    const bool use_swiglu_skip = (g_tls_swiglu_gate_data != NULL &&
++                                  g_tls_swiglu_keep_128 > 0 && g_tls_swiglu_keep_128 < 128 &&
++                                  ir1_start == 0 && ir1_end == 1 && ids->ne[1] == 1 &&
++                                  (ir0_end - ir0_start) <= 128);
++    if (use_swiglu_skip) {
++        const int id0 = MMID_MATRIX_ROW(cur_a, 0).i1;
++        const float * gate_col = (const float *)((const char *)g_tls_swiglu_gate_data + id0 * g_tls_swiglu_gate_nb1);
++        swiglu_alpha = ggml_swiglu_gate_mask_128(
++            gate_col, ir0_start, ir0_end, g_tls_swiglu_keep_128, swiglu_keep_mask);
++    }
++
+     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ++ir1) {
+@@ -1514,6 +1633,15 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
+                 float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2));
+ 
+                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
++                    if (use_swiglu_skip) {
++                        if (!swiglu_keep_mask[ir0 - ir0_start]) {
++                            tmp[ir0 - iir0] = 0.0f;
++                            continue;
++                        }
++                        vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
++                        tmp[ir0 - iir0] *= swiglu_alpha;
++                        continue;
++                    }
+                     vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
+                 }
+ 
+@@ -1582,28 +1710,18 @@ static void ggml_compute_forward_mul_mat_id(
  
      GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
  
@@ -1899,7 +595,7 @@ index 7918845..c2a47f4 100644
          for (int64_t i13 = 0; i13 < ne13; ++i13) {
              for (int64_t i12 = 0; i12 < ne12; ++i12) {
                  for (int64_t i11 = 0; i11 < ne11; ++i11) {
-@@ -1616,16 +1619,18 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -1616,16 +1734,18 @@ static void ggml_compute_forward_mul_mat_id(
                  }
              }
          }
@@ -1920,7 +616,7 @@ index 7918845..c2a47f4 100644
                  const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
  
                  assert(i02 >= 0 && i02 < n_as);
-@@ -1636,14 +1641,25 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -1636,14 +1756,25 @@ static void ggml_compute_forward_mul_mat_id(
          }
      }
  
@@ -1951,7 +647,7 @@ index 7918845..c2a47f4 100644
      for (int cur_a = 0; cur_a < n_as; ++cur_a) {
          const int64_t cne1 = matrix_row_counts[cur_a];
  
-@@ -1652,7 +1668,7 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -1652,7 +1783,7 @@ static void ggml_compute_forward_mul_mat_id(
          }
  
          const char * src0_cur = (const char *) src0->data + cur_a * nb02;
@@ -1960,7 +656,7 @@ index 7918845..c2a47f4 100644
          const size_t row_size = ggml_row_size(vec_dot_type, ne10);
  
          const int64_t nr0 = ne01;
-@@ -2257,6 +2273,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+@@ -2257,6 +2388,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
          case GGML_OP_SOLVE_TRI:
          case GGML_OP_GATED_DELTA_NET:
          case GGML_OP_DSV4_HC_COMB:
@@ -1970,7 +666,7 @@ index 7918845..c2a47f4 100644
          case GGML_OP_DSV4_HC_PRE:
          case GGML_OP_DSV4_HC_POST:
              {
-@@ -3057,6 +3076,66 @@ static int ggml_cpu_try_fuse_ops(
+@@ -3057,6 +3191,66 @@ static int ggml_cpu_try_fuse_ops(
      return 0;
  }
  
@@ -2037,7 +733,7 @@ index 7918845..c2a47f4 100644
  static thread_ret_t ggml_graph_compute_thread(void * data) {
      struct ggml_compute_state * state = (struct ggml_compute_state *) data;
      struct ggml_threadpool    * tp    = state->threadpool;
-@@ -3085,11 +3164,112 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3085,11 +3279,112 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
      GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
  #endif
  
@@ -2152,7 +848,7 @@ index 7918845..c2a47f4 100644
              continue;
          }
  
-@@ -3097,13 +3277,119 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3097,13 +3392,161 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
              continue;
          }
  
@@ -2251,12 +947,54 @@ index 7918845..c2a47f4 100644
 +                last_mmid_ids_data = 0;
 +            }
 +
++            g_tls_swiglu_gate_data = NULL;
++            g_tls_swiglu_keep_128  = 0;
++            if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) &&
++                !params.use_ref && s_moe_cfg_mmap != NULL &&
++                node->ne[2] == 1 && node->ne[3] == 1) {
++                const int keep_128 = (node->op == GGML_OP_MUL_MAT_ID) ? s_moe_cfg_mmap[6] : s_moe_cfg_mmap[7];
++                int sw_il = 3;
++                const char * sw_dash = strrchr(node->name, '-');
++                if (sw_dash) {
++                    sw_il = atoi(sw_dash + 1);
++                }
++                const int sw_start = s_moe_cfg_mmap[3];
++                const int sw_end   = s_moe_cfg_mmap[4];
++                if (keep_128 > 0 && keep_128 < 128 && sw_il >= sw_start && sw_il < sw_end) {
++                    const struct ggml_tensor * glu_node = NULL;
++                    if (node_n + 1 < cgraph->n_nodes &&
++                        cgraph->nodes[node_n + 1]->op == GGML_OP_GLU &&
++                        cgraph->nodes[node_n + 1]->src[1] == node) {
++                        glu_node = cgraph->nodes[node_n + 1];
++                    } else if (node_n + 2 < cgraph->n_nodes &&
++                               cgraph->nodes[node_n + 1]->op == GGML_OP_CLAMP &&
++                               cgraph->nodes[node_n + 1]->src[0] == node &&
++                               cgraph->nodes[node_n + 2]->op == GGML_OP_GLU &&
++                               cgraph->nodes[node_n + 2]->src[1] == cgraph->nodes[node_n + 1]) {
++                        glu_node = cgraph->nodes[node_n + 2];
++                    }
++                    if (glu_node != NULL && ggml_get_glu_op(glu_node) == GGML_GLU_OP_SWIGLU) {
++                        const struct ggml_tensor * gate_node = glu_node->src[0];
++                        if (gate_node != NULL && gate_node->data != NULL &&
++                            gate_node->type == GGML_TYPE_F32 &&
++                            gate_node->ne[0] == node->ne[0] && gate_node->ne[1] == node->ne[1] &&
++                            gate_node->ne[2] == 1 && gate_node->ne[3] == 1) {
++                            g_tls_swiglu_gate_data = (const float *) gate_node->data;
++                            g_tls_swiglu_gate_nb1  = gate_node->nb[1];
++                            g_tls_swiglu_keep_128  = keep_128;
++                        }
++                    }
++                }
++            }
++
              ggml_compute_forward(&params, node);
 +
 +            g_tls_q8_wdata = NULL;
 +            g_tls_q8_valid = false;
 +            g_tls_mmid_ids_valid = false;
 +            g_tls_moe_skip_mask = 0;
++            g_tls_swiglu_gate_data = NULL;
++            g_tls_swiglu_keep_128 = 0;
 +
 +            struct ggml_tensor * wbase = node->view_src ? node->view_src : node;
 +            const uintptr_t ws = (uintptr_t) wbase->data;
@@ -2272,7 +1010,7 @@ index 7918845..c2a47f4 100644
          }
  
          if (state->ith == 0 && cplan->abort_callback &&
-@@ -3115,6 +3401,106 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+@@ -3115,6 +3558,106 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
          if (node_n + 1 < cgraph->n_nodes) {
              ggml_barrier(state->threadpool);
          }
@@ -2379,7 +1117,7 @@ index 7918845..c2a47f4 100644
      }
  
  #ifdef GGML_USE_OPENMP
-@@ -3284,6 +3670,8 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
+@@ -3284,6 +3827,8 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
          threadpool->n_barrier        = 0;
          threadpool->n_barrier_passed = 0;
          threadpool->current_chunk    = 0;
@@ -2388,7 +1126,7 @@ index 7918845..c2a47f4 100644
          threadpool->stop             = false;
          threadpool->pause            = tpp->paused;
          threadpool->abort            = -1;
-@@ -3376,7 +3764,113 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -3376,7 +3921,113 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
      }
  
  #ifdef GGML_USE_OPENMP
@@ -2503,7 +1241,7 @@ index 7918845..c2a47f4 100644
          #pragma omp parallel num_threads(n_threads)
          {
              #pragma omp single
-@@ -3392,6 +3886,16 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+@@ -3392,6 +4043,16 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
              ggml_thread_apply_priority(threadpool->prio);
              if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
                  ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
@@ -2520,525 +1258,12 @@ index 7918845..c2a47f4 100644
              }
              ggml_graph_compute_thread(&threadpool->workers[ith]);
          }
-@@ -3893,3 +4397,5 @@ void ggml_cpu_init(void) {
+@@ -3893,3 +4554,5 @@ void ggml_cpu_init(void) {
  
      ggml_critical_section_end();
  }
 +
 +int ggml_dsv4_skip_csa_comp = 0;
-diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 42ec809..a5dc038 100644
---- a/ggml/src/ggml-cpu/ops.cpp
-+++ b/ggml/src/ggml-cpu/ops.cpp
-@@ -12,6 +12,10 @@
- #include <cfloat>
- #include <cmath>
- 
-+#if defined(__x86_64__) || defined(_M_X64)
-+#include <immintrin.h>
-+#endif
-+
- // ggml_compute_forward_dup
- 
- static void ggml_compute_forward_dup_same_cont(
-@@ -2010,6 +2014,32 @@ static void ggml_compute_forward_concat_f16(
- 
-     const ggml_fp16_t * x;
- 
-+    if (nb00 == sizeof(ggml_fp16_t) && nb10 == sizeof(ggml_fp16_t) && nb0 == sizeof(ggml_fp16_t)) {
-+        const int64_t nr  = ne1 * ne2 * ne3;
-+        const int64_t dr  = (nr + nth - 1) / nth;
-+        const int64_t ir0 = dr * ith;
-+        const int64_t ir1 = MIN(ir0 + dr, nr);
-+        for (int64_t ir = ir0; ir < ir1; ++ir) {
-+            const int64_t i1 = ir % ne1;
-+            const int64_t i2 = (ir / ne1) % ne2;
-+            const int64_t i3 = ir / (ne1 * ne2);
-+            char * y = (char *)dst->data + i1*nb1 + i2*nb2 + i3*nb3;
-+            if (dim == 0) {
-+                const char * x0 = (const char *)src0->data + i1*nb01 + i2*nb02 + i3*nb03;
-+                const char * x1 = (const char *)src1->data + i1*nb11 + i2*nb12 + i3*nb13;
-+                memcpy(y,                           x0, ne00 * sizeof(ggml_fp16_t));
-+                memcpy(y + ne00 * sizeof(ggml_fp16_t), x1, ne10 * sizeof(ggml_fp16_t));
-+            } else if (i1 < ne01 && i2 < ne02 && i3 < ne03) {
-+                const char * x0 = (const char *)src0->data + i1*nb01 + i2*nb02 + i3*nb03;
-+                memcpy(y, x0, ne0 * sizeof(ggml_fp16_t));
-+            } else {
-+                const char * x1 = (const char *)src1->data + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13;
-+                memcpy(y, x1, ne0 * sizeof(ggml_fp16_t));
-+            }
-+        }
-+        return;
-+    }
-+
-     // TODO: smarter multi-theading
-     for (int i3 = 0; i3 < ne3; i3++) {
-         for (int i2 = ith; i2 < ne2; i2 += nth) {
-@@ -2053,6 +2083,32 @@ static void ggml_compute_forward_concat_f32(
- 
-     const float * x;
- 
-+    if (nb00 == sizeof(float) && nb10 == sizeof(float) && nb0 == sizeof(float)) {
-+        const int64_t nr  = ne1 * ne2 * ne3;
-+        const int64_t dr  = (nr + nth - 1) / nth;
-+        const int64_t ir0 = dr * ith;
-+        const int64_t ir1 = MIN(ir0 + dr, nr);
-+        for (int64_t ir = ir0; ir < ir1; ++ir) {
-+            const int64_t i1 = ir % ne1;
-+            const int64_t i2 = (ir / ne1) % ne2;
-+            const int64_t i3 = ir / (ne1 * ne2);
-+            char * y = (char *)dst->data + i1*nb1 + i2*nb2 + i3*nb3;
-+            if (dim == 0) {
-+                const char * x0 = (const char *)src0->data + i1*nb01 + i2*nb02 + i3*nb03;
-+                const char * x1 = (const char *)src1->data + i1*nb11 + i2*nb12 + i3*nb13;
-+                memcpy(y,                     x0, ne00 * sizeof(float));
-+                memcpy(y + ne00 * sizeof(float), x1, ne10 * sizeof(float));
-+            } else if (i1 < ne01 && i2 < ne02 && i3 < ne03) {
-+                const char * x0 = (const char *)src0->data + i1*nb01 + i2*nb02 + i3*nb03;
-+                memcpy(y, x0, ne0 * sizeof(float));
-+            } else {
-+                const char * x1 = (const char *)src1->data + (i1 - o[1])*nb11 + (i2 - o[2])*nb12 + (i3 - o[3])*nb13;
-+                memcpy(y, x1, ne0 * sizeof(float));
-+            }
-+        }
-+        return;
-+    }
-+
-     // TODO: smarter multi-theading
-     for (int i3 = 0; i3 < ne3; i3++) {
-         for (int i2 = ith; i2 < ne2; i2 += nth) {
-@@ -8465,6 +8521,93 @@ void ggml_compute_forward_top_k(
-     }
- }
- 
-+#if defined(__AVX2__) || defined(__AVX512F__)
-+#include <sys/mman.h>
-+#include <fcntl.h>
-+#include <unistd.h>
-+
-+struct llama_modchip_shm_t {
-+    uint32_t magic;            // 0x4D4F4443 ("MODC")
-+    uint32_t version;          // 1
-+    int32_t  kv_l3_window;     // L3 hot window tokens (0 = disable KV NTA)
-+    int32_t  attn_window;      // SWA window tokens (0 = full global attention)
-+    int32_t  attn_sinks;       // Attention sinks (default 16)
-+    int32_t  swa_stride;       // 0/1 = all layers SWA; 4 = 3:1 Interleaved SWA (keep every 4th layer global)
-+    int32_t  disable_chunking; // 1 = static GQA Dual-CCD L3 partition
-+    int32_t  rc_enabled;       // 1 = RouteCrack on, 0 = off
-+    int32_t  rc_cert_d0;       // Step 0 certainty gate (84 strict / 78 balanced)
-+    int32_t  rc_cert_d1;       // Step 1 certainty gate (92 strict / 88 balanced)
-+    int32_t  rc_cert_d2;       // Step 2 certainty gate (96 strict / 94 balanced)
-+    int32_t  moe_top_k;        // Active MoE Top-K
-+};
-+
-+struct kv_l3_policy_config {
-+    int64_t kv_l3_window;
-+    int64_t kv_nta_prefix;
-+    int64_t attn_window;
-+    int64_t attn_sinks;
-+    int64_t swa_stride;
-+    const volatile llama_modchip_shm_t * shm_ptr;
-+
-+    kv_l3_policy_config() : shm_ptr(nullptr) {
-+        const char * env_w  = getenv("LLAMA_KV_L3_WINDOW");
-+        kv_l3_window        = env_w ? atoll(env_w) : 2048;
-+        const char * env_p  = getenv("LLAMA_KV_L3_NTA_PREFIX");
-+        kv_nta_prefix       = env_p ? atoll(env_p) : -1;
-+        const char * env_aw = getenv("LLAMA_ATTN_WINDOW");
-+        attn_window         = env_aw ? atoll(env_aw) : 0;
-+        const char * env_as = getenv("LLAMA_ATTN_SINKS");
-+        attn_sinks          = env_as ? atoll(env_as) : 16;
-+        const char * env_st = getenv("LLAMA_SWA_STRIDE");
-+        swa_stride          = env_st ? atoll(env_st) : 0;
-+
-+        int fd = open("/dev/shm/llama_modchip.bin", O_RDONLY);
-+        if (fd >= 0) {
-+            void * p = mmap(nullptr, sizeof(llama_modchip_shm_t), PROT_READ, MAP_SHARED, fd, 0);
-+            close(fd);
-+            if (p != MAP_FAILED) {
-+                const llama_modchip_shm_t * s = (const llama_modchip_shm_t *)p;
-+                if (s->magic == 0x4D4F4443u) {
-+                    shm_ptr = s;
-+                }
-+            }
-+        }
-+
-+        if (attn_window > 0) {
-+            fprintf(stderr, "[GGML-MODCHIP] SWA ACTIVE: Window=%ld, Sinks=%ld, Stride=%ld, L3 Window=%ld\n",
-+                    (long)attn_window, (long)attn_sinks, (long)swa_stride, (long)kv_l3_window);
-+        } else {
-+            fprintf(stderr, "[GGML-MODCHIP] Full 256K Global Attention ACTIVE: Window=FULL, L3 NTA Window=%ld\n",
-+                    (long)kv_l3_window);
-+        }
-+    }
-+};
-+
-+static inline const kv_l3_policy_config & get_kv_l3_policy() {
-+    static const kv_l3_policy_config cfg;
-+    return cfg;
-+}
-+
-+static inline int parse_tensor_layer_id(const ggml_tensor * t) {
-+    if (!t) return -1;
-+    const char * s = (t->view_src && t->view_src->name[0]) ? t->view_src->name : t->name;
-+    int last_num = -1;
-+    while (*s) {
-+        if (*s >= '0' && *s <= '9') {
-+            int v = 0;
-+            while (*s >= '0' && *s <= '9') {
-+                v = v * 10 + (*s - '0');
-+                s++;
-+            }
-+            last_num = v;
-+        } else {
-+            s++;
-+        }
-+    }
-+    return last_num;
-+}
-+#endif
-+
- static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
-         const ggml_compute_params * params,
-         ggml_tensor * dst,
-@@ -8473,6 +8616,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
-         float * partials, int64_t partial_stride) {
- 
-     const bool write_partials = (partials != nullptr);
-+#if defined(__AVX2__) || defined(__AVX512F__)
-+    const kv_l3_policy_config & l3_cfg = get_kv_l3_policy();
-+#endif
-     const ggml_tensor * q     = dst->src[0];
-     const ggml_tensor * k     = dst->src[1];
-     const ggml_tensor * v     = dst->src[2];
-@@ -8588,8 +8734,22 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
-         // online softmax / attention
-         // loop over n_kv and n_head_kv
-         // ref: https://arxiv.org/pdf/2112.05682.pdf
-+        const int64_t cur_pos = (N == 1) ? (ic_end - 1) : (ic_end - N + iq1);
- 
-         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-+#if defined(__AVX2__) || defined(__AVX512F__)
-+            const bool is_dsv4_mla = (k->data == v->data) || (k->op == GGML_OP_CONCAT);
-+            const int64_t eff_aw = is_dsv4_mla ? 0 : ((l3_cfg.shm_ptr && l3_cfg.shm_ptr->magic == 0x4D4F4443u) ? l3_cfg.shm_ptr->attn_window : l3_cfg.attn_window);
-+            const int64_t eff_as = (l3_cfg.shm_ptr && l3_cfg.shm_ptr->magic == 0x4D4F4443u) ? l3_cfg.shm_ptr->attn_sinks  : l3_cfg.attn_sinks;
-+            const int64_t eff_st = (l3_cfg.shm_ptr && l3_cfg.shm_ptr->magic == 0x4D4F4443u) ? l3_cfg.shm_ptr->swa_stride  : l3_cfg.swa_stride;
-+            if (eff_aw > 0 && cur_pos > eff_aw) {
-+                const int lid = (eff_st > 1) ? parse_tensor_layer_id(k) : 0;
-+                const bool is_global_anchor = (eff_st > 1) && (lid < 0 || ((lid + 1) % eff_st == 0));
-+                if (!is_global_anchor && ic >= eff_as && ic < (cur_pos - eff_aw)) {
-+                    continue; // Skip out-of-window tokens (SWA or Interleaved SWA)
-+                }
-+            }
-+#endif
-             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
-             if (mv == -INFINITY) {
-                 continue;
-@@ -8597,6 +8757,53 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
- 
-             float s; // KQ value
- 
-+#if defined(__AVX2__) || defined(__AVX512F__)
-+            if (ic + 1 < ic_end) {
-+                // For sparse top-k masks (DSV4 CSA/LID), find the next active unmasked row to prefetch
-+                int64_t next_ic = ic + 1;
-+                if (mp && is_dsv4_mla) {
-+                    while (next_ic < ic_end && GGML_CPU_FP16_TO_FP32(mp[next_ic]) == -INFINITY) {
-+                        ++next_ic;
-+                    }
-+                } else {
-+                    next_ic = (ic + 4 < ic_end) ? (ic + 4) : (ic + 1);
-+                }
-+                if (next_ic < ic_end) {
-+                    const char * k_pref = (const char *) k->data + (next_ic*nbk1 + ik2*nbk2 + ik3*nbk3);
-+                    const int64_t eff_l3w = (l3_cfg.shm_ptr && l3_cfg.shm_ptr->magic == 0x4D4F4443u) ? l3_cfg.shm_ptr->kv_l3_window : l3_cfg.kv_l3_window;
-+                    const bool is_nta = (N == 1) && (is_dsv4_mla ? (next_ic >= 512) :
-+                                        ((l3_cfg.kv_nta_prefix > 0 && next_ic < l3_cfg.kv_nta_prefix) ||
-+                                         (eff_l3w > 0 && (ic_end - next_ic) > eff_l3w)));
-+                    if (is_dsv4_mla) {
-+                        // DSV4 MLA shares k == v (512 FP16 = 1024B row); prefetch 4 distinct cache lines instead of duplicating k & v
-+                        if (is_nta) {
-+                            _mm_prefetch(k_pref,       _MM_HINT_NTA);
-+                            _mm_prefetch(k_pref + 64,  _MM_HINT_NTA);
-+                            _mm_prefetch(k_pref + 128, _MM_HINT_NTA);
-+                            _mm_prefetch(k_pref + 192, _MM_HINT_NTA);
-+                        } else {
-+                            _mm_prefetch(k_pref,       _MM_HINT_T0);
-+                            _mm_prefetch(k_pref + 64,  _MM_HINT_T0);
-+                            _mm_prefetch(k_pref + 128, _MM_HINT_T0);
-+                            _mm_prefetch(k_pref + 192, _MM_HINT_T0);
-+                        }
-+                    } else {
-+                        const char * v_pref = ((const char *) v->data + (next_ic*nbv1 + iv2*nbv2 + iv3*nbv3));
-+                        if (is_nta) {
-+                            _mm_prefetch(k_pref,      _MM_HINT_NTA);
-+                            _mm_prefetch(k_pref + 64, _MM_HINT_NTA);
-+                            _mm_prefetch(v_pref,      _MM_HINT_NTA);
-+                            _mm_prefetch(v_pref + 64, _MM_HINT_NTA);
-+                        } else {
-+                            _mm_prefetch(k_pref,      _MM_HINT_T0);
-+                            _mm_prefetch(k_pref + 64, _MM_HINT_T0);
-+                            _mm_prefetch(v_pref,      _MM_HINT_T0);
-+                            _mm_prefetch(v_pref + 64, _MM_HINT_T0);
-+                        }
-+                    }
-+                }
-+            }
-+#endif
-             const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
-             kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
- 
-@@ -9112,7 +9319,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
-     const bool use_ref = params->use_ref;
- 
-     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
--    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
-+    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512 && neq2 < nth;
- 
-     if (use_split_kv_path) {
-         const int64_t chunk_size = (nek1 + nth - 1) / nth;
-@@ -9149,7 +9356,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
-         const int64_t nr = neq1*neq2*neq3;
- 
-         // disable for NUMA
--        const bool disable_chunking = ggml_is_numa();
-+        const bool disable_chunking = true; // Static GQA KV-Head Dual-CCD L3 Partitioning
- 
-         // 4x chunks per thread
-         int nth_scaled = nth * 4;
-@@ -9160,12 +9367,6 @@ static void ggml_compute_forward_flash_attn_ext_f16(
-             nchunk = nth;
-         }
- 
--        if (ith == 0) {
--            ggml_threadpool_chunk_set(params->threadpool, nth);
--        }
--
--        ggml_barrier(params->threadpool);
--
-         const int64_t dr = (nr + nchunk - 1) / nchunk;
- 
-         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-@@ -9182,19 +9383,32 @@ static void ggml_compute_forward_flash_attn_ext_f16(
- #endif
-         use_tiled &= (DV % f32_epr == 0);
- #endif
--        int current_chunk = ith;
--
--        while (current_chunk < nchunk) {
--            const int64_t ir0 = dr * current_chunk;
-+        if (nchunk == nth) {
-+            const int64_t ir0 = dr * ith;
-             const int64_t ir1 = MIN(ir0 + dr, nr);
--
--            if (use_tiled) {
--                ggml_compute_forward_flash_attn_ext_tiled(params, dst, ir0, ir1);
--            } else {
--                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
-+            if (ir0 < ir1) {
-+                if (use_tiled) {
-+                    ggml_compute_forward_flash_attn_ext_tiled(params, dst, ir0, ir1);
-+                } else {
-+                    ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
-+                }
-+            }
-+        } else {
-+            if (ith == 0) {
-+                ggml_threadpool_chunk_set(params->threadpool, nth);
-+            }
-+            ggml_barrier(params->threadpool);
-+            int current_chunk = ith;
-+            while (current_chunk < nchunk) {
-+                const int64_t ir0 = dr * current_chunk;
-+                const int64_t ir1 = MIN(ir0 + dr, nr);
-+                if (use_tiled) {
-+                    ggml_compute_forward_flash_attn_ext_tiled(params, dst, ir0, ir1);
-+                } else {
-+                    ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
-+                }
-+                current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
-             }
--
--            current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
-         }
-     }
- }
-@@ -10894,7 +11108,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
-     int64_t nr = V->ne[1] * V->ne[3];
- 
-     // disable for NUMA
--    const bool disable_chunking = ggml_is_numa();
-+    const bool disable_chunking = true; // Static GQA KV-Head Dual-CCD L3 Partitioning
- 
-     int nth = params->nth;
-     int ith = params->ith;
-@@ -11111,6 +11325,28 @@ static void ggml_compute_forward_dsv4_hc_pre_f32(
-     const int ith = params->ith;
-     const int nth = params->nth;
- 
-+    if (hc == 4 && nbx0 == sizeof(float) && nbd0 == sizeof(float)) {
-+        const int64_t dr  = (n_embd + nth - 1) / nth;
-+        const int64_t i00 = dr * ith;
-+        const int64_t i01 = MIN(i00 + dr, n_embd);
-+        if (i00 >= i01) return;
-+        for (int64_t it = 0; it < n_tokens; ++it) {
-+            const float w0 = *(const float *) ((const char *) weights->data + 0*nbw0 + it*nbw1);
-+            const float w1 = *(const float *) ((const char *) weights->data + 1*nbw0 + it*nbw1);
-+            const float w2 = *(const float *) ((const char *) weights->data + 2*nbw0 + it*nbw1);
-+            const float w3 = *(const float *) ((const char *) weights->data + 3*nbw0 + it*nbw1);
-+            const float * GGML_RESTRICT x0 = (const float *) ((const char *) x->data + 0*nbx1 + it*nbx2);
-+            const float * GGML_RESTRICT x1 = (const float *) ((const char *) x->data + 1*nbx1 + it*nbx2);
-+            const float * GGML_RESTRICT x2 = (const float *) ((const char *) x->data + 2*nbx1 + it*nbx2);
-+            const float * GGML_RESTRICT x3 = (const float *) ((const char *) x->data + 3*nbx1 + it*nbx2);
-+            float * GGML_RESTRICT d0 = (float *) ((char *) dst->data + it*nbd1);
-+            for (int64_t i0 = i00; i0 < i01; ++i0) {
-+                d0[i0] = x0[i0]*w0 + x1[i0]*w1 + x2[i0]*w2 + x3[i0]*w3;
-+            }
-+        }
-+        return;
-+    }
-+
-     const int64_t nr  = n_embd * n_tokens;
-     const int64_t dr  = (nr + nth - 1) / nth;
-     const int64_t ir0 = dr * ith;
-@@ -11188,6 +11424,63 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
-     const int ith = params->ith;
-     const int nth = params->nth;
- 
-+    if (hc == 4 && nbx0 == sizeof(float) && nbr0 == sizeof(float) && nbd0 == sizeof(float)) {
-+        const int64_t dr  = (n_embd + nth - 1) / nth;
-+        const int64_t i00 = dr * ith;
-+        const int64_t i01 = MIN(i00 + dr, n_embd);
-+        if (i00 >= i01) return;
-+        for (int64_t it = 0; it < n_tokens; ++it) {
-+            const float p0 = *(const float *) ((const char *) post->data + 0*nbp0 + it*nbp1);
-+            const float p1 = *(const float *) ((const char *) post->data + 1*nbp0 + it*nbp1);
-+            const float p2 = *(const float *) ((const char *) post->data + 2*nbp0 + it*nbp1);
-+            const float p3 = *(const float *) ((const char *) post->data + 3*nbp0 + it*nbp1);
-+
-+            const float c00 = *(const float *) ((const char *) comb->data + 0*nbc0 + 0*nbc1 + it*nbc2);
-+            const float c01 = *(const float *) ((const char *) comb->data + 0*nbc0 + 1*nbc1 + it*nbc2);
-+            const float c02 = *(const float *) ((const char *) comb->data + 0*nbc0 + 2*nbc1 + it*nbc2);
-+            const float c03 = *(const float *) ((const char *) comb->data + 0*nbc0 + 3*nbc1 + it*nbc2);
-+
-+            const float c10 = *(const float *) ((const char *) comb->data + 1*nbc0 + 0*nbc1 + it*nbc2);
-+            const float c11 = *(const float *) ((const char *) comb->data + 1*nbc0 + 1*nbc1 + it*nbc2);
-+            const float c12 = *(const float *) ((const char *) comb->data + 1*nbc0 + 2*nbc1 + it*nbc2);
-+            const float c13 = *(const float *) ((const char *) comb->data + 1*nbc0 + 3*nbc1 + it*nbc2);
-+
-+            const float c20 = *(const float *) ((const char *) comb->data + 2*nbc0 + 0*nbc1 + it*nbc2);
-+            const float c21 = *(const float *) ((const char *) comb->data + 2*nbc0 + 1*nbc1 + it*nbc2);
-+            const float c22 = *(const float *) ((const char *) comb->data + 2*nbc0 + 2*nbc1 + it*nbc2);
-+            const float c23 = *(const float *) ((const char *) comb->data + 2*nbc0 + 3*nbc1 + it*nbc2);
-+
-+            const float c30 = *(const float *) ((const char *) comb->data + 3*nbc0 + 0*nbc1 + it*nbc2);
-+            const float c31 = *(const float *) ((const char *) comb->data + 3*nbc0 + 1*nbc1 + it*nbc2);
-+            const float c32 = *(const float *) ((const char *) comb->data + 3*nbc0 + 2*nbc1 + it*nbc2);
-+            const float c33 = *(const float *) ((const char *) comb->data + 3*nbc0 + 3*nbc1 + it*nbc2);
-+
-+            const float * GGML_RESTRICT xt = (const float *) ((const char *) x->data        + it*nbx1);
-+            const float * GGML_RESTRICT r0 = (const float *) ((const char *) residual->data + 0*nbr1 + it*nbr2);
-+            const float * GGML_RESTRICT r1 = (const float *) ((const char *) residual->data + 1*nbr1 + it*nbr2);
-+            const float * GGML_RESTRICT r2 = (const float *) ((const char *) residual->data + 2*nbr1 + it*nbr2);
-+            const float * GGML_RESTRICT r3 = (const float *) ((const char *) residual->data + 3*nbr1 + it*nbr2);
-+
-+            float * GGML_RESTRICT d0 = (float *) ((char *) dst->data + 0*nbd1 + it*nbd2);
-+            float * GGML_RESTRICT d1 = (float *) ((char *) dst->data + 1*nbd1 + it*nbd2);
-+            float * GGML_RESTRICT d2 = (float *) ((char *) dst->data + 2*nbd1 + it*nbd2);
-+            float * GGML_RESTRICT d3 = (float *) ((char *) dst->data + 3*nbd1 + it*nbd2);
-+
-+            for (int64_t i0 = i00; i0 < i01; ++i0) {
-+                const float xv  = xt[i0];
-+                const float rv0 = r0[i0];
-+                const float rv1 = r1[i0];
-+                const float rv2 = r2[i0];
-+                const float rv3 = r3[i0];
-+                d0[i0] = xv * p0 + rv0 * c00 + rv1 * c01 + rv2 * c02 + rv3 * c03;
-+                d1[i0] = xv * p1 + rv0 * c10 + rv1 * c11 + rv2 * c12 + rv3 * c13;
-+                d2[i0] = xv * p2 + rv0 * c20 + rv1 * c21 + rv2 * c22 + rv3 * c23;
-+                d3[i0] = xv * p3 + rv0 * c30 + rv1 * c31 + rv2 * c32 + rv3 * c33;
-+            }
-+        }
-+        return;
-+    }
-+
-     const int64_t nr  = n_embd * hc * n_tokens;
-     const int64_t dr  = (nr + nth - 1) / nth;
-     const int64_t ir0 = dr * ith;
-@@ -11853,14 +12146,47 @@ static void ggml_compute_forward_fwht_f32(const ggml_compute_params * params, gg
-     const GGML_F32_VEC v_minus_one = GGML_F32_VEC_SET1(-1.0f);
- #endif
- 
--    for (int64_t r = start_row; r < end_row; r++) {
--        const int64_t i13 = r / (ne11 * ne12);
--        const int64_t i12 = (r - i13 * ne11 * ne12) / ne11;
--        const int64_t i11 = r - i13 * ne11 * ne12 - i12 * ne11;
-+#if defined(__AVX512F__)
-+    const __m512 v_scale = _mm512_set1_ps(scale);
-+    const __m512 v_zero  = _mm512_setzero_ps();
-+#endif
-+    int64_t i13 = start_row / (ne11 * ne12);
-+    int64_t rem = start_row - i13 * (ne11 * ne12);
-+    int64_t i12 = rem / ne11;
-+    int64_t i11 = rem - i12 * ne11;
- 
-+    for (int64_t r = start_row; r < end_row; r++) {
-         const float * src_row = (const float *) ((const char *) src1->data + i11 * nb11 + i12 * nb12 + i13 * nb13);
-         float * dst_row = (float *) ((char *) dst->data + i11 * nb1 + i12 * nb2 + i13 * nb3);
--
-+        if (++i11 == ne11) { i11 = 0; if (++i12 == ne12) { i12 = 0; ++i13; } }
-+
-+#if defined(__AVX512F__)
-+        if (n >= 16) {
-+            for (int64_t i = 0; i < n; i += 16) {
-+                __m512 x = _mm512_mul_ps(_mm512_loadu_ps(src_row + i), v_scale);
-+                __m512 s1 = _mm512_permute_ps(x, 0xB1);
-+                x = _mm512_add_ps(_mm512_mask_sub_ps(x, 0xAAAA, v_zero, x), s1);
-+                __m512 s2 = _mm512_permute_ps(x, 0x4E);
-+                x = _mm512_add_ps(_mm512_mask_sub_ps(x, 0xCCCC, v_zero, x), s2);
-+                __m512 s4 = _mm512_shuffle_f32x4(x, x, 0xB1);
-+                x = _mm512_add_ps(_mm512_mask_sub_ps(x, 0xF0F0, v_zero, x), s4);
-+                __m512 s8 = _mm512_shuffle_f32x4(x, x, 0x4E);
-+                x = _mm512_add_ps(_mm512_mask_sub_ps(x, 0xFF00, v_zero, x), s8);
-+                _mm512_storeu_ps(dst_row + i, x);
-+            }
-+            for (int64_t len = 16; len < n; len <<= 1) {
-+                for (int64_t i = 0; i < n; i += 2 * len) {
-+                    for (int64_t j = 0; j < len; j += 16) {
-+                        __m512 u = _mm512_loadu_ps(dst_row + i + j);
-+                        __m512 v = _mm512_loadu_ps(dst_row + i + len + j);
-+                        _mm512_storeu_ps(dst_row + i + j,       _mm512_add_ps(u, v));
-+                        _mm512_storeu_ps(dst_row + i + len + j, _mm512_sub_ps(u, v));
-+                    }
-+                }
-+            }
-+            continue;
-+        }
-+#endif
-         for (int64_t j = 0; j < n; j++) {
-             dst_row[j] = src_row[j] * scale;
-         }
-@@ -11981,6 +12307,11 @@ void ggml_compute_forward_lightning_indexer(
-             const ggml_fp16_t *   m_row = (ggml_fp16_t *) ((char *)   m->data + t*nbm1 + (s%nem3)*nbm3);
-             float             * dst_row =       (float *) ((char *) dst->data + t*nb1  +        s*nb3 );
-             for (int ik = ir0; ik < ir1; ++ik) {
-+                const float mv = GGML_CPU_FP16_TO_FP32(m_row[ik]);
-+                if (mv == -INFINITY) {
-+                    dst_row[ik] = -INFINITY;
-+                    continue;
-+                }
-                 char * k_row = (char *) k->data + ik*nbk2 + s*nbk3;
-                 if (k_to_float) {
-                     k_to_float(k_row, k_row_f32, n_embd);
-@@ -11997,7 +12328,7 @@ void ggml_compute_forward_lightning_indexer(
-                     score += MAX(qk, 0.0f) * w_row[h];
-                 }
-                 // apply mask
--                dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
-+                dst_row[ik] = score + mv;
-             }
-         }
-     }
 diff --git a/ggml/src/ggml-cpu/quants.c b/ggml/src/ggml-cpu/quants.c
 index 5e36459..e41027d 100644
 --- a/ggml/src/ggml-cpu/quants.c
@@ -3213,228 +1438,6 @@ index 5e36459..e41027d 100644
  }
  
  void ggml_vec_dot_q4_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
-diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
-index 1ebc50a..053cdf3 100644
---- a/ggml/src/ggml-quants.c
-+++ b/ggml/src/ggml-quants.c
-@@ -71,40 +71,128 @@ void quantize_row_q1_0_ref(const float * GGML_RESTRICT x, block_q1_0 * GGML_REST
-     }
- }
- 
-+static inline uint8_t ggml_fractal3_quant_scalar(float u) {
-+    // Non-linear dyadic codebook: {-14, -8, -4, -1, 1, 4, 8, 14}
-+    // Midpoints: {-11.0, -6.0, -2.5, 0.0, 2.5, 6.0, 11.0}
-+    if (u < 0.0f) {
-+        if (u < -6.0f) return (u < -11.0f) ? 0 : 1;
-+        return (u < -2.5f) ? 2 : 3;
-+    } else {
-+        if (u < 6.0f) return (u < 2.5f) ? 4 : 5;
-+        return (u < 11.0f) ? 6 : 7;
-+    }
-+}
-+
- void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_RESTRICT y, int64_t k) {
-     static const int qk = QK2_0;
-+    static const int8_t kvalues_fractal3[8] = { -14, -8, -4, -1, 1, 4, 8, 14 };
- 
-     assert(k % qk == 0);
- 
-     const int nb = k / qk;
- 
-     for (int i = 0; i < nb; i++) {
--        // Compute scale as max absolute value in the block
--        float amax = 0.0f;
--        for (int j = 0; j < qk; j++) {
--            const float a = fabsf(x[i*qk + j]);
--            if (a > amax) amax = a;
-+        const float * xb = x + i * qk;
-+        float s_opt[8];
-+        float max_s = 0.0f;
-+
-+        // Step 1: Find optimal local scale for each of the 8 sub-blocks of 8 weights
-+        for (int b = 0; b < 8; ++b) {
-+            const float * xsb = xb + b * 8;
-+            float amax = 0.0f;
-+            for (int m = 0; m < 8; ++m) {
-+                const float a = fabsf(xsb[m]);
-+                if (a > amax) amax = a;
-+            }
-+            float sb = amax / 14.0f;
-+            if (sb > 0.0f) {
-+                for (int it = 0; it < 2; ++it) {
-+                    const float isb = 1.0f / sb;
-+                    float wx = 0.0f;
-+                    float qq = 0.0f;
-+                    for (int m = 0; m < 8; ++m) {
-+                        const uint8_t idx = ggml_fractal3_quant_scalar(xsb[m] * isb);
-+                        const float qv = (float)kvalues_fractal3[idx];
-+                        wx += xsb[m] * qv;
-+                        qq += qv * qv;
-+                    }
-+                    if (qq > 0.0f && wx > 0.0f) {
-+                        sb = wx / qq;
-+                    }
-+                }
-+            }
-+            s_opt[b] = sb;
-+            if (sb > max_s) max_s = sb;
-         }
--        const float d = amax;
--        const float id = d > 0.0f ? 1.0f / d : 0.0f;
- 
--        y[i].d = GGML_FP32_TO_FP16(d);
-+        const float d_fp32 = max_s / 19.0f;
-+        y[i].d = GGML_FP32_TO_FP16(d_fp32);
-+        const float d = GGML_FP16_TO_FP32(y[i].d);
- 
--        // Clear quant bytes
--        for (int j = 0; j < qk / 4; ++j) {
--            y[i].qs[j] = 0;
-+        memset(y[i].scales, 0, sizeof(y[i].scales));
-+        memset(y[i].qs, 0, sizeof(y[i].qs));
-+        memset(y[i].qh, 0, sizeof(y[i].qh));
-+
-+        if (d <= 0.0f) {
-+            continue;
-         }
- 
--        // Encode 2-bit values: round(w/d) clamped to [-1, 2], then add 1
--        // 00 (-1) = -scale, 01 (0) = 0, 10 (+1) = +scale, 11 (+2) = 2*scale
--        for (int j = 0; j < qk; ++j) {
--            const float w = x[i*qk + j];
--            int q = (int)roundf(w * id) + 1;
--            if (q < 0) q = 0;
--            if (q > 3) q = 3;
--            const int byte_index = j / 4;
--            const int bit_offset = (j % 4) * 2;
--            y[i].qs[byte_index] |= ((uint8_t)q << bit_offset);
-+        // Step 2: Select optimal 4-bit shifted sub-scale sc in {0..15} (mult = 4 + sc in {4..19})
-+        // and pack 3-bit fractal indices into qs[16] (low 2 bits) and qh[8] (high 1 bit)
-+        uint8_t idx_block[64];
-+        uint8_t sc_block[8];
-+
-+        for (int b = 0; b < 8; ++b) {
-+            const float * xsb = xb + b * 8;
-+            int sc_est = (int)roundf(s_opt[b] / d) - 4;
-+            if (sc_est < 0) sc_est = 0;
-+            if (sc_est > 15) sc_est = 15;
-+
-+            int sc_lo = sc_est - 2;
-+            int sc_hi = sc_est + 2;
-+            if (sc_lo < 0) sc_lo = 0;
-+            if (sc_hi > 15) sc_hi = 15;
-+
-+            float best_err = FLT_MAX;
-+            uint8_t best_sc = (uint8_t)sc_est;
-+            uint8_t best_idx[8] = {4, 4, 4, 4, 4, 4, 4, 4};
-+
-+            for (int sc = sc_lo; sc <= sc_hi; ++sc) {
-+                const float eff_s = d * (float)(4 + sc);
-+                const float ieff_s = 1.0f / eff_s;
-+                float err = 0.0f;
-+                uint8_t cur_idx[8];
-+                for (int m = 0; m < 8; ++m) {
-+                    const uint8_t idx = ggml_fractal3_quant_scalar(xsb[m] * ieff_s);
-+                    cur_idx[m] = idx;
-+                    const float diff = xsb[m] - eff_s * (float)kvalues_fractal3[idx];
-+                    err += diff * diff;
-+                }
-+                if (err < best_err) {
-+                    best_err = err;
-+                    best_sc = (uint8_t)sc;
-+                    for (int m = 0; m < 8; ++m) best_idx[m] = cur_idx[m];
-+                }
-+            }
-+
-+            sc_block[b] = best_sc;
-+            for (int m = 0; m < 8; ++m) {
-+                idx_block[b * 8 + m] = best_idx[m];
-+            }
-+        }
-+
-+        // Pack scales: b=0..3 in low nibbles of scales[0..3], b=4..7 in high nibbles of scales[0..3]
-+        for (int b = 0; b < 4; ++b) {
-+            y[i].scales[b] = (uint8_t)((sc_block[b] & 0x0F) | ((sc_block[b + 4] & 0x0F) << 4));
-+        }
-+
-+        // Pack 64 3-bit indices into qs[16] and qh[8]
-+        for (int g = 0; g < 4; ++g) {
-+            for (int k_idx = 0; k_idx < 16; ++k_idx) {
-+                const uint8_t idx = idx_block[g * 16 + k_idx];
-+                y[i].qs[k_idx] |= (uint8_t)((idx & 0x03) << (2 * g));
-+                y[i].qh[k_idx & 7] |= (uint8_t)(((idx >> 2) & 0x01) << (2 * g + (k_idx >> 3)));
-+            }
-         }
-     }
- }
-@@ -438,6 +526,7 @@ void dequantize_row_q1_0(const block_q1_0 * GGML_RESTRICT x, float * GGML_RESTRI
- 
- void dequantize_row_q2_0(const block_q2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-     static const int qk = QK2_0;
-+    static const int8_t kvalues_fractal3[8] = { -14, -8, -4, -1, 1, 4, 8, 14 };
- 
-     assert(k % qk == 0);
- 
-@@ -445,13 +534,20 @@ void dequantize_row_q2_0(const block_q2_0 * GGML_RESTRICT x, float * GGML_RESTRI
- 
-     for (int i = 0; i < nb; i++) {
-         const float d = GGML_FP16_TO_FP32(x[i].d);
-+        float eff_s[8];
-+        for (int b = 0; b < 4; ++b) {
-+            eff_s[b]     = d * (float)(4 + (x[i].scales[b] & 0x0F));
-+            eff_s[b + 4] = d * (float)(4 + ((x[i].scales[b] >> 4) & 0x0F));
-+        }
- 
--        for (int j = 0; j < qk; ++j) {
--            const int byte_index = j / 4;
--            const int bit_offset = (j % 4) * 2;
--            const uint8_t q = (x[i].qs[byte_index] >> bit_offset) & 0x03;
--            // 00=-1, 01=0, 10=+1, 11=+2
--            y[i*qk + j] = ((int)q - 1) * d;
-+        for (int g = 0; g < 4; ++g) {
-+            for (int k_idx = 0; k_idx < 16; ++k_idx) {
-+                const int j = g * 16 + k_idx;
-+                const uint8_t lo2 = (x[i].qs[k_idx] >> (2 * g)) & 0x03;
-+                const uint8_t hi1 = (x[i].qh[k_idx & 7] >> (2 * g + (k_idx >> 3))) & 0x01;
-+                const uint8_t idx = (uint8_t)(lo2 | (hi1 << 2));
-+                y[i * qk + j] = eff_s[j >> 3] * (float)kvalues_fractal3[idx];
-+            }
-         }
-     }
- }
-diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index da7f3a5..6aa727a 100644
---- a/ggml/src/ggml.c
-+++ b/ggml/src/ggml.c
-@@ -380,6 +380,13 @@ void * ggml_aligned_malloc(size_t size) {
-         GGML_LOG_ERROR("%s: %s (attempted to allocate %6.2f MB)\n", __func__, error_desc, size/(1024.0*1024.0));
-         return NULL;
-     }
-+#if defined(__linux__) && defined(MADV_HUGEPAGE)
-+    if (size >= 2 * 1024 * 1024) {
-+        uintptr_t page_mask = ~(uintptr_t)(4096 - 1);
-+        void * page_aligned = (void *)((uintptr_t)aligned_memory & page_mask);
-+        madvise(page_aligned, size, MADV_HUGEPAGE);
-+    }
-+#endif
-     return aligned_memory;
- #endif
- }
-diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 2be3b75..c894b9e 100644
---- a/src/llama-graph.cpp
-+++ b/src/llama-graph.cpp
-@@ -853,6 +853,10 @@ static void dsv4_set_comp_inputs(
-     dsv4_set_i32(inp.state_read_idxs, plan.state_read_idxs);
-     dsv4_set_i64(inp.state_write_idxs, plan.state_write_idxs);
-     dsv4_set_i32(inp.state_write_pos, plan.state_write_pos);
-+    if (strcmp(name, "csa") == 0) {
-+        extern int ggml_dsv4_skip_csa_comp;
-+        ggml_dsv4_skip_csa_comp = (plan.state_write_pos.size() == 1 && plan.state_write_pos[0] == -1) ? 1 : 0;
-+    }
-     dsv4_set_kq_mask(inp.kq_mask, plan, n_tokens, n_stream);
- 
-     if (debug || dsv4_compress_debug()) {
 diff --git a/src/llama-kv-cache-dsv4.cpp b/src/llama-kv-cache-dsv4.cpp
 index 5caa05e..e79b88a 100644
 --- a/src/llama-kv-cache-dsv4.cpp
@@ -3502,220 +1505,6 @@ index 5caa05e..e79b88a 100644
              rs_idx[seq_id] = (uint32_t) rollback;
          }
  
-diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
-index ed572da..b18ef4a 100644
---- a/src/llama-mmap.cpp
-+++ b/src/llama-mmap.cpp
-@@ -458,6 +458,9 @@ struct llama_mmap::impl {
-         if (addr == MAP_FAILED) {
-             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
-         }
-+#if defined(__linux__) && defined(MADV_HUGEPAGE)
-+        madvise(addr, file->size(), MADV_HUGEPAGE);
-+#endif
- 
-         if (prefetch > 0) {
-             if (posix_madvise(addr, std::min(file->size(), prefetch), POSIX_MADV_WILLNEED)) {
-diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 3d50f8a..37a376c 100644
---- a/src/llama-model-loader.cpp
-+++ b/src/llama-model-loader.cpp
-@@ -462,6 +462,10 @@ namespace GGUFMeta {
-                 GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(metadata, kid);
- 
-             if (n != arr_info.length) {
-+                if (arr_info.length <= n) {
-+                    result.fill(0);
-+                    return get_arr(key, result, required);
-+                }
-                 throw std::runtime_error(format("key %s has wrong array length; expected %u, got %u", key.c_str(), n, (uint32_t) arr_info.length));
-             }
- 
-diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 3bf3a22..b4f5af5 100644
---- a/src/llama-model.cpp
-+++ b/src/llama-model.cpp
-@@ -40,8 +40,6 @@
- 
- static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
-     switch (arch) {
--        case LLM_ARCH_CLIP:
--            return new llama_model_clip(params);
-         case LLM_ARCH_LLAMA:
-             return new llama_model_llama(params);
-         case LLM_ARCH_LLAMA4:
-@@ -114,8 +112,6 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
-             return new llama_model_qwen3vl(params);
-         case LLM_ARCH_QWEN3VLMOE:
-             return new llama_model_qwen3vlmoe(params);
--        case LLM_ARCH_QWEN3TTS:
--            return new llama_model_qwen3tts(params);
-         case LLM_ARCH_PHI2:
-             return new llama_model_phi2(params);
-         case LLM_ARCH_PHI3:
-@@ -176,8 +172,6 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
-             return new llama_model_olmo2(params);
-         case LLM_ARCH_OLMOE:
-             return new llama_model_olmoe(params);
--        case LLM_ARCH_MUSE_GLIMMER:
--            return new llama_model_muse_glimmer(params);
-         case LLM_ARCH_OPENELM:
-             return new llama_model_openelm(params);
-         case LLM_ARCH_GPTNEOX:
-@@ -238,8 +232,6 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
-             return new llama_model_granite(params);
-         case LLM_ARCH_GRANITE_MOE:
-             return new llama_model_granite_moe(params);
--        case LLM_ARCH_GRANITE_SWITCH:
--            return new llama_model_granite_switch(params);
-         case LLM_ARCH_MINICPM:
-             return new llama_model_minicpm(params);
-         case LLM_ARCH_GRANITE_HYBRID:
-@@ -1104,6 +1096,18 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
-     ml.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);
-     ml.get_key(LLM_KV_EXPERT_GROUP_USED_COUNT, hparams.n_group_used,    false);
- 
-+    {
-+        const char * env_moe_top_k = getenv("LLAMA_MOE_TOP_K");
-+        if (env_moe_top_k && atoi(env_moe_top_k) > 0) {
-+            const uint32_t val = (uint32_t)atoi(env_moe_top_k);
-+            if (val <= hparams.n_expert && hparams.n_expert_used > 0) {
-+                LLAMA_LOG_INFO("%s: [ROUTECRACK] Dynamic Expert Selection: overriding n_expert_used from %u to %u (LLAMA_MOE_TOP_K)\n",
-+                    __func__, hparams.n_expert_used, val);
-+                hparams.n_expert_used = val;
-+            }
-+        }
-+    }
-+
-     if (arch == LLM_ARCH_HUNYUAN_VL || arch == LLM_ARCH_HUNYUAN_DENSE) {
-         if (hparams.n_expert <= 1) {
-             hparams.n_expert      = 0;
-@@ -1918,7 +1922,6 @@ void llama_model::print_info() const {
-                 arch == LLM_ARCH_GRANITE ||
-                 arch == LLM_ARCH_GRANITE_MOE ||
-                 arch == LLM_ARCH_GRANITE_HYBRID ||
--                arch == LLM_ARCH_GRANITE_SWITCH ||
-                 arch == LLM_ARCH_NEMOTRON_H_MOE) {
-             LLAMA_LOG_INFO("%s: f_embedding_scale     = %f\n", __func__, hparams.f_embedding_scale);
-             LLAMA_LOG_INFO("%s: f_residual_scale      = %f\n", __func__, hparams.f_residual_scale);
-@@ -2235,9 +2238,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
-                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
-                     (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE);
- 
--                const bool mtp_on_hybrid_nemotron =
--                    params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
--
-                 if (llm_arch_is_recurrent(arch)) {
-                     res = new llama_memory_recurrent(
-                             *this,
-@@ -2248,7 +2248,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
-                             cparams.n_seq_max,
-                             cparams.n_rs_seq,
-                             nullptr);
--                } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron) {
-+                } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen) {
-                     // The main difference between hybrid architectures is the
-                     // layer filters, so pick the right one here
-                     llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
-@@ -2329,7 +2329,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
-                         };
-                     }
- 
--                    if (mtp_on_hybrid_qwen || mtp_on_hybrid_nemotron) {
-+                    if (mtp_on_hybrid_qwen) {
-                         filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
-                     }
- 
-@@ -2601,13 +2601,11 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
-         case LLM_ARCH_DEEPSEEK2OCR:
-         case LLM_ARCH_DEEPSEEK32:
-         case LLM_ARCH_DEEPSEEK4:
--        case LLM_ARCH_MUSE_GLIMMER:
-         case LLM_ARCH_PLM:
-         case LLM_ARCH_CHATGLM:
-         case LLM_ARCH_GRANITE:
-         case LLM_ARCH_GRANITE_MOE:
-         case LLM_ARCH_GRANITE_HYBRID:
--        case LLM_ARCH_GRANITE_SWITCH:
-         case LLM_ARCH_CHAMELEON:
-         case LLM_ARCH_BAILINGMOE:
-         case LLM_ARCH_NEO_BERT:
-@@ -2707,7 +2705,6 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
-         case LLM_ARCH_QWEN3VLMOE:
-         case LLM_ARCH_QWEN35:
-         case LLM_ARCH_QWEN35MOE:
--        case LLM_ARCH_QWEN3TTS:
-             return LLAMA_ROPE_TYPE_IMROPE;
- 
-         case LLM_ARCH_GLM4:
-@@ -2902,21 +2899,6 @@ void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
-         int64_t n_embd_, int64_t n_embd_q_, int64_t n_embd_k_, int64_t n_embd_v_,
-         int flags) {
-     const int64_t n_embd_qkv = n_embd_q_ + n_embd_k_ + n_embd_v_;
--
--    if (flags & TENSOR_SKIP) {
--        const int skip = TENSOR_NOT_REQUIRED | TENSOR_SKIP;
--
--        create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", bid), {n_embd_, n_embd_qkv}, skip | TENSOR_SKIP_IF_VIRTUAL);
--        create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias",   bid), {n_embd_qkv},          skip | TENSOR_SKIP_IF_VIRTUAL);
--        create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", bid), {n_embd_, n_embd_q_},  skip);
--        create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", bid), {n_embd_, n_embd_k_},  skip);
--        create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", bid), {n_embd_, n_embd_v_},  skip);
--        create_tensor(tn(LLM_TENSOR_ATTN_Q,   "bias",   bid), {n_embd_q_},           skip);
--        create_tensor(tn(LLM_TENSOR_ATTN_K,   "bias",   bid), {n_embd_k_},           skip);
--        create_tensor(tn(LLM_TENSOR_ATTN_V,   "bias",   bid), {n_embd_v_},           skip);
--        return;
--    }
--
-     layer.wqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", bid), {n_embd_, n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
-     if (layer.wqkv) {
-         layer.wqkv_b = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias", bid), {n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
-@@ -2940,36 +2922,17 @@ uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
- }
- 
- uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out) {
--    if (model->vocab.n_tokens() == 0 || model->tok_embd == nullptr) {
-+    if (!model || !model->tok_embd) {
-         return 0;
-     }
--
--    const ggml_tensor * tensor = model->tok_embd;
--    const size_t nelements = ggml_nelements(tensor);
--    GGML_ASSERT(nelements <= UINT32_MAX); // for the return type
--
--    if (out == nullptr) {
--        return (uint32_t) nelements;
--    }
--
--    if (tensor->type == GGML_TYPE_F32) {
--        ggml_backend_tensor_get(tensor, out, 0, nelements * sizeof(float));
--        return (uint32_t) nelements;
-+    const uint32_t n_tokens = model->vocab.n_tokens();
-+    if (!out) {
-+        return n_tokens;
-     }
--
--    std::vector<uint8_t> buf(ggml_nbytes(tensor));
--    ggml_backend_tensor_get(tensor, buf.data(), 0, buf.size());
--
--    const ggml_type_traits * traits = ggml_get_type_traits(tensor->type);
--    if (tensor->type == GGML_TYPE_F16) {
--        ggml_fp16_to_fp32_row((const ggml_fp16_t *) buf.data(), out, nelements);
--    } else if (tensor->type == GGML_TYPE_BF16) {
--        ggml_bf16_to_fp32_row((const ggml_bf16_t *) buf.data(), out, nelements);
--    } else if (ggml_is_quantized(tensor->type) && traits->to_float != nullptr) {
--        traits->to_float(buf.data(), out, nelements);
--    } else {
--        GGML_ABORT("unsupported tensor type for dequantization: %s", ggml_type_name(tensor->type));
-+    const auto * traits = ggml_get_type_traits(model->tok_embd->type);
-+    if (!traits || !traits->to_float) {
-+        return 0;
-     }
--
--    return (uint32_t) nelements;
-+    traits->to_float(model->tok_embd->data, out, ggml_nelements(model->tok_embd));
-+    return n_tokens;
- }
 diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
 index 89cd461..d190d2c 100644
 --- a/src/models/deepseek4.cpp
@@ -3946,177 +1735,3 @@ index 89cd461..d190d2c 100644
  
          const dsv4_state_tensors hca_snapshot = dsv4_build_state_snapshot(
                  ctx0, inp_dsv4->get_hca(), hca_state, hca_snapshot_source_kv, hca_snapshot_source_score, il);
-diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
-index 38f2a57..2787e66 100644
---- a/src/models/qwen35moe.cpp
-+++ b/src/models/qwen35moe.cpp
-@@ -75,19 +75,22 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
- 
-         if (!hparams.is_recr(il)) {
-             // Attention layers
--            create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, flags);
--            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", il), { n_embd_head_k * n_head, n_embd }, flags);
-+            create_tensor_qkv(layer, il, n_embd, hparams.n_embd_head_k(il) * hparams.n_head(il) * 2, hparams.n_embd_k_gqa(il), hparams.n_embd_v_gqa(il), flags);
-+            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", il), { (int64_t)(hparams.n_embd_head_k(il) * hparams.n_head(il)), n_embd }, flags);
- 
-             // Q/K normalization for attention layers
--            layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, flags);
--            layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, flags);
-+            layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { (int64_t)hparams.n_embd_head_k(il) }, flags);
-+            layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { (int64_t)hparams.n_embd_head_k(il) }, flags);
-         } else {
-             // Linear attention (gated delta net) specific tensors
-             // Create tensors with calculated dimensions
-             layer.wqkv           = create_tensor(tn(LLM_TENSOR_ATTN_QKV,       "weight", il), { n_embd, key_dim * 2 + value_dim }, TENSOR_NOT_REQUIRED);
-             layer.wqkv_gate      = create_tensor(tn(LLM_TENSOR_ATTN_GATE,      "weight", il), { n_embd, value_dim }, TENSOR_NOT_REQUIRED);
-             layer.ssm_conv1d     = create_tensor(tn(LLM_TENSOR_SSM_CONV1D,     "weight", il), { hparams.ssm_d_conv, conv_dim }, flags);
--            layer.ssm_dt         = create_tensor(tn(LLM_TENSOR_SSM_DT,         "bias",   il), { hparams.ssm_dt_rank }, flags);
-+            layer.ssm_dt         = create_tensor(tn(LLM_TENSOR_SSM_DT,                        il), { hparams.ssm_dt_rank }, TENSOR_NOT_REQUIRED);
-+            if (!layer.ssm_dt) {
-+                layer.ssm_dt = create_tensor(tn(LLM_TENSOR_SSM_DT,         "bias",   il), { hparams.ssm_dt_rank }, flags);
-+            }
-             layer.ssm_a          = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,             il), { hparams.ssm_dt_rank }, flags);
-             layer.ssm_beta       = create_tensor(tn(LLM_TENSOR_SSM_BETA,       "weight", il), { n_embd, n_v_heads }, flags);
-             layer.ssm_alpha      = create_tensor(tn(LLM_TENSOR_SSM_ALPHA,      "weight", il), { n_embd, n_v_heads }, flags);
-@@ -117,10 +120,10 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
-         layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", il), { n_embd }, mtp_flags);
-         layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", il), { n_embd }, mtp_flags);
- 
--        create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, mtp_flags);
--        layer.wo          = create_tensor(tn(LLM_TENSOR_ATTN_OUT,    "weight", il), { n_embd_head_k * n_head, n_embd }, mtp_flags);
--        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, mtp_flags);
--        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, mtp_flags);
-+        create_tensor_qkv(layer, il, n_embd, hparams.n_embd_head_k(il) * hparams.n_head(il) * 2, hparams.n_embd_k_gqa(il), hparams.n_embd_v_gqa(il), mtp_flags);
-+        layer.wo          = create_tensor(tn(LLM_TENSOR_ATTN_OUT,    "weight", il), { (int64_t)(hparams.n_embd_head_k(il) * hparams.n_head(il)), n_embd }, mtp_flags);
-+        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { (int64_t)hparams.n_embd_head_k(il) }, mtp_flags);
-+        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { (int64_t)hparams.n_embd_head_k(il) }, mtp_flags);
- 
-         // Routed experts
-         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, mtp_flags);
-@@ -285,8 +288,10 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
-         ggml_tensor *             inp_pos,
-         int *                     sections,
-         int                       il) {
--    const int64_t n_embd_head = hparams.n_embd_head_v();
--    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
-+    const int64_t n_embd_head = hparams.n_embd_head_v(il);
-+    const int64_t n_head      = hparams.n_head(il);
-+    const int64_t n_head_kv   = hparams.n_head_kv(il);
-+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k(il));
- 
-     // Order: joint QG projection, QG split, Q norm, KV projection, K norm, RoPE, attention
- 
-@@ -556,10 +561,11 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
-     GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN35MOE MTP requires n_layer_nextn > 0");
-     GGML_ASSERT(hparams.n_layer_nextn == 1 && "QWEN35MOE MTP currently only supports a single MTP block");
- 
--    const int64_t n_embd_head = hparams.n_embd_head_v();
--    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
--
-     const int il = hparams.n_layer();
-+    const int64_t n_embd_head = hparams.n_embd_head_v(il);
-+    const int64_t n_head      = hparams.n_head(il);
-+    const int64_t n_head_kv   = hparams.n_head_kv(il);
-+    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k(il));
-     const auto & layer = model.layers[il];
- 
-     GGML_ASSERT(layer.nextn.eh_proj    && "MTP block missing nextn.eh_proj");
-diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 38d2e5c..7566a67 100644
---- a/tools/server/server-context.cpp
-+++ b/tools/server/server-context.cpp
-@@ -2376,13 +2376,16 @@ private:
-         }
- 
-         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
--            // make room for the new checkpoint, if needed
--            const auto & cur = slot.prompt.checkpoints.front();
-+            // Keep checkpoints.front() (base system+tools prefix checkpoint) pinned so new sessions never cold-prefill
-+            auto evict_it = slot.prompt.checkpoints.size() > 1
-+                ? std::next(slot.prompt.checkpoints.begin())
-+                : slot.prompt.checkpoints.begin();
-+            const auto & cur = *evict_it;
- 
-             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
- 
--            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
-+            slot.prompt.checkpoints.erase(evict_it);
-         }
- 
-         auto & cur = slot.prompt.checkpoints.emplace_back();
-@@ -2605,6 +2608,33 @@ private:
-                     const size_t token_count = tokens.size();
-                     const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
- 
-+                    // Save Mamba-2 / hybrid context checkpoints alongside slot state (.ckpt)
-+                    {
-+                        const std::string ckpt_path = filepath + ".ckpt";
-+                        std::ofstream fckpt(ckpt_path, std::ios::binary | std::ios::trunc);
-+                        if (fckpt.good()) {
-+                            const uint32_t magic = 0x434B5054; // "CKPT"
-+                            const uint32_t count = (uint32_t) slot->prompt.checkpoints.size();
-+                            fckpt.write(reinterpret_cast<const char *>(&magic), sizeof(magic));
-+                            fckpt.write(reinterpret_cast<const char *>(&count), sizeof(count));
-+                            for (const auto & ckpt : slot->prompt.checkpoints) {
-+                                fckpt.write(reinterpret_cast<const char *>(&ckpt.n_tokens), sizeof(ckpt.n_tokens));
-+                                fckpt.write(reinterpret_cast<const char *>(&ckpt.pos_min), sizeof(ckpt.pos_min));
-+                                fckpt.write(reinterpret_cast<const char *>(&ckpt.pos_max), sizeof(ckpt.pos_max));
-+                                const uint64_t sz_tgt  = ckpt.data_tgt.size();
-+                                const uint64_t sz_dft  = ckpt.data_dft.size();
-+                                const uint64_t sz_spec = ckpt.data_spec.size();
-+                                fckpt.write(reinterpret_cast<const char *>(&sz_tgt), sizeof(sz_tgt));
-+                                fckpt.write(reinterpret_cast<const char *>(&sz_dft), sizeof(sz_dft));
-+                                fckpt.write(reinterpret_cast<const char *>(&sz_spec), sizeof(sz_spec));
-+                                if (sz_tgt  > 0) fckpt.write(reinterpret_cast<const char *>(ckpt.data_tgt.data()),  sz_tgt);
-+                                if (sz_dft  > 0) fckpt.write(reinterpret_cast<const char *>(ckpt.data_dft.data()),  sz_dft);
-+                                if (sz_spec > 0) fckpt.write(reinterpret_cast<const char *>(ckpt.data_spec.data()), sz_spec);
-+                            }
-+                            SLT_INF(*slot, "saved %u context checkpoints to %s\n", count, ckpt_path.c_str());
-+                        }
-+                    }
-+
-                     const int64_t t_end = ggml_time_us();
-                     const double t_save_ms = (t_end - t_start) / 1000.0;
- 
-@@ -2651,6 +2681,40 @@ private:
-                     slot->prompt.clear();
-                     slot->prompt.tokens.insert(tokens);
- 
-+                    // Restore Mamba-2 / hybrid context checkpoints from .ckpt companion file
-+                    {
-+                        const std::string ckpt_path = filepath + ".ckpt";
-+                        std::ifstream fckpt(ckpt_path, std::ios::binary);
-+                        if (fckpt.good()) {
-+                            uint32_t magic = 0;
-+                            uint32_t count = 0;
-+                            fckpt.read(reinterpret_cast<char *>(&magic), sizeof(magic));
-+                            fckpt.read(reinterpret_cast<char *>(&count), sizeof(count));
-+                            if (fckpt.good() && magic == 0x434B5054 && count <= 256) {
-+                                for (uint32_t i = 0; i < count; ++i) {
-+                                    common_prompt_checkpoint ckpt;
-+                                    uint64_t sz_tgt = 0, sz_dft = 0, sz_spec = 0;
-+                                    fckpt.read(reinterpret_cast<char *>(&ckpt.n_tokens), sizeof(ckpt.n_tokens));
-+                                    fckpt.read(reinterpret_cast<char *>(&ckpt.pos_min), sizeof(ckpt.pos_min));
-+                                    fckpt.read(reinterpret_cast<char *>(&ckpt.pos_max), sizeof(ckpt.pos_max));
-+                                    fckpt.read(reinterpret_cast<char *>(&sz_tgt), sizeof(sz_tgt));
-+                                    fckpt.read(reinterpret_cast<char *>(&sz_dft), sizeof(sz_dft));
-+                                    fckpt.read(reinterpret_cast<char *>(&sz_spec), sizeof(sz_spec));
-+                                    if (!fckpt.good()) break;
-+                                    ckpt.data_tgt.resize(sz_tgt);
-+                                    ckpt.data_dft.resize(sz_dft);
-+                                    ckpt.data_spec.resize(sz_spec);
-+                                    if (sz_tgt  > 0) fckpt.read(reinterpret_cast<char *>(ckpt.data_tgt.data()),  sz_tgt);
-+                                    if (sz_dft  > 0) fckpt.read(reinterpret_cast<char *>(ckpt.data_dft.data()),  sz_dft);
-+                                    if (sz_spec > 0) fckpt.read(reinterpret_cast<char *>(ckpt.data_spec.data()), sz_spec);
-+                                    if (!fckpt.good()) break;
-+                                    slot->prompt.checkpoints.push_back(std::move(ckpt));
-+                                }
-+                                SLT_INF(*slot, "restored %zu context checkpoints from %s\n", slot->prompt.checkpoints.size(), ckpt_path.c_str());
-+                            }
-+                        }
-+                    }
-+
-                     const int64_t t_end = ggml_time_us();
-                     const double t_restore_ms = (t_end - t_start) / 1000.0;
- 
