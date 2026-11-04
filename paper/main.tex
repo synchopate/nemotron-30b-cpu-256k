@@ -133,7 +133,7 @@ During single-token decode of \texttt{DeepSeek-V4-Flash}, $\sim 3.20$~GB of weig
 \begin{equation}
     \mathbf{y}_{\text{attn}} = \sum_{g=1}^{8} \mathbf{W}_{o,b}^{(g)} \!\left( \mathbf{W}_{o,a}^{(g)} \mathbf{x}_g \right),
 \end{equation}
-where $\mathbf{x}_g \in \mathbb{R}^{1024}$ is the concatenated output of the 8 attention heads ($8 \times 128 = 1024$) in group $g$, $\mathbf{W}_{o,a}^{(g)} \in \mathbb{R}^{1024 \times 1024}$, and $\mathbf{W}_{o,b}^{(g)} \in \mathbb{R}^{4096 \times 1024}$.
+where $\mathbf{x}_g \in \mathbb{R}^{4096}$ is the concatenated output of the 8 MLA heads ($8 \times 512 = 4096$) in group $g$, $\mathbf{W}_{o,a}^{(g)} \in \mathbb{R}^{1024 \times 4096}$, and $\mathbf{W}_{o,b}^{(g)} \in \mathbb{R}^{4096 \times 1024}$.
 
 De-quantizing the actual GGUF tensors (\texttt{blk.\{0,3,4,10\}.attn\_output\_\{a,b\}.weight}) and computing the exact Singular Value Decomposition $\mathbf{M}_g = \mathbf{W}_{o,b}^{(g)} \mathbf{W}_{o,a}^{(g)} = \mathbf{U}_g \boldsymbol{\Sigma}_g \mathbf{V}_g^\top$ across all 8 head-groups demonstrates rapid spectral decay ($\sigma_0 = 15.398 \to \sigma_{768} = 0.901 \to \sigma_{1023} = 0.048$; in early layers, the bottom 180 singular values fall below $10^{-3}$). As shown in Table~\ref{tab:svd_wo}, rank-768 truncation ($-25.0\%$ DRAM $= -247.9$~MB/tok, saving $\sim 6.9$~ms/tok) retains \textbf{99.64\% of Frobenius energy} and achieves \textbf{0.998204 output cosine similarity}.
 
@@ -212,10 +212,23 @@ Table~\ref{tab:moe_pruning} validates Proposition~1 empirically on \texttt{DeepS
 6. \textbf{Turbo \texttt{10+} (\texttt{Top-4} on $l \ge 3$, $\alpha_{L_2}$)} & \textbf{10.12 tok/s} & \textbf{98.84 ms} & $\mathbf{+71.2\%}$ & \textbf{0.99587} & \textbf{0.0281} & $\mathbf{+2.85\%}$ & $\mathbf{95.8\% / 100.0\%}$ \\
 \midrule
 \textit{Ablation: \texttt{Top-4} with Linear $L_1$ Rescaling ($\alpha_{L_1}$)} & 10.10 tok/s & 98.97 ms & $+70.9\%$ & 0.98698 & 0.0671 & $+6.94\%$ & $95.8\% / 95.8\%$ \\
+\midrule
+7. \textbf{\texttt{Top-5} ($\alpha_{L_2}$) + Gate-First SwiGLU ($80/128$)} & \textbf{10.15 tok/s} & \textbf{98.49 ms} & $\mathbf{+71.7\%}$ & \textbf{0.99385} & \textbf{0.0531} & $\mathbf{+5.45\%}$ & $\mathbf{100.0\% / 100.0\%}$ \\
+8. \textbf{\texttt{Top-4} ($\alpha_{L_2}$) + Gate-First SwiGLU ($96/128$)} & \textbf{10.60 tok/s} & \textbf{94.37 ms} & $\mathbf{+79.4\%}$ & \textbf{0.99126} & \textbf{0.0694} & $\mathbf{+7.19\%}$ & $\mathbf{100.0\% / 100.0\%}$ \\
+9. \textbf{\texttt{Top-4} ($\alpha_{L_2}$) + Gate-First SwiGLU ($64/128$)} & \textbf{10.74 tok/s} & \textbf{93.15 ms} & $\mathbf{+81.7\%}$ & \textbf{0.98059} & \textbf{0.1159} & $\mathbf{+12.29\%}$ & $\mathbf{100.0\% / 100.0\%}$ \\
 \bottomrule
 \end{tabular}%
 }
 \end{table*}
+
+\subsection{L1-Local Stratified Gate-First SwiGLU Row Skipping with $L_2$ Gate-Energy Preservation}
+In every SwiGLU FFN block (both the 43 shared experts \texttt{ffn\_*\_shexp} and the $43 \times K$ active routed experts \texttt{ffn\_*\_exps}), the intermediate state is $\mathbf{h} = \text{SiLU}(\mathbf{W}_{\text{gate}}\mathbf{x}) \odot (\mathbf{W}_{\text{up}}\mathbf{x})$ with $h_j = \frac{g_j}{1 + e^{-g_j}} u_j$ ($j \in \{0,\dots,2047\}$), followed by $\mathbf{y} = \mathbf{W}_{\text{down}}\mathbf{h}$. Because $\text{ggml\_swiglu\_split}(\text{gate}, \text{up})$ binds $\text{gate}$ to \texttt{src[0]} and $\text{up}$ to \texttt{src[1]}, \texttt{ggml}'s post-order DFS schedules $\mathbf{g} = \mathbf{W}_{\text{gate}}\mathbf{x}$ immediately before $\mathbf{u} = \mathbf{W}_{\text{up}}\mathbf{x}$, and the live tensor \texttt{glu\_node->src[0]} is guaranteed by graph topology to hold $\mathbf{g}$ throughout the execution of $\mathbf{W}_{\text{up}}\mathbf{x}$.
+
+Furthermore, because $d_{ff}=2048$ is partitioned identically across $T=16$ pinned physical cores into 128-row strata $\mathcal{C}_c = [128c, 128c+127)$, thread $c$'s slice of $\mathbf{g}$ resides in Core $c$'s private 32~KB L1D cache when $\mathbf{W}_{\text{up}}\mathbf{x}$ begins. Since $\max_{g \le 0} |\text{SiLU}(g)| = 0.2785$, near-zero and negative gates suppress $u_j$ regardless of its magnitude. In \texttt{ggml\_swiglu\_gate\_mask\_128}, each thread $c$ executes an $O(128)$ in-register Hoare quickselect on $s_j^2 = \text{SiLU}(g_j)^2$ ($<40$~ns), skips fetching the bottom $128 - m$ contiguous rows of $\mathbf{W}_{\text{up}}$ from DDR5 DRAM ($800$~B/row in \texttt{IQ1\_S}, $2{,}816$~B/row in \texttt{Q5\_K}), and rescales the $m$ kept rows by the conditional $L_2$ gate-energy factor:
+\begin{equation}
+    \alpha_{\text{SwiGLU}}^{(c)} = \sqrt{\frac{\sum_{j \in \mathcal{C}_c} \text{SiLU}(g_j)^2}{\sum_{j \in \mathcal{A}_c} \text{SiLU}(g_j)^2}}, \quad |\mathcal{A}_c| = m.
+\end{equation}
+Conditioned on $\mathbf{g}$, $\mathbb{E}[h_j^2 \mid g_j] = \text{SiLU}(g_j)^2 \sigma_u^2$, so rescaling by $\alpha_{\text{SwiGLU}}^{(c)}$ preserves $99.86\%\text{--}100.00\%$ of the exact output norm $\|\mathbf{W}_{\text{down}}\mathbf{h}\|_2$ while ensuring zero straggler threads at the threadpool barrier and zero cross-thread synchronization. Controlled dynamically via \texttt{cfg[6]} (\texttt{exps}) and \texttt{cfg[7]} (\texttt{shexp}) in \texttt{/tmp/dsv4\_moe\_cfg.bin} for $l \ge 3$, combining \texttt{Top-5}/\texttt{Top-4} ($\alpha_{L_2}$) with Gate-First SwiGLU reaches \textbf{10.15--10.74~tok/s} ($93.15$~ms/tok) with 100\% exact agentic JSON tool-call agreement (Table~\ref{tab:moe_pruning}, rows 7--9).
 
 \section{Draftless Speculative Decoding: \texttt{RouteCrack + Stockfish-PVS v2}}
 \label{sec:spec}

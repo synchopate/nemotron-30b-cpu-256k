@@ -1,0 +1,1737 @@
+diff --git a/ggml/src/ggml-cpu/arch/x86/quants.c b/ggml/src/ggml-cpu/arch/x86/quants.c
+index ea54cfe..ffe3392 100644
+--- a/ggml/src/ggml-cpu/arch/x86/quants.c
++++ b/ggml/src/ggml-cpu/arch/x86/quants.c
+@@ -721,6 +721,12 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
+ 
+     // Main loop
+     for (; ib < nb; ++ib) {
++#if defined(__AVX2__) || defined(__AVX512F__)
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from weight streaming pollution
++        if (ib + 4 < nb) {
++            _mm_prefetch((const char *)&x[ib + 4], _MM_HINT_NTA);
++        }
++#endif
+         /* Compute combined scale for the block */
+         const __m256 d = _mm256_set1_ps( GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d) );
+ 
+@@ -942,6 +948,10 @@ void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
+     __m256 accum2 = _mm256_setzero_ps();
+ 
+     for (; ib + 1 < nb; ib += 2) {
++        if (ib + 6 < nb) {
++            _mm_prefetch((const char *)&x[ib + 6], _MM_HINT_NTA);
++            _mm_prefetch((const char *)&y[ib + 6], _MM_HINT_T0);
++        }
+         const __m128i q4bits_1 = _mm_loadu_si128((const __m128i*)x[ib + 0].qs);
+         const __m128i q4bits_2 = _mm_loadu_si128((const __m128i*)x[ib + 1].qs);
+         const __m256i q8b_1 = _mm256_loadu_si256((const __m256i *)y[ib + 0].qs);
+@@ -1162,6 +1172,12 @@ void ggml_vec_dot_q5_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
+ 
+     // Main loop
+     for (; ib < nb; ++ib) {
++#if defined(__AVX2__) || defined(__AVX512F__)
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from weight streaming pollution
++        if (ib + 4 < nb) {
++            _mm_prefetch((const char *)&x[ib + 4], _MM_HINT_NTA);
++        }
++#endif
+         /* Compute combined scale for the block */
+         const __m256 d = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d));
+ 
+@@ -1186,6 +1202,12 @@ void ggml_vec_dot_q5_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
+ 
+     // Main loop
+     for (; ib < nb; ++ib) {
++#if defined(__AVX2__) || defined(__AVX512F__)
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from weight streaming pollution
++        if (ib + 4 < nb) {
++            _mm_prefetch((const char *)&x[ib + 4], _MM_HINT_NTA);
++        }
++#endif
+         /* Compute combined scale for the block */
+         const __m256 d = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d));
+ 
+@@ -1591,6 +1613,14 @@ void ggml_vec_dot_q2_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+     __m256 acc = _mm256_setzero_ps();
+ 
+     for (int i = 0; i < nb; ++i) {
++#if defined(__AVX2__) || defined(__AVX512F__)
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
++        if (i + 2 < nb) {
++                _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 128, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 192, _MM_HINT_NTA);
++        }
++#endif
+ 
+         const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
+         const float dmin = -y[i].d * GGML_CPU_FP16_TO_FP32(x[i].dmin);
+@@ -1790,6 +1820,14 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+     uint32_t aux[3];
+ 
+     for (int i = 0; i < nb; ++i) {
++#if defined(__AVX2__) || defined(__AVX512F__)
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
++        if (i + 2 < nb) {
++                _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 128, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 192, _MM_HINT_NTA);
++        }
++#endif
+ 
+         const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
+ 
+@@ -1895,6 +1933,14 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+     const uint32_t *aux;
+ 
+     for (int i = 0; i < nb; ++i) {
++#if defined(__AVX2__) || defined(__AVX512F__)
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
++        if (i + 2 < nb) {
++                _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 128, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 192, _MM_HINT_NTA);
++        }
++#endif
+ 
+         const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
+ 
+@@ -2062,6 +2108,14 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+     __m128 acc_m = _mm_setzero_ps();
+ 
+    for (int i = 0; i < nb; ++i) {
++#if defined(__AVX2__) || defined(__AVX512F__)
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
++        if (i + 2 < nb) {
++                _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 128, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 192, _MM_HINT_NTA);
++        }
++#endif
+ 
+         const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
+         const float dmin = -y[i].d * GGML_CPU_FP16_TO_FP32(x[i].dmin);
+@@ -2128,6 +2182,14 @@ void ggml_vec_dot_q4_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+     __m128 acc_m = _mm_setzero_ps();
+ 
+    for (int i = 0; i < nb; ++i) {
++#if defined(__AVX2__) || defined(__AVX512F__)
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
++        if (i + 2 < nb) {
++                _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 128, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 192, _MM_HINT_NTA);
++        }
++#endif
+ 
+         const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
+         const float dmin = -y[i].d * GGML_CPU_FP16_TO_FP32(x[i].dmin);
+@@ -2243,6 +2305,11 @@ void ggml_vec_dot_q5_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+     float summs = 0.f;
+ 
+     for (int i = 0; i < nb; ++i) {
++        if (i + 2 < nb) {
++            _mm_prefetch((const char *)&x[i + 2], _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 128, _MM_HINT_NTA);
++        }
+         const uint8_t * GGML_RESTRICT q5 = x[i].qs;
+         const int8_t  * GGML_RESTRICT q8 = y[i].qs;
+ 
+@@ -2291,6 +2358,13 @@ void ggml_vec_dot_q5_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+             const __m256i q5_1  = _mm256_add_epi8(q5l_1, q5h_1);
+             hmask = _mm256_slli_epi16(hmask, 1);
+ 
++#if defined(__AVX512BW__) && defined(__AVX512VL__)
++            const __m512i q5_01 = _mm512_inserti64x4(_mm512_castsi256_si512(q5_0), q5_1, 1);
++            const __m512i q8_01 = _mm512_loadu_si512((const __m512i*)q8); q8 += 64;
++            const __m512i sc_01 = _mm512_inserti64x4(_mm512_castsi256_si512(scale_0), scale_1, 1);
++            const __m512i p32   = _mm512_madd_epi16(sc_01, _mm512_maddubs_epi16(q5_01, q8_01));
++            sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(_mm512_castsi512_si256(p32), _mm512_extracti64x4_epi64(p32, 1)));
++#else
+             const __m256i q8_0 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+             const __m256i q8_1 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+ 
+@@ -2301,6 +2375,7 @@ void ggml_vec_dot_q5_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+             p16_1 = _mm256_madd_epi16(scale_1, p16_1);
+ 
+             sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16_0, p16_1));
++#endif
+ 
+         }
+ 
+@@ -2323,6 +2398,14 @@ void ggml_vec_dot_q5_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+     float summs = 0.f;
+ 
+     for (int i = 0; i < nb; ++i) {
++#if defined(__AVX2__) || defined(__AVX512F__)
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
++        if (i + 2 < nb) {
++                _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 128, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 192, _MM_HINT_NTA);
++        }
++#endif
+ 
+         const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
+         const float dmin = -y[i].d * GGML_CPU_FP16_TO_FP32(x[i].dmin);
+@@ -2444,6 +2527,14 @@ void ggml_vec_dot_q6_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+     __m256 acc = _mm256_setzero_ps();
+ 
+     for (int i = 0; i < nb; ++i) {
++#if defined(__AVX2__) || defined(__AVX512F__)
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
++        if (i + 2 < nb) {
++                _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 128, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 192, _MM_HINT_NTA);
++        }
++#endif
+ 
+         const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
+ 
+@@ -2515,6 +2606,14 @@ void ggml_vec_dot_q6_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
+     __m256 acc = _mm256_setzero_ps();
+ 
+     for (int i = 0; i < nb; ++i) {
++#if defined(__AVX2__) || defined(__AVX512F__)
++        // RouteCrack Non-Temporal prefetch: protect L3 KV cache from Q6_K weight streaming
++        if (i + 2 < nb) {
++                _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 128, _MM_HINT_NTA);
++            _mm_prefetch((const char *)&x[i + 2] + 192, _MM_HINT_NTA);
++        }
++#endif
+ 
+         const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
+ 
+@@ -2679,6 +2778,9 @@ void ggml_vec_dot_iq2_xxs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const
+ 
+     __m256 accumf = _mm256_setzero_ps();
+     for (int i = 0; i < nb; ++i) {
++        if (i + 2 < nb) {
++                _mm_prefetch((const char *)&x[i + 2] + 64, _MM_HINT_NTA);
++        }
+         const float d = GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d;
+         const uint16_t * GGML_RESTRICT q2 = x[i].qs;
+         const int8_t   * GGML_RESTRICT q8 = y[i].qs;
+@@ -3608,6 +3710,7 @@ void ggml_vec_dot_iq1_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
+ 
+     __m256 accum = _mm256_setzero_ps();
+     float accum1 = 0;
++    const __m256i ones256 = _mm256_set1_epi8(1);
+     for (int i = 0; i < nb; ++i) {
+ 
+         const int8_t   * q8 = y[i].qs;
+@@ -3620,10 +3723,8 @@ void ggml_vec_dot_iq1_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
+ #ifdef __BMI2__
+             const uint64_t packed_idx1 = _pdep_u64(*(const uint32_t *)qs, 0x00ff00ff00ff00ffULL) | _pdep_u64(qh[ib], 0x700070007000700ULL);
+             const uint64_t packed_idx2 = _pdep_u64(*(const uint32_t *)(qs + 4), 0x00ff00ff00ff00ffULL) | _pdep_u64(qh[ib + 1], 0x700070007000700ULL);
+-            const uint16_t *idx1 = (const uint16_t *)(&packed_idx1);
+-            const uint16_t *idx2 = (const uint16_t *)(&packed_idx2);
+-            const __m256i q1b_1 = _mm256_set_epi64x(iq1s_grid[idx1[3]], iq1s_grid[idx1[2]], iq1s_grid[idx1[1]], iq1s_grid[idx1[0]]);
+-            const __m256i q1b_2 = _mm256_set_epi64x(iq1s_grid[idx2[3]], iq1s_grid[idx2[2]], iq1s_grid[idx2[1]], iq1s_grid[idx2[0]]);
++            const __m256i q1b_1 = _mm256_set_epi64x(iq1s_grid[(uint16_t)(packed_idx1 >> 48)], iq1s_grid[(uint16_t)(packed_idx1 >> 32)], iq1s_grid[(uint16_t)(packed_idx1 >> 16)], iq1s_grid[(uint16_t)packed_idx1]);
++            const __m256i q1b_2 = _mm256_set_epi64x(iq1s_grid[(uint16_t)(packed_idx2 >> 48)], iq1s_grid[(uint16_t)(packed_idx2 >> 32)], iq1s_grid[(uint16_t)(packed_idx2 >> 16)], iq1s_grid[(uint16_t)packed_idx2]);
+ #else
+             const __m256i q1b_1 = _mm256_set_epi64x(iq1s_grid[qs[3] | ((qh[ib+0] >> 1) & 0x700)], iq1s_grid[qs[2] | ((qh[ib+0] << 2) & 0x700)],
+                                                     iq1s_grid[qs[1] | ((qh[ib+0] << 5) & 0x700)], iq1s_grid[qs[0] | ((qh[ib+0] << 8) & 0x700)]);
+@@ -3634,8 +3735,8 @@ void ggml_vec_dot_iq1_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
+             const __m256i q8b_1 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+             const __m256i q8b_2 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+ 
+-            const __m256i dot1 = mul_add_epi8(q1b_1, q8b_1);
+-            const __m256i dot2 = mul_add_epi8(q1b_2, q8b_2);
++            const __m256i dot1 = _mm256_maddubs_epi16(ones256, _mm256_sign_epi8(q8b_1, q1b_1));
++            const __m256i dot2 = _mm256_maddubs_epi16(ones256, _mm256_sign_epi8(q8b_2, q1b_2));
+             const int16_t ls1 = 2*((qh[ib+0] >> 12) & 7) + 1;
+             const int16_t ls2 = 2*((qh[ib+1] >> 12) & 7) + 1;
+             const __m256i p1 = _mm256_madd_epi16(dot1, _mm256_set1_epi16(ls1));
+@@ -3645,7 +3746,6 @@ void ggml_vec_dot_iq1_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
+             sumi1 += (y[i].bsums[2*ib+0] + y[i].bsums[2*ib+1]) * (qh[ib+0] & 0x8000 ? -1 : 1) * ls1
+                    + (y[i].bsums[2*ib+2] + y[i].bsums[2*ib+3]) * (qh[ib+1] & 0x8000 ? -1 : 1) * ls2;
+         }
+-
+         const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
+         accum = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), accum);
+         accum1 += d * sumi1;
+@@ -3757,14 +3857,14 @@ void ggml_vec_dot_iq1_m_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
+         __m256i sumi2 = _mm256_setzero_si256();
+         for (int ib = 0; ib < QK_K/32; ib += 2) {
+ #ifdef __BMI2__
++            if (ib == 0 && i + 2 < nb) {
++                    }
+             const uint64_t packed_idx1 = _pdep_u64(*(const uint32_t *)qs, 0x00ff00ff00ff00ffULL)
+                                        | _pdep_u64(*(const uint16_t*)(qh) & 0x7777, 0xf000f000f000f00ULL);
+             const uint64_t packed_idx2 = _pdep_u64(*(const uint32_t *)(qs + 4), 0x00ff00ff00ff00ffULL)
+                                        | _pdep_u64(*(const uint16_t*)(qh + 2) & 0x7777, 0xf000f000f000f00ULL);
+-            const uint16_t *idx1 = (const uint16_t *)(&packed_idx1);
+-            const uint16_t *idx2 = (const uint16_t *)(&packed_idx2);
+-            const __m256i q1b_1 = _mm256_set_epi64x(iq1s_grid[idx1[3]], iq1s_grid[idx1[2]], iq1s_grid[idx1[1]], iq1s_grid[idx1[0]]);
+-            const __m256i q1b_2 = _mm256_set_epi64x(iq1s_grid[idx2[3]], iq1s_grid[idx2[2]], iq1s_grid[idx2[1]], iq1s_grid[idx2[0]]);
++            const __m256i q1b_1 = _mm256_set_epi64x(iq1s_grid[(uint16_t)(packed_idx1 >> 48)], iq1s_grid[(uint16_t)(packed_idx1 >> 32)], iq1s_grid[(uint16_t)(packed_idx1 >> 16)], iq1s_grid[(uint16_t)packed_idx1]);
++            const __m256i q1b_2 = _mm256_set_epi64x(iq1s_grid[(uint16_t)(packed_idx2 >> 48)], iq1s_grid[(uint16_t)(packed_idx2 >> 32)], iq1s_grid[(uint16_t)(packed_idx2 >> 16)], iq1s_grid[(uint16_t)packed_idx2]);
+ 
+             // Convert signs to bytes 0x81 (negative) or 0x01 (positive)
+             const uint64_t delta_sign = _pdep_u64(*(const uint32_t*)(qh) & 0x88888888, 0xf0f0f0f0f0f0f0f0ULL);
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 7918845..01b9eb6 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1,3 +1,12 @@
++#ifdef _WIN32
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++#else
++#include <sys/mman.h>
++#include <fcntl.h>
++#endif
+ #define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
+ #define _USE_MATH_DEFINES // For M_PI on MSVC
+ 
+@@ -489,6 +498,8 @@ struct ggml_threadpool {
+     atomic_int GGML_CACHE_ALIGN n_barrier;
+     atomic_int GGML_CACHE_ALIGN n_barrier_passed;
+     atomic_int GGML_CACHE_ALIGN current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.
++    atomic_int GGML_CACHE_ALIGN ccd_phase;     // Dual-CCD vertical pipeline phase synchronization
++    bool dual_ccd_active;
+ 
+     // these are atomic as an annotation for thread-sanitizer
+     atomic_bool stop;         // Used for stopping the threadpool altogether
+@@ -579,8 +590,11 @@ void ggml_barrier(struct ggml_threadpool * tp) {
+     }
+ 
+ #ifdef GGML_USE_OPENMP
+-    #pragma omp barrier
+-#else
++    if (!tp->dual_ccd_active) {
++        #pragma omp barrier
++        return;
++    }
++#endif
+     int n_passed = atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed);
+ 
+     // enter barrier (full seq-cst fence)
+@@ -607,7 +621,6 @@ void ggml_barrier(struct ggml_threadpool * tp) {
+     #else
+     atomic_thread_fence(memory_order_seq_cst);
+     #endif
+-#endif
+ }
+ 
+ void ggml_threadpool_chunk_set(struct ggml_threadpool * tp, int value) {
+@@ -1161,6 +1174,86 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2,
+ 
+ // ggml_compute_forward_mul_mat
+ 
++#define GGML_Q8_CACHE_SLOTS 8
++#define GGML_Q8_CACHE_SIZE  65536
++static uint8_t s_q8_cache_buf[GGML_Q8_CACHE_SLOTS][GGML_Q8_CACHE_SIZE] __attribute__((aligned(64)));
++static __thread void * g_tls_q8_wdata = NULL;
++static __thread bool   g_tls_q8_valid = false;
++static __thread bool   g_tls_mmid_ids_valid = false;
++static __thread int g_tls_moe_skip_mask = 0;
++static __thread const float * g_tls_swiglu_gate_data = NULL;
++static __thread size_t        g_tls_swiglu_gate_nb1  = 0;
++static __thread int           g_tls_swiglu_keep_128  = 0;
++
++static inline float ggml_swiglu_gate_mask_128(
++        const float * gate_col,
++        int64_t ir0_start,
++        int64_t ir0_end,
++        int keep_128,
++        uint8_t * keep_mask) {
++    const int n = (int)(ir0_end - ir0_start);
++    const int k_keep = (keep_128 * n) >> 7;
++    if (n <= 0 || n > 128 || k_keep <= 0 || k_keep >= n) {
++        if (n > 0 && n <= 128) memset(keep_mask, 1, n);
++        return 1.0f;
++    }
++    float s2[128];
++    float sorted_s2[128];
++    float orig_l2 = 0.0f;
++    const float * g = gate_col + ir0_start;
++    for (int i = 0; i < n; ++i) {
++        const float x = g[i];
++        const float silu = x / (1.0f + expf(-x));
++        const float v2 = silu * silu;
++        s2[i] = v2;
++        sorted_s2[i] = v2;
++        orig_l2 += v2;
++    }
++    const int target = n - k_keep;
++    int left = 0, right = n - 1;
++    while (left < right) {
++        const float pivot = sorted_s2[(left + right) >> 1];
++        int i = left, j = right;
++        while (i <= j) {
++            while (sorted_s2[i] < pivot) i++;
++            while (sorted_s2[j] > pivot) j--;
++            if (i <= j) {
++                const float t = sorted_s2[i];
++                sorted_s2[i] = sorted_s2[j];
++                sorted_s2[j] = t;
++                i++;
++                j--;
++            }
++        }
++        if (target <= j) right = j;
++        else if (target >= i) left = i;
++        else break;
++    }
++    const float thresh = sorted_s2[target];
++    float kept_l2 = 0.0f;
++    int kept_cnt = 0;
++    for (int i = 0; i < n; ++i) {
++        if (s2[i] > thresh) {
++            keep_mask[i] = 1;
++            kept_l2 += s2[i];
++            kept_cnt++;
++        } else {
++            keep_mask[i] = 0;
++        }
++    }
++    for (int i = 0; i < n && kept_cnt < k_keep; ++i) {
++        if (!keep_mask[i] && s2[i] >= thresh) {
++            keep_mask[i] = 1;
++            kept_l2 += s2[i];
++            kept_cnt++;
++        }
++    }
++    if (kept_l2 > 1e-20f && kept_l2 < orig_l2) {
++        return sqrtf(orig_l2 / kept_l2);
++    }
++    return 1.0f;
++}
++
+ static void ggml_compute_forward_mul_mat_one_chunk(
+     const struct ggml_compute_params * params,
+     struct ggml_tensor * dst,
+@@ -1192,15 +1285,16 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+         return;
+     }
+ 
+-    const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
++    const void * wdata = (src1->type == vec_dot_type) ? src1->data : (g_tls_q8_wdata ? g_tls_q8_wdata : params->wdata);
+     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+ 
+     assert(ne12 % ne02 == 0);
+     assert(ne13 % ne03 == 0);
+ 
+-    // block-tiling attempt
++    // block-tiling: cap blck_1 at ne11 * r2 so 3D tensors (wo_a) do not jump across distinct 2MB matrices inside iir0
+     const int64_t blck_0 = 16;
+-    const int64_t blck_1 = 16;
++    const int64_t same_src0_cols = ne11 * r2;
++    const int64_t blck_1 = (same_src0_cols > 0 && same_src0_cols < 16) ? same_src0_cols : 16;
+ 
+     const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
+ 
+@@ -1208,6 +1302,18 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+     // 16 * 2, accounting for mmla kernels
+     float tmp[32];
+ 
++    uint8_t swiglu_keep_mask[128];
++    float   swiglu_alpha = 1.0f;
++    const bool use_swiglu_skip = (g_tls_swiglu_gate_data != NULL &&
++                                  g_tls_swiglu_keep_128 > 0 && g_tls_swiglu_keep_128 < 128 &&
++                                  num_rows_per_vec_dot == 1 &&
++                                  ir1_start == 0 && ir1_end == 1 &&
++                                  (ir0_end - ir0_start) <= 128);
++    if (use_swiglu_skip) {
++        swiglu_alpha = ggml_swiglu_gate_mask_128(
++            g_tls_swiglu_gate_data, ir0_start, ir0_end, g_tls_swiglu_keep_128, swiglu_keep_mask);
++    }
++
+     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += num_rows_per_vec_dot) {
+@@ -1240,6 +1346,15 @@ static void ggml_compute_forward_mul_mat_one_chunk(
+                 //}
+ 
+                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
++                    if (use_swiglu_skip) {
++                        if (!swiglu_keep_mask[ir0 - ir0_start]) {
++                            tmp[ir0 - iir0] = 0.0f;
++                            continue;
++                        }
++                        vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_row + ir0 * nb01, 0, src1_col, 0, 1);
++                        tmp[ir0 - iir0] *= swiglu_alpha;
++                        continue;
++                    }
+                     vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
+                 }
+ 
+@@ -1319,28 +1434,18 @@ void ggml_compute_forward_mul_mat(
+ UseGgmlGemm1:;
+ #endif
+ 
+-    if (src1->type != vec_dot_type) {
+-        char * wdata = params->wdata;
++    char * wdata_q8 = g_tls_q8_wdata ? (char *) g_tls_q8_wdata : (char *) params->wdata;
++    if (src1->type != vec_dot_type && !g_tls_q8_valid) {
++        char * wdata = wdata_q8;
+ 
+         const size_t nbw0 = ggml_type_size(vec_dot_type);
+         const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
+         const size_t nbw2 = nbw1*ne11;
+         const size_t nbw3 = nbw2*ne12;
+ 
+-        assert(params->wsize >= ne13*nbw3);
++        assert(g_tls_q8_wdata != NULL || params->wsize >= ne13*nbw3);
+         GGML_ASSERT(src1->type == GGML_TYPE_F32);
+ 
+-    #if 0
+-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
+-            for (int64_t i12 = 0; i12 < ne12; ++i12) {
+-                for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
+-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
+-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
+-                                ne10);
+-                }
+-            }
+-        }
+-    #else
+         for (int64_t i13 = 0; i13 < ne13; ++i13) {
+             for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                 for (int64_t i11 = 0; i11 < ne11; ++i11) {
+@@ -1353,19 +1458,20 @@ UseGgmlGemm1:;
+                 }
+             }
+         }
+-    #endif
+     }
+ 
+-    if (ith == 0) {
+-        // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
+-        atomic_store_explicit(&params->threadpool->current_chunk, nth, memory_order_relaxed);
+-    }
++    if (!g_tls_q8_valid || (ne1 * ne2 * ne3) > 1 || ((ne0 + 63) / 64) >= nth * 4) {
++        if (ith == 0) {
++            // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
++            atomic_store_explicit(&params->threadpool->current_chunk, nth, memory_order_relaxed);
++        }
+ 
+-    ggml_barrier(params->threadpool);
++        ggml_barrier(params->threadpool);
++    }
+ 
+ #if GGML_USE_LLAMAFILE
+     if (src1->type != vec_dot_type) {
+-        const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
++        const void* wdata = (src1->type == vec_dot_type) ? src1->data : wdata_q8;
+         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+ 
+         for (int64_t i13 = 0; i13 < ne13; i13++)
+@@ -1488,6 +1594,19 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
+ 
+     float tmp[16];
+ 
++    uint8_t swiglu_keep_mask[128];
++    float   swiglu_alpha = 1.0f;
++    const bool use_swiglu_skip = (g_tls_swiglu_gate_data != NULL &&
++                                  g_tls_swiglu_keep_128 > 0 && g_tls_swiglu_keep_128 < 128 &&
++                                  ir1_start == 0 && ir1_end == 1 && ids->ne[1] == 1 &&
++                                  (ir0_end - ir0_start) <= 128);
++    if (use_swiglu_skip) {
++        const int id0 = MMID_MATRIX_ROW(cur_a, 0).i1;
++        const float * gate_col = (const float *)((const char *)g_tls_swiglu_gate_data + id0 * g_tls_swiglu_gate_nb1);
++        swiglu_alpha = ggml_swiglu_gate_mask_128(
++            gate_col, ir0_start, ir0_end, g_tls_swiglu_keep_128, swiglu_keep_mask);
++    }
++
+     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
+         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ++ir1) {
+@@ -1514,6 +1633,15 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
+                 float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2));
+ 
+                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
++                    if (use_swiglu_skip) {
++                        if (!swiglu_keep_mask[ir0 - ir0_start]) {
++                            tmp[ir0 - iir0] = 0.0f;
++                            continue;
++                        }
++                        vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
++                        tmp[ir0 - iir0] *= swiglu_alpha;
++                        continue;
++                    }
+                     vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
+                 }
+ 
+@@ -1582,28 +1710,18 @@ static void ggml_compute_forward_mul_mat_id(
+ 
+     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
+ 
+-    if (src1->type != vec_dot_type) {
+-        char * wdata = params->wdata;
++    char * wdata_q8 = g_tls_q8_wdata ? (char *) g_tls_q8_wdata : (char *) params->wdata;
++    if (src1->type != vec_dot_type && !g_tls_q8_valid) {
++        char * wdata = wdata_q8;
+ 
+         const size_t nbw0 = ggml_type_size(vec_dot_type);
+         const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
+         const size_t nbw2 = nbw1*ne11;
+         const size_t nbw3 = nbw2*ne12;
+ 
+-        assert(params->wsize >= ne13*nbw3);
++        assert(g_tls_q8_wdata != NULL || params->wsize >= ne13*nbw3);
+         GGML_ASSERT(src1->type == GGML_TYPE_F32);
+ 
+-#if 0
+-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
+-            for (int64_t i12 = ith; i12 < ne12; i12 += nth) {
+-                for (int64_t i11 = 0; i11 < ne11; ++i11) {
+-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
+-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
+-                               ne10);
+-                }
+-            }
+-        }
+-#else
+         for (int64_t i13 = 0; i13 < ne13; ++i13) {
+             for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                 for (int64_t i11 = 0; i11 < ne11; ++i11) {
+@@ -1616,16 +1734,18 @@ static void ggml_compute_forward_mul_mat_id(
+                 }
+             }
+         }
+-#endif
+     }
+ 
+-    if (ith == 0) {
++    if (!g_tls_mmid_ids_valid && ith == 0) {
+         // initialize matrix_row_counts
+         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
+ 
+         // group rows by src0 matrix
+         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+             for (int id = 0; id < n_ids; ++id) {
++                if (ids->ne[1] == 1 && (g_tls_moe_skip_mask & (1 << id))) {
++                    continue;
++                }
+                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+ 
+                 assert(i02 >= 0 && i02 < n_as);
+@@ -1636,14 +1756,25 @@ static void ggml_compute_forward_mul_mat_id(
+         }
+     }
+ 
+-    // reset current_chunk
+-    for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
+-        atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
+-        *current_chunk_ctr = nth;
++    if (ids->ne[1] > 1 || ((ne01 + 63) / 64) >= nth * 4) {
++        // reset current_chunk
++        for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
++            atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
++            *current_chunk_ctr = nth;
++        }
+     }
+ 
+-    ggml_barrier(params->threadpool);
++    if (!g_tls_q8_valid || !g_tls_mmid_ids_valid || ids->ne[1] > 1 || ((ne01 + 63) / 64) >= nth * 4) {
++        ggml_barrier(params->threadpool);
++    }
+ 
++    if (ith == 0 && ids->ne[1] == 1 && g_tls_moe_skip_mask != 0) {
++        for (int id = 0; id < n_ids; ++id) {
++            if (g_tls_moe_skip_mask & (1 << id)) {
++                memset((char *) dst->data + id*nb1, 0, sizeof(float)*ne0);
++            }
++        }
++    }
+     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+         const int64_t cne1 = matrix_row_counts[cur_a];
+ 
+@@ -1652,7 +1783,7 @@ static void ggml_compute_forward_mul_mat_id(
+         }
+ 
+         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+-        const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
++        const void * wdata = (src1->type == vec_dot_type) ? src1->data : wdata_q8;
+         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+ 
+         const int64_t nr0 = ne01;
+@@ -2257,6 +2388,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_SOLVE_TRI:
+         case GGML_OP_GATED_DELTA_NET:
+         case GGML_OP_DSV4_HC_COMB:
++            {
++                n_tasks = (node->ne[2] >= 4) ? n_threads : 1;
++            } break;
+         case GGML_OP_DSV4_HC_PRE:
+         case GGML_OP_DSV4_HC_POST:
+             {
+@@ -3057,6 +3191,66 @@ static int ggml_cpu_try_fuse_ops(
+     return 0;
+ }
+ 
++static thread_ret_t ggml_graph_compute_thread_range(struct ggml_compute_state * state, int node_start, int node_end) {
++    struct ggml_threadpool    * tp    = state->threadpool;
++
++    const struct ggml_cgraph * cgraph = tp->cgraph;
++    const struct ggml_cplan  * cplan  = tp->cplan;
++
++#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
++    ggml_backend_cpu_riscv64_spacemit_set_numa_thread_affinity(state->ith);
++#else
++    set_numa_thread_affinity(state->ith);
++#endif
++
++    struct ggml_compute_params params = {
++        /*.ith        =*/ state->ith,
++        /*.nth        =*/ atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK,
++        /*.wsize      =*/ cplan->work_size,
++        /*.wdata      =*/ cplan->work_data,
++        /*.threadpool =*/ tp,
++        /*.use_ref    =*/ cplan->use_ref,
++    };
++
++    for (int node_n = node_start; node_n < node_end && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
++        struct ggml_tensor * node = cgraph->nodes[node_n];
++
++        if (ggml_op_is_empty(node->op)) {
++            // skip NOPs
++            continue;
++        }
++
++        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
++            continue;
++        }
++
++        const int n_fused = (node_n + 1 < node_end) ? ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan) : 0;
++        if (n_fused > 0) {
++            node_n += n_fused;
++        } else {
++            ggml_compute_forward(&params, node);
++        }
++
++        if (state->ith == 0 && cplan->abort_callback &&
++                cplan->abort_callback(cplan->abort_callback_data)) {
++            atomic_store_explicit(&tp->abort, node_n + 1, memory_order_relaxed);
++            tp->ec    = GGML_STATUS_ABORTED;
++        }
++
++        if (node_n + 1 < node_end) {
++            ggml_barrier(state->threadpool);
++        }
++    }
++
++    ggml_barrier(state->threadpool);
++
++#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
++    ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);
++#endif
++
++    return 0;
++}
++
+ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+     struct ggml_threadpool    * tp    = state->threadpool;
+@@ -3085,11 +3279,112 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
+ #endif
+ 
++    static int s_prof_ops = -1;
++    if (s_prof_ops == -1) {
++        const char * e = getenv("LLAMA_PROFILE_OPS");
++        s_prof_ops = (e && atoi(e) > 0) ? atoi(e) : 0;
++    }
++    static int64_t prof_us[GGML_OP_COUNT][GGML_TYPE_COUNT];
++    static int32_t prof_cnt[GGML_OP_COUNT][GGML_TYPE_COUNT];
++    static int s_graph_idx = 0;
++    static int64_t s_prev_end = 0;
++    int64_t t_gstart = 0;
++    const bool do_prof = (s_prof_ops > 0 && state->ith == 0 && cgraph->n_nodes > 500);
++    if (do_prof) {
++        t_gstart = ggml_time_us();
++        memset(prof_us, 0, sizeof(prof_us));
++        memset(prof_cnt, 0, sizeof(prof_cnt));
++    }
++
++    struct {
++        uintptr_t src1_data;
++        uintptr_t base_start;
++        uintptr_t base_end;
++        enum ggml_type vec_dot_type;
++        int64_t ne[4];
++        size_t nb[4];
++    } q8_cache[GGML_Q8_CACHE_SLOTS];
++    memset(q8_cache, 0, sizeof(q8_cache));
++    int q8_next_slot = 0;
++    uintptr_t last_mmid_ids_data = 0;
++    uintptr_t last_mmid_ids_base_start = 0;
++    uintptr_t last_mmid_ids_base_end = 0;
++    int64_t last_mmid_ne0 = 0, last_mmid_ne1 = 0, last_mmid_nas = 0;
++    static atomic_int s_shared_moe_skip_mask = 0;
++    static atomic_int s_moe_topk = -1;
++    static float s_moe_min_w = 0.0f;
++    static volatile int32_t * s_moe_cfg_mmap = NULL;
++    if (state->ith == 0) {
++        atomic_store_explicit(&s_shared_moe_skip_mask, 0, memory_order_release);
++        if (atomic_load_explicit(&s_moe_topk, memory_order_relaxed) == -1) {
++            const char * et = getenv("DSV4_MOE_TOPK");
++            const int tk = (et && atoi(et) > 0) ? atoi(et) : 6;
++            const char * ew = getenv("DSV4_MOE_MIN_W");
++            s_moe_min_w = (ew && atof(ew) > 0.0) ? (float)atof(ew) : 0.0f;
++            int32_t init_cfg[8] = {tk, tk, (int32_t)(s_moe_min_w * 10000.0f), 3, 43, 1, 0, 0};
++#ifdef _WIN32
++            char cfg_path[MAX_PATH];
++            DWORD tlen = GetTempPathA(MAX_PATH, cfg_path);
++            if (tlen > 0 && tlen < MAX_PATH - 24) {
++                strcat(cfg_path, "dsv4_moe_cfg.bin");
++                HANDLE hFile = CreateFileA(cfg_path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
++                if (hFile != INVALID_HANDLE_VALUE) {
++                    if (GetFileSize(hFile, NULL) < 32) {
++                        DWORD written = 0;
++                        WriteFile(hFile, init_cfg, sizeof(init_cfg), &written, NULL);
++                    }
++                    HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_READWRITE, 0, 32, NULL);
++                    if (hMap != NULL) {
++                        void * mp = MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, 32);
++                        if (mp != NULL) {
++                            s_moe_cfg_mmap = (volatile int32_t *) mp;
++                        }
++                        CloseHandle(hMap);
++                    }
++                    CloseHandle(hFile);
++                }
++            }
++#else
++            const char * custom_cfg = getenv("DSV4_MOE_CFG_PATH");
++            const char * cfg_path = (custom_cfg && custom_cfg[0]) ? custom_cfg : "/tmp/dsv4_moe_cfg.bin";
++            int open_flags = O_RDWR | O_CREAT;
++#ifdef O_NOFOLLOW
++            open_flags |= O_NOFOLLOW;
++#endif
++            int fd = open(cfg_path, open_flags, 0666);
++            if (fd >= 0) {
++                (void) fchmod(fd, 0666);
++                if (lseek(fd, 0, SEEK_END) < 32) {
++                    if (write(fd, init_cfg, sizeof(init_cfg)) != sizeof(init_cfg)) {}
++                }
++                void * mp = mmap(NULL, 32, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++                if (mp != MAP_FAILED) {
++                    s_moe_cfg_mmap = (volatile int32_t *) mp;
++                }
++                close(fd);
++            } else {
++                fd = open(cfg_path, O_RDONLY);
++                if (fd >= 0) {
++                    void * mp = mmap(NULL, 32, PROT_READ, MAP_SHARED, fd, 0);
++                    if (mp != MAP_FAILED) {
++                        s_moe_cfg_mmap = (volatile int32_t *) mp;
++                    }
++                    close(fd);
++                }
++            }
++#endif
++            atomic_store_explicit(&s_moe_topk, tk, memory_order_release);
++        }
++    }
++    size_t last_mmid_q8_off = 0;
++
++    extern int ggml_dsv4_skip_csa_comp;
++    const int skip_csa_comp = ggml_dsv4_skip_csa_comp;
+     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
+         struct ggml_tensor * node = cgraph->nodes[node_n];
+ 
+-        if (ggml_op_is_empty(node->op)) {
+-            // skip NOPs
++        if (ggml_op_is_empty(node->op) || (skip_csa_comp && (node->flags & 0x100))) {
++            // skip NOPs or dynamically skipped dummy CSA/LID compression node
+             continue;
+         }
+ 
+@@ -3097,13 +3392,161 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+             continue;
+         }
+ 
++        const int orig_op = node->op;
++        const int orig_t0 = node->src[0] ? node->src[0]->type : 0;
++        const int64_t t_start = do_prof ? ggml_time_us() : 0;
++
+         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
+         // Try fused ops, fall back to normal compute
+         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+         if (n_fused > 0) {
++            for (int fn = 0; fn <= n_fused; ++fn) {
++                struct ggml_tensor * fnode = cgraph->nodes[node_n + fn];
++                struct ggml_tensor * wbase = fnode->view_src ? fnode->view_src : fnode;
++                const uintptr_t ws = (uintptr_t) wbase->data;
++                const uintptr_t we = ws + ggml_nbytes(wbase);
++                for (int s = 0; s < GGML_Q8_CACHE_SLOTS; ++s) {
++                    if (q8_cache[s].src1_data && ws < q8_cache[s].base_end && q8_cache[s].base_start < we) {
++                        q8_cache[s].src1_data = 0;
++                    }
++                }
++            }
++            last_mmid_ids_data = 0;
+             node_n += n_fused;
+         } else {
++            g_tls_q8_wdata = NULL;
++            g_tls_q8_valid = false;
++            g_tls_mmid_ids_valid = false;
++            g_tls_moe_skip_mask = 0;
++
++            if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && !params.use_ref) {
++                const struct ggml_tensor * src0 = node->src[0];
++                const struct ggml_tensor * src1 = node->src[1];
++                const int32_t hint = (node->op == GGML_OP_MUL_MAT) ? ggml_get_op_params_i32(node, 1) : 0;
++                if (hint != GGML_HINT_SRC0_IS_HADAMARD) {
++                    const enum ggml_type vdt = type_traits_cpu[src0->type].vec_dot_type;
++                    if (src1->type == GGML_TYPE_F32 && src1->type != vdt) {
++                        const size_t q_bytes = ggml_row_size(vdt, ggml_nelements(src1));
++                        if (q_bytes <= GGML_Q8_CACHE_SIZE) {
++                            int hit = -1;
++                            for (int s = 0; s < GGML_Q8_CACHE_SLOTS; ++s) {
++                                if (q8_cache[s].src1_data == (uintptr_t) src1->data &&
++                                    q8_cache[s].vec_dot_type == vdt &&
++                                    q8_cache[s].ne[0] == src1->ne[0] && q8_cache[s].ne[1] == src1->ne[1] &&
++                                    q8_cache[s].ne[2] == src1->ne[2] && q8_cache[s].ne[3] == src1->ne[3] &&
++                                    q8_cache[s].nb[1] == src1->nb[1] && q8_cache[s].nb[2] == src1->nb[2] &&
++                                    q8_cache[s].nb[3] == src1->nb[3]) {
++                                    hit = s;
++                                    break;
++                                }
++                            }
++                            if (hit >= 0) {
++                                g_tls_q8_wdata = s_q8_cache_buf[hit];
++                                g_tls_q8_valid = true;
++                            } else {
++                                const int s = (q8_next_slot++) & (GGML_Q8_CACHE_SLOTS - 1);
++                                const struct ggml_tensor * s1_base = src1->view_src ? src1->view_src : src1;
++                                q8_cache[s].src1_data = (uintptr_t) src1->data;
++                                q8_cache[s].base_start = (uintptr_t) s1_base->data;
++                                q8_cache[s].base_end = q8_cache[s].base_start + ggml_nbytes(s1_base);
++                                q8_cache[s].vec_dot_type = vdt;
++                                for (int d = 0; d < 4; ++d) {
++                                    q8_cache[s].ne[d] = src1->ne[d];
++                                    q8_cache[s].nb[d] = src1->nb[d];
++                                }
++                                g_tls_q8_wdata = s_q8_cache_buf[s];
++                                g_tls_q8_valid = false;
++                            }
++                        }
++                    }
++                    if (node->op == GGML_OP_MUL_MAT_ID) {
++                        g_tls_moe_skip_mask = atomic_load_explicit(&s_shared_moe_skip_mask, memory_order_acquire);
++                        const struct ggml_tensor * ids = node->src[2];
++                        const size_t q8_off = (src1->type != vdt) ? ggml_row_size(vdt, ggml_nelements(src1)) : 0;
++                        if (last_mmid_ids_data == (uintptr_t) ids->data &&
++                            last_mmid_ne0 == ids->ne[0] && last_mmid_ne1 == ids->ne[1] &&
++                            last_mmid_nas == src0->ne[2] && last_mmid_q8_off == q8_off) {
++                            g_tls_mmid_ids_valid = true;
++                        } else {
++                            const struct ggml_tensor * ids_base = ids->view_src ? ids->view_src : ids;
++                            last_mmid_ids_data = (uintptr_t) ids->data;
++                            last_mmid_ids_base_start = (uintptr_t) ids_base->data;
++                            last_mmid_ids_base_end = last_mmid_ids_base_start + ggml_nbytes(ids_base);
++                            last_mmid_ne0 = ids->ne[0];
++                            last_mmid_ne1 = ids->ne[1];
++                            last_mmid_nas = src0->ne[2];
++                            last_mmid_q8_off = q8_off;
++                        }
++                    } else if (g_tls_q8_wdata == NULL) {
++                        last_mmid_ids_data = 0;
++                    }
++                } else {
++                    last_mmid_ids_data = 0;
++                }
++            } else {
++                last_mmid_ids_data = 0;
++            }
++
++            g_tls_swiglu_gate_data = NULL;
++            g_tls_swiglu_keep_128  = 0;
++            if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) &&
++                !params.use_ref && s_moe_cfg_mmap != NULL &&
++                node->ne[2] == 1 && node->ne[3] == 1) {
++                const int keep_128 = (node->op == GGML_OP_MUL_MAT_ID) ? s_moe_cfg_mmap[6] : s_moe_cfg_mmap[7];
++                int sw_il = 3;
++                const char * sw_dash = strrchr(node->name, '-');
++                if (sw_dash) {
++                    sw_il = atoi(sw_dash + 1);
++                }
++                const int sw_start = s_moe_cfg_mmap[3];
++                const int sw_end   = s_moe_cfg_mmap[4];
++                if (keep_128 > 0 && keep_128 < 128 && sw_il >= sw_start && sw_il < sw_end) {
++                    const struct ggml_tensor * glu_node = NULL;
++                    if (node_n + 1 < cgraph->n_nodes &&
++                        cgraph->nodes[node_n + 1]->op == GGML_OP_GLU &&
++                        cgraph->nodes[node_n + 1]->src[1] == node) {
++                        glu_node = cgraph->nodes[node_n + 1];
++                    } else if (node_n + 2 < cgraph->n_nodes &&
++                               cgraph->nodes[node_n + 1]->op == GGML_OP_CLAMP &&
++                               cgraph->nodes[node_n + 1]->src[0] == node &&
++                               cgraph->nodes[node_n + 2]->op == GGML_OP_GLU &&
++                               cgraph->nodes[node_n + 2]->src[1] == cgraph->nodes[node_n + 1]) {
++                        glu_node = cgraph->nodes[node_n + 2];
++                    }
++                    if (glu_node != NULL && ggml_get_glu_op(glu_node) == GGML_GLU_OP_SWIGLU) {
++                        const struct ggml_tensor * gate_node = glu_node->src[0];
++                        if (gate_node != NULL && gate_node->data != NULL &&
++                            gate_node->type == GGML_TYPE_F32 &&
++                            gate_node->ne[0] == node->ne[0] && gate_node->ne[1] == node->ne[1] &&
++                            gate_node->ne[2] == 1 && gate_node->ne[3] == 1) {
++                            g_tls_swiglu_gate_data = (const float *) gate_node->data;
++                            g_tls_swiglu_gate_nb1  = gate_node->nb[1];
++                            g_tls_swiglu_keep_128  = keep_128;
++                        }
++                    }
++                }
++            }
++
+             ggml_compute_forward(&params, node);
++
++            g_tls_q8_wdata = NULL;
++            g_tls_q8_valid = false;
++            g_tls_mmid_ids_valid = false;
++            g_tls_moe_skip_mask = 0;
++            g_tls_swiglu_gate_data = NULL;
++            g_tls_swiglu_keep_128 = 0;
++
++            struct ggml_tensor * wbase = node->view_src ? node->view_src : node;
++            const uintptr_t ws = (uintptr_t) wbase->data;
++            const uintptr_t we = ws + ggml_nbytes(wbase);
++            for (int s = 0; s < GGML_Q8_CACHE_SLOTS; ++s) {
++                if (q8_cache[s].src1_data && ws < q8_cache[s].base_end && q8_cache[s].base_start < we) {
++                    q8_cache[s].src1_data = 0;
++                }
++            }
++            if (last_mmid_ids_data && ws < last_mmid_ids_base_end && last_mmid_ids_base_start < we) {
++                last_mmid_ids_data = 0;
++            }
+         }
+ 
+         if (state->ith == 0 && cplan->abort_callback &&
+@@ -3115,6 +3558,106 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+         if (node_n + 1 < cgraph->n_nodes) {
+             ggml_barrier(state->threadpool);
+         }
++        if (node->op == GGML_OP_SCALE && node->ne[0] == 1 && node->ne[1] == 6) {
++            if (state->ith == 0) {
++                if (node->ne[2] == 1) {
++                    int il = -1;
++                    const char * dash = strrchr(node->name, '-');
++                    if (dash) {
++                        il = atoi(dash + 1);
++                    }
++                    float * mw = (float *) node->data;
++                    int order[6] = {0, 1, 2, 3, 4, 5};
++                    for (int a = 0; a < 5; ++a) {
++                        for (int b = a + 1; b < 6; ++b) {
++                            if (mw[order[b]] > mw[order[a]]) {
++                                int tmp = order[a]; order[a] = order[b]; order[b] = tmp;
++                            }
++                        }
++                    }
++                    const int def_tk         = atomic_load_explicit(&s_moe_topk, memory_order_acquire);
++                    const int cfg_topk_early = s_moe_cfg_mmap ? s_moe_cfg_mmap[0] : def_tk;
++                    const int cfg_topk_mid   = s_moe_cfg_mmap ? s_moe_cfg_mmap[1] : def_tk;
++                    const float cfg_min_w    = s_moe_cfg_mmap ? (s_moe_cfg_mmap[2] * 0.0001f) : s_moe_min_w;
++                    const int cfg_mid_start  = s_moe_cfg_mmap ? s_moe_cfg_mmap[3] : 3;
++                    const int cfg_mid_end    = s_moe_cfg_mmap ? s_moe_cfg_mmap[4] : 43;
++                    int cur_topk             = (il >= cfg_mid_start && il < cfg_mid_end) ? cfg_topk_mid : cfg_topk_early;
++                    if (cur_topk < 1) cur_topk = 1;
++                    const int cfg_scale_mode = s_moe_cfg_mmap ? s_moe_cfg_mmap[5] : 1;
++                    if (il >= 3 && (cur_topk < 6 || cfg_min_w > 0.0f)) {
++                        float orig_sum = 0.0f;
++                        float orig_l2  = 0.0f;
++                        for (int k = 0; k < 6; ++k) {
++                            orig_sum += mw[k];
++                            orig_l2  += mw[k] * mw[k];
++                        }
++                        float kept_sum = 0.0f;
++                        float kept_l2  = 0.0f;
++                        int skip_mask = 0;
++                        for (int r = 0; r < 6; ++r) {
++                            int idx = order[r];
++                            if (r >= cur_topk || (r > 0 && mw[idx] < cfg_min_w)) {
++                                mw[idx] = 0.0f;
++                                skip_mask |= (1 << idx);
++                            } else {
++                                kept_sum += mw[idx];
++                                kept_l2  += mw[idx] * mw[idx];
++                            }
++                        }
++                        if (cfg_scale_mode == 1 && kept_l2 > 0.0f && kept_l2 < orig_l2) {
++                            const float rescale = sqrtf(orig_l2 / kept_l2);
++                            for (int k = 0; k < 6; ++k) {
++                                mw[k] *= rescale;
++                            }
++                        } else if (cfg_scale_mode == 2 && kept_sum > 0.0f && kept_sum < orig_sum) {
++                            const float rescale = orig_sum / kept_sum;
++                            for (int k = 0; k < 6; ++k) {
++                                mw[k] *= rescale;
++                            }
++                        }
++                        atomic_store_explicit(&s_shared_moe_skip_mask, skip_mask, memory_order_release);
++                    } else {
++                        atomic_store_explicit(&s_shared_moe_skip_mask, 0, memory_order_release);
++                    }
++                } else {
++                    atomic_store_explicit(&s_shared_moe_skip_mask, 0, memory_order_release);
++                }
++            }
++            ggml_barrier(state->threadpool);
++        }
++        if (do_prof) {
++            const int64_t dt = ggml_time_us() - t_start;
++            if (orig_op >= 0 && orig_op < GGML_OP_COUNT && orig_t0 >= 0 && orig_t0 < GGML_TYPE_COUNT) {
++                prof_us[orig_op][orig_t0] += dt;
++                prof_cnt[orig_op][orig_t0] += 1;
++            }
++        }
++    }
++    if (do_prof) {
++        const int64_t t_gend = ggml_time_us();
++        const double g_ms = (t_gend - t_gstart) / 1000.0;
++        const double gap_ms = s_prev_end > 0 ? (t_gstart - s_prev_end) / 1000.0 : 0.0;
++        s_prev_end = t_gend;
++        s_graph_idx++;
++        if (s_graph_idx >= 45 && s_graph_idx <= 55) {
++            fprintf(stderr, "[GRAPH #%d] wall=%.2f ms, gap=%.2f ms, skip_csa=%d, n_nodes=%d\n", s_graph_idx, g_ms, gap_ms, skip_csa_comp, cgraph->n_nodes);
++        }
++        if (s_graph_idx == s_prof_ops || s_graph_idx == s_prof_ops + 1) {
++            int64_t tot_us = 0;
++            fprintf(stderr, "\n=== [LLAMA_PROFILE_OPS] Graph #%d (n_nodes=%d, nth=%d) ===\n", s_graph_idx, cgraph->n_nodes, params.nth);
++            for (int o = 0; o < GGML_OP_COUNT; o++) {
++                for (int t = 0; t < GGML_TYPE_COUNT; t++) {
++                    if (prof_cnt[o][t] > 0) {
++                        tot_us += prof_us[o][t];
++                        fprintf(stderr, "  %-24s | %-10s | calls=%4d | %8.2f ms\n",
++                                ggml_op_name((enum ggml_op)o), ggml_type_name((enum ggml_type)t),
++                                prof_cnt[o][t], prof_us[o][t] / 1000.0);
++                    }
++                }
++            }
++            fprintf(stderr, "  TOTAL GRAPH TIME: %.2f ms (%.2f tok/s)\n===================================================\n",
++                    tot_us / 1000.0, 1000000.0 / (tot_us > 0 ? tot_us : 1));
++        }
+     }
+ 
+ #ifdef GGML_USE_OPENMP
+@@ -3284,6 +3827,8 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
+         threadpool->n_barrier        = 0;
+         threadpool->n_barrier_passed = 0;
+         threadpool->current_chunk    = 0;
++        threadpool->ccd_phase        = 0;
++        threadpool->dual_ccd_active  = false;
+         threadpool->stop             = false;
+         threadpool->pause            = tpp->paused;
+         threadpool->abort            = -1;
+@@ -3376,7 +3921,113 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+     }
+ 
+ #ifdef GGML_USE_OPENMP
+-    if (n_threads > 1) {
++    static int s_dual_ccd_split_layer = -2;
++    if (s_dual_ccd_split_layer == -2) {
++        const char * env_split = getenv("LLAMA_DUAL_CCD_SPLIT");
++        s_dual_ccd_split_layer = (env_split && atoi(env_split) > 0) ? atoi(env_split) : -1;
++        if (s_dual_ccd_split_layer > 0) {
++            fprintf(stderr, "[GGML-DUAL-CCD] Vertical Layer Partitioning ACTIVE: Layers 0..%d -> CCD0 (32MB L3), Layers %d..N -> CCD1 (32MB L3)\n",
++                    s_dual_ccd_split_layer - 1, s_dual_ccd_split_layer);
++        }
++    }
++
++    if (s_dual_ccd_split_layer > 0 && n_threads > 1) {
++        int split_node = -1;
++        if (cgraph->n_nodes > 64) {
++            char target_nemotron[64];
++            char target_std[64];
++            snprintf(target_nemotron, sizeof(target_nemotron), "nemotron_h_block_out-%d", s_dual_ccd_split_layer - 1);
++            snprintf(target_std,      sizeof(target_std),      "l_out-%d",                s_dual_ccd_split_layer - 1);
++            for (int i = 0; i < cgraph->n_nodes; i++) {
++                const char * tname = cgraph->nodes[i]->name;
++                if (strcmp(tname, target_nemotron) == 0 || strcmp(tname, target_std) == 0) {
++                    split_node = i + 1;
++                    break;
++                }
++            }
++        }
++
++        threadpool->dual_ccd_active = true;
++        atomic_store_explicit(&threadpool->n_graph, n_threads, memory_order_relaxed);
++        atomic_store_explicit(&threadpool->n_barrier, 0, memory_order_relaxed);
++        atomic_store_explicit(&threadpool->n_barrier_passed, 0, memory_order_relaxed);
++        atomic_store_explicit(&threadpool->current_chunk, 0, memory_order_relaxed);
++        atomic_store_explicit(&threadpool->ccd_phase, 0, memory_order_relaxed);
++
++        #pragma omp parallel num_threads(n_threads * 2)
++        {
++            int omp_id = omp_get_thread_num();
++
++            static const int ccd0_cpus[16] = {0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23};
++            static const int ccd1_cpus[16] = {8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31};
++            static __thread int tls_pinned_cpu = -1;
++            int target_cpu = (omp_id < n_threads)
++                ? ccd0_cpus[omp_id % 16]
++                : ccd1_cpus[(omp_id - n_threads) % 16];
++            if (tls_pinned_cpu != target_cpu) {
++                cpu_set_t cpuset;
++                CPU_ZERO(&cpuset);
++                CPU_SET(target_cpu, &cpuset);
++                if (pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) == 0) {
++                    tls_pinned_cpu = target_cpu;
++                }
++            }
++
++            if (split_node > 0 && split_node < cgraph->n_nodes) {
++                if (omp_id < n_threads) {
++                    struct ggml_compute_state local_state;
++                    memset(&local_state, 0, sizeof(local_state));
++                    local_state.threadpool = threadpool;
++                    local_state.ith        = omp_id;
++                    ggml_graph_compute_thread_range(&local_state, 0, split_node);
++
++                    if (omp_id == 0) {
++                        atomic_store_explicit(&threadpool->current_chunk, 0, memory_order_relaxed);
++                        atomic_store_explicit(&threadpool->ccd_phase, 1, memory_order_seq_cst);
++                    }
++
++                    while (atomic_load_explicit(&threadpool->ccd_phase, memory_order_acquire) < 2) {
++                        ggml_thread_cpu_relax();
++                    }
++                } else if (omp_id < n_threads * 2) {
++                    while (atomic_load_explicit(&threadpool->ccd_phase, memory_order_acquire) < 1) {
++                        ggml_thread_cpu_relax();
++                    }
++
++                    if (atomic_load_explicit(&threadpool->abort, memory_order_relaxed) < 0) {
++                        struct ggml_compute_state local_state;
++                        memset(&local_state, 0, sizeof(local_state));
++                        local_state.threadpool = threadpool;
++                        local_state.ith        = omp_id - n_threads;
++                        ggml_graph_compute_thread_range(&local_state, split_node, cgraph->n_nodes);
++                    }
++
++                    if (omp_id == n_threads) {
++                        atomic_store_explicit(&threadpool->ccd_phase, 2, memory_order_seq_cst);
++                    }
++                }
++            } else {
++                if (omp_id < n_threads) {
++                    struct ggml_compute_state local_state;
++                    memset(&local_state, 0, sizeof(local_state));
++                    local_state.threadpool = threadpool;
++                    local_state.ith        = omp_id;
++                    ggml_graph_compute_thread_range(&local_state, 0, cgraph->n_nodes);
++
++                    if (omp_id == 0) {
++                        atomic_store_explicit(&threadpool->ccd_phase, 2, memory_order_seq_cst);
++                    }
++                } else {
++                    while (atomic_load_explicit(&threadpool->ccd_phase, memory_order_acquire) < 2) {
++                        ggml_thread_cpu_relax();
++                    }
++                }
++            }
++        }
++        threadpool->dual_ccd_active = false;
++    } else if (n_threads > 1) {
++        atomic_store_explicit(&threadpool->n_barrier, 0, memory_order_relaxed);
++        atomic_store_explicit(&threadpool->n_barrier_passed, 0, memory_order_relaxed);
+         #pragma omp parallel num_threads(n_threads)
+         {
+             #pragma omp single
+@@ -3392,6 +4043,16 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+             ggml_thread_apply_priority(threadpool->prio);
+             if (ggml_thread_cpumask_is_valid(threadpool->workers[ith].cpumask)) {
+                 ggml_thread_apply_affinity(threadpool->workers[ith].cpumask);
++            } else if (n_threads == 16 || n_threads == 32) {
++                static __thread int tls_std_pinned_cpu = -1;
++                if (tls_std_pinned_cpu != ith) {
++                    cpu_set_t cpuset;
++                    CPU_ZERO(&cpuset);
++                    CPU_SET(ith, &cpuset);
++                    if (pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) == 0) {
++                        tls_std_pinned_cpu = ith;
++                    }
++                }
+             }
+             ggml_graph_compute_thread(&threadpool->workers[ith]);
+         }
+@@ -3893,3 +4554,5 @@ void ggml_cpu_init(void) {
+ 
+     ggml_critical_section_end();
+ }
++
++int ggml_dsv4_skip_csa_comp = 0;
+diff --git a/ggml/src/ggml-cpu/quants.c b/ggml/src/ggml-cpu/quants.c
+index 5e36459..e41027d 100644
+--- a/ggml/src/ggml-cpu/quants.c
++++ b/ggml/src/ggml-cpu/quants.c
+@@ -188,38 +188,154 @@ void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
+     const block_q2_0 * GGML_RESTRICT x = vx;
+     const block_q8_0 * GGML_RESTRICT y = vy;
+ 
++#if defined(__AVX512F__) && defined(__AVX512BW__)
++    const __m512i m3_512 = _mm512_set1_epi8(0x03);
++    const __m512i m4_512 = _mm512_set1_epi8(0x04);
++    const __m512i zero512 = _mm512_setzero_si512();
++    const __m512i lut_abs512 = _mm512_set4_epi32(0x0e080401, 0x0104080e, 0x0e080401, 0x0104080e);
++    const __m512i shuf_mult512 = _mm512_setr_epi32(
++        0x80008000, 0x80008000, 0x80018001, 0x80018001,
++        0x80028002, 0x80028002, 0x80038003, 0x80038003,
++        0x80048004, 0x80048004, 0x80058005, 0x80058005,
++        0x80068006, 0x80068006, 0x80078007, 0x80078007
++    );
++    const __m512i shift_qs = _mm512_setr_epi32(0, 0, 0, 0, 2, 2, 2, 2, 4, 4, 4, 4, 6, 6, 6, 6);
++    const __m512i ror_qh   = _mm512_setr_epi64(62, 63, 0, 1, 2, 3, 4, 5);
++
++    __m512 acc512 = _mm512_setzero_ps();
++
++    for (int i = 0; i < nb; i++) {
++        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
++        const __m512 vd = _mm512_mask_broadcastss_ps(
++            _mm512_set1_ps(d0 * GGML_CPU_FP16_TO_FP32(y[2 * i + 0].d)), 0xFF00,
++            _mm_set_ss(d0 * GGML_CPU_FP16_TO_FP32(y[2 * i + 1].d)));
++
++        uint32_t sc_raw;
++        memcpy(&sc_raw, x[i].scales, sizeof(sc_raw));
++        const uint64_t m_all = ((uint64_t)((sc_raw & 0x0F0F0F0FU) + 0x04040404U)) |
++                               (((uint64_t)(((sc_raw >> 4) & 0x0F0F0F0FU) + 0x04040404U)) << 32);
++        const __m512i vmult = _mm512_shuffle_epi8(_mm512_set1_epi64((int64_t)m_all), shuf_mult512);
++
++        uint64_t qh64;
++        memcpy(&qh64, x[i].qh, sizeof(qh64));
++        const __m512i qs512 = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *)x[i].qs));
++        const __m512i qs_sh = _mm512_and_si512(_mm512_srlv_epi32(qs512, shift_qs), m3_512);
++        const __m512i qh_sh = _mm512_and_si512(_mm512_rorv_epi64(_mm512_set1_epi64((int64_t)qh64), ror_qh), m4_512);
++        const __m512i idx   = _mm512_or_si512(qs_sh, qh_sh);
++        const __m512i q_abs = _mm512_shuffle_epi8(lut_abs512, idx);
++        const __mmask64 neg_mask = _mm512_testn_epi8_mask(qh_sh, m4_512);
++
++        const __m512i q8_all = _mm512_inserti64x4(
++            _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *)y[2 * i + 0].qs)),
++            _mm256_loadu_si256((const __m256i *)y[2 * i + 1].qs), 1);
++
++        const __m512i q8_signed = _mm512_mask_sub_epi8(q8_all, neg_mask, zero512, q8_all);
++        const __m512i p = _mm512_maddubs_epi16(q_abs, q8_signed);
++        const __m512i s_i32 = _mm512_madd_epi16(p, vmult);
++
++        acc512 = _mm512_fmadd_ps(vd, _mm512_cvtepi32_ps(s_i32), acc512);
++    }
++    *s = _mm512_reduce_add_ps(acc512);
++#elif defined(__AVX2__)
++    const __m256i m3 = _mm256_set1_epi8(0x03);
++    const __m256i m4 = _mm256_set1_epi8(0x04);
++    const __m256i lut256 = _mm256_setr_epi8(
++        -14, -8, -4, -1, 1, 4, 8, 14, -14, -8, -4, -1, 1, 4, 8, 14,
++        -14, -8, -4, -1, 1, 4, 8, 14, -14, -8, -4, -1, 1, 4, 8, 14
++    );
++    const __m256i shuf_mult = _mm256_setr_epi8(
++        0, -128, 0, -128, 0, -128, 0, -128, 1, -128, 1, -128, 1, -128, 1, -128,
++        2, -128, 2, -128, 2, -128, 2, -128, 3, -128, 3, -128, 3, -128, 3, -128
++    );
++    const __m256i shift_qs01 = _mm256_setr_epi32(0, 0, 0, 0, 2, 2, 2, 2);
++    const __m256i shift_qs23 = _mm256_setr_epi32(4, 4, 4, 4, 6, 6, 6, 6);
++
++    __m256 acc0 = _mm256_setzero_ps();
++    __m256 acc1 = _mm256_setzero_ps();
++
++    for (int i = 0; i < nb; i++) {
++        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
++        const __m256 vd0 = _mm256_set1_ps(d0 * GGML_CPU_FP16_TO_FP32(y[2 * i + 0].d));
++        const __m256 vd1 = _mm256_set1_ps(d0 * GGML_CPU_FP16_TO_FP32(y[2 * i + 1].d));
++
++        uint32_t sc_raw;
++        memcpy(&sc_raw, x[i].scales, sizeof(sc_raw));
++        const uint32_t m01 = (sc_raw & 0x0F0F0F0FU) + 0x04040404U;
++        const uint32_t m23 = ((sc_raw >> 4) & 0x0F0F0F0FU) + 0x04040404U;
++
++        const __m256i vmult01 = _mm256_shuffle_epi8(_mm256_set1_epi32((int32_t)m01), shuf_mult);
++        const __m256i vmult23 = _mm256_shuffle_epi8(_mm256_set1_epi32((int32_t)m23), shuf_mult);
++
++        uint64_t qh64;
++        memcpy(&qh64, x[i].qh, sizeof(qh64));
++        const __m256i qs256 = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)x[i].qs));
++
++        const __m256i qs_01 = _mm256_srlv_epi32(qs256, shift_qs01);
++        const __m256i qh_01 = _mm256_and_si256(_mm256_setr_epi64x(
++            (int64_t)(qh64 << 2), (int64_t)(qh64 << 1), (int64_t)qh64, (int64_t)(qh64 >> 1)), m4);
++        const __m256i idx01 = _mm256_or_si256(_mm256_and_si256(qs_01, m3), qh_01);
++        const __m256i q01   = _mm256_shuffle_epi8(lut256, idx01);
++
++        const __m256i qs_23 = _mm256_srlv_epi32(qs256, shift_qs23);
++        const __m256i qh_23 = _mm256_and_si256(_mm256_setr_epi64x(
++            (int64_t)(qh64 >> 2), (int64_t)(qh64 >> 3), (int64_t)(qh64 >> 4), (int64_t)(qh64 >> 5)), m4);
++        const __m256i idx23 = _mm256_or_si256(_mm256_and_si256(qs_23, m3), qh_23);
++        const __m256i q23   = _mm256_shuffle_epi8(lut256, idx23);
++
++        const __m256i q8_0 = _mm256_loadu_si256((const __m256i *)y[2 * i + 0].qs);
++        const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)y[2 * i + 1].qs);
++
++        const __m256i p01 = _mm256_maddubs_epi16(_mm256_abs_epi8(q01), _mm256_sign_epi8(q8_0, q01));
++        const __m256i p23 = _mm256_maddubs_epi16(_mm256_abs_epi8(q23), _mm256_sign_epi8(q8_1, q23));
++
++        const __m256i s01 = _mm256_madd_epi16(p01, vmult01);
++        const __m256i s23 = _mm256_madd_epi16(p23, vmult23);
++
++        acc0 = _mm256_fmadd_ps(vd0, _mm256_cvtepi32_ps(s01), acc0);
++        acc1 = _mm256_fmadd_ps(vd1, _mm256_cvtepi32_ps(s23), acc1);
++    }
++
++    const __m256 acc = _mm256_add_ps(acc0, acc1);
++    const __m128 res4 = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
++    const __m128 res2 = _mm_add_ps(res4, _mm_movehl_ps(res4, res4));
++    const __m128 res1 = _mm_add_ss(res2, _mm_movehdup_ps(res2));
++    *s = _mm_cvtss_f32(res1);
++#else
++    static const int8_t kvalues_fractal3[8] = { -14, -8, -4, -1, 1, 4, 8, 14 };
+     float sumf = 0.0f;
+ 
+     for (int i = 0; i < nb; i++) {
+         const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
++        int mult[8];
++        for (int b = 0; b < 4; ++b) {
++            mult[b]     = 4 + (x[i].scales[b] & 0x0F);
++            mult[b + 4] = 4 + ((x[i].scales[b] >> 4) & 0x0F);
++        }
+ 
+         float sumi = 0.0f;
+-
+-        // group 64: one Q2_0 block (64 weights) maps to two Q8_0 blocks (2 * 32 = 64)
+         for (int k = 0; k < 2; k++) {
+             const block_q8_0 * GGML_RESTRICT yb = &y[i * 2 + k];
+             const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
+             int sumi_block = 0;
+ 
+-            const uint8_t * GGML_RESTRICT qs = &x[i].qs[k * 8];
+-            const int8_t  * GGML_RESTRICT qy = yb->qs;
+-
+-            for (int b = 0; b < 8; ++b) {
+-                const uint8_t byte = qs[b];
+-                // Extract 4 two-bit values, map {0,1,2,3} -> {-1,0,1,2}
+-                sumi_block += ((int)((byte >> 0) & 3) - 1) * qy[b*4 + 0];
+-                sumi_block += ((int)((byte >> 2) & 3) - 1) * qy[b*4 + 1];
+-                sumi_block += ((int)((byte >> 4) & 3) - 1) * qy[b*4 + 2];
+-                sumi_block += ((int)((byte >> 6) & 3) - 1) * qy[b*4 + 3];
++            for (int g_sub = 0; g_sub < 2; ++g_sub) {
++                const int g = k * 2 + g_sub;
++                for (int k_idx = 0; k_idx < 16; ++k_idx) {
++                    const int j_local = g_sub * 16 + k_idx;
++                    const int j_global = k * 32 + j_local;
++                    const uint8_t lo2 = (x[i].qs[k_idx] >> (2 * g)) & 0x03;
++                    const uint8_t hi1 = (x[i].qh[k_idx & 7] >> (2 * g + (k_idx >> 3))) & 0x01;
++                    const uint8_t idx = (uint8_t)(lo2 | (hi1 << 2));
++                    sumi_block += (int)kvalues_fractal3[idx] * mult[j_global >> 3] * (int)yb->qs[j_local];
++                }
+             }
+-
+-            sumi += d1 * sumi_block;
++            sumi += d1 * (float)sumi_block;
+         }
+-
+         sumf += d0 * sumi;
+     }
+ 
+     *s = sumf;
++#endif
+ }
+ 
+ void ggml_vec_dot_q4_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+diff --git a/src/llama-kv-cache-dsv4.cpp b/src/llama-kv-cache-dsv4.cpp
+index 5caa05e..e79b88a 100644
+--- a/src/llama-kv-cache-dsv4.cpp
++++ b/src/llama-kv-cache-dsv4.cpp
+@@ -553,7 +553,7 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
+             const int32_t source_idx = state_source_idx(seq_id, ubatch.pos[i]);
+ 
+             plan.state_write_idxs.push_back(cache_off + kv_size - 1);
+-            plan.state_write_pos .push_back(0);
++            plan.state_write_pos .push_back(-1);
+ 
+             if (overlap) {
+                 for (uint32_t j = 0; j < ratio; ++j) {
+@@ -630,11 +630,12 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
+ 
+             const int64_t stream_off = dsv4_stream_offset(n_stream, seq_id, state_size);
+             const uint32_t rollback = (uint32_t) seq_id < rs_idx.size() ? rs_idx[seq_id] : 0;
+-            // Keep the restore graph fixed-width when no rollback is pending.
+-            const int64_t src_plane = rollback > 0 && rollback <= n_rs_seq ? (int64_t) rollback*state_rows : 0;
+-            for (uint32_t r = 0; r < state_size; ++r) {
+-                plan.state_restore_src_idxs.push_back((int32_t) (src_plane + stream_off + r));
+-                plan.state_restore_dst_idxs.push_back((int32_t) (stream_off + r));
++            if (rollback > 0 && rollback <= n_rs_seq) {
++                const int64_t src_plane = (int64_t) rollback*state_rows;
++                for (uint32_t r = 0; r < state_size; ++r) {
++                    plan.state_restore_src_idxs.push_back((int32_t) (src_plane + stream_off + r));
++                    plan.state_restore_dst_idxs.push_back((int32_t) (stream_off + r));
++                }
+             }
+ 
+             std::vector<uint32_t> token_idxs;
+@@ -649,8 +650,12 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
+             }
+ 
+             const uint32_t n_seq_tokens = (uint32_t) token_idxs.size();
++            if (n_seq_tokens <= 1) {
++                continue;
++            }
+             const int64_t scratch_off = (int64_t) state_rows*(1 + n_rs_seq);
+-            for (uint32_t d = 1; d <= n_rs_seq; ++d) {
++            const uint32_t max_d = std::min<uint32_t>(n_rs_seq, n_seq_tokens - 1);
++            for (uint32_t d = 1; d <= max_d; ++d) {
+                 const int64_t dst_plane = (int64_t) d*state_rows;
+ 
+                 for (uint32_t r = 0; r < state_size; ++r) {
+@@ -666,7 +671,10 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
+                             }
+                         }
+                     } else {
+-                        const int64_t src_plane = (int64_t) (d - n_seq_tokens)*state_rows;
++                        const int32_t eff_rollback = (rollback > 0 && rollback <= n_rs_seq) ? (int32_t)rollback : 0;
++                        const int32_t raw_plane = eff_rollback + ((int32_t)d - (int32_t)n_seq_tokens);
++                        const uint32_t hist_plane = (raw_plane <= 0) ? 0u : (uint32_t)std::min<int32_t>((int32_t)n_rs_seq, raw_plane);
++                        const int64_t src_plane = (int64_t) hist_plane*state_rows;
+                         src = (int32_t) (src_plane + stream_off + r);
+                     }
+ 
+@@ -1435,6 +1443,9 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
+ 
+         const bool res = kv_raw->seq_rm(seq_id, p0, p1);
+         if (res) {
++            kv_csa->seq_rm(seq_id, p0/DSV4_CSA_RATIO, -1);
++            kv_hca->seq_rm(seq_id, p0/DSV4_HCA_RATIO, -1);
++            kv_lid->seq_rm(seq_id, p0/DSV4_CSA_RATIO, -1);
+             rs_idx[seq_id] = (uint32_t) rollback;
+         }
+ 
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 89cd461..d190d2c 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -746,7 +746,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+     const auto & inp_csa = inp_dsv4->get_csa();
+     GGML_ASSERT(inp_csa.kq_mask);
+ 
+-    ggml_tensor * top_k = build_lid_top_k(model, inp_dsv4, qr, cur, inp_pos, il);
++    const bool need_top_k = inp_csa.kq_mask->ne[0] > hparams.indexer_top_k;
++    ggml_tensor * top_k = need_top_k ? build_lid_top_k(model, inp_dsv4, qr, cur, inp_pos, il) : nullptr;
+ 
+     ggml_tensor * k_rot = inp_attn->self_k_rot;
+     if (k_rot) {
+@@ -778,7 +779,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+     cb(k_all, "csa_k_all", il);
+ 
+     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
+-    ggml_tensor * csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
++    ggml_tensor * csa_mask = need_top_k ? build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il) : inp_csa.kq_mask;
+ 
+     ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);
+     cb(kq_mask, "csa_lid_kq_mask", il);
+@@ -1013,42 +1014,55 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+         csa_state_score = ggml_add(ctx0, csa_state_score, csa_ape_rows);
+         cb(csa_state_score, "csa_state_score_ape", il);
+ 
+-        GGML_ASSERT(inp_dsv4->get_csa().state_write_idxs);
+-
+         const auto * csa_state = inp_dsv4->mctx->get_csa_state();
+-        const dsv4_state_tensors csa_restored = dsv4_build_state_restore(
+-                ctx0, inp_dsv4->get_csa(), csa_state, il);
+-        ggml_tensor * csa_base_kv = dsv4_view_2d(
+-                ctx0, csa_restored.kv, csa_restored.kv->ne[0], csa_state->get_n_rows(), 0);
+-        ggml_tensor * csa_base_score = dsv4_view_2d(
+-                ctx0, csa_restored.score, csa_restored.score->ne[0], csa_state->get_n_rows(), 0);
+-
+-        ggml_tensor * csa_source_kv = ggml_concat(ctx0, csa_base_kv, csa_state_kv, 1);
+-        ggml_tensor * csa_source_score = ggml_concat(ctx0, csa_base_score, csa_state_score, 1);
+-
+-        ggml_tensor * kv_comp_csa_state = build_overlap_compressed_kv_from_state(
+-                csa_source_kv,
+-                csa_source_score,
+-                inp_dsv4->get_csa().state_read_idxs,
+-                inp_dsv4->get_csa().state_write_pos,
+-                layer.attn_comp_norm,
+-                DSV4_CSA_RATIO,
+-                n_embd_head,
+-                "csa_state_compress",
+-                il);
+-
+-        if (inp_dsv4->get_csa().k_rot) {
+-            kv_comp_csa_state = llama_mul_mat_hadamard(ctx0, kv_comp_csa_state, inp_dsv4->get_csa().k_rot);
+-            cb(kv_comp_csa_state, "csa_state_compress_rot", il);
++        dsv4_state_tensors csa_restored = {};
++        if (inp_dsv4->get_csa().state_write_idxs != nullptr || inp_dsv4->get_csa().state_restore_src_idxs != nullptr || inp_dsv4->get_csa().state_snapshot_src_idxs != nullptr) {
++            csa_restored = dsv4_build_state_restore(ctx0, inp_dsv4->get_csa(), csa_state, il);
++            if (inp_dsv4->get_csa().state_restore_src_idxs != nullptr) {
++                ggml_build_forward_expand(gf, csa_restored.kv);
++                ggml_build_forward_expand(gf, csa_restored.score);
++            }
+         }
+ 
+-        ggml_build_forward_expand(gf, inp_dsv4->mctx->get_csa()->cpy_k(ctx0,
+-                    kv_comp_csa_state, inp_dsv4->get_csa().state_write_idxs, il));
++        if (inp_dsv4->get_csa().state_write_idxs) {
++            ggml_build_forward_expand(gf, csa_state_kv);
++            ggml_build_forward_expand(gf, csa_state_score);
++            if (csa_restored.kv) ggml_build_forward_expand(gf, csa_restored.kv);
++            if (csa_restored.score) ggml_build_forward_expand(gf, csa_restored.score);
++            const int n_before_csa = ggml_graph_n_nodes(gf);
++            ggml_tensor * csa_base_kv = dsv4_view_2d(
++                    ctx0, csa_restored.kv, csa_restored.kv->ne[0], csa_state->get_n_rows(), 0);
++            ggml_tensor * csa_base_score = dsv4_view_2d(
++                    ctx0, csa_restored.score, csa_restored.score->ne[0], csa_state->get_n_rows(), 0);
++
++            ggml_tensor * csa_source_kv = ggml_concat(ctx0, csa_base_kv, csa_state_kv, 1);
++            ggml_tensor * csa_source_score = ggml_concat(ctx0, csa_base_score, csa_state_score, 1);
++
++            ggml_tensor * kv_comp_csa_state = build_overlap_compressed_kv_from_state(
++                    csa_source_kv,
++                    csa_source_score,
++                    inp_dsv4->get_csa().state_read_idxs,
++                    inp_dsv4->get_csa().state_write_pos,
++                    layer.attn_comp_norm,
++                    DSV4_CSA_RATIO,
++                    n_embd_head,
++                    "csa_state_compress",
++                    il);
++
++            if (inp_dsv4->get_csa().k_rot) {
++                kv_comp_csa_state = llama_mul_mat_hadamard(ctx0, kv_comp_csa_state, inp_dsv4->get_csa().k_rot);
++                cb(kv_comp_csa_state, "csa_state_compress_rot", il);
++            }
++
++            ggml_build_forward_expand(gf, inp_dsv4->mctx->get_csa()->cpy_k(ctx0,
++                        kv_comp_csa_state, inp_dsv4->get_csa().state_write_idxs, il));
++            for (int i = n_before_csa; i < ggml_graph_n_nodes(gf); ++i) {
++                ggml_graph_node(gf, i)->flags |= 0x100;
++            }
++        }
+ 
+-        ggml_tensor * csa_snapshot_source_kv = ggml_concat(ctx0,
+-                csa_restored.kv, csa_state_kv, 1);
+-        ggml_tensor * csa_snapshot_source_score = ggml_concat(ctx0,
+-                csa_restored.score, csa_state_score, 1);
++        ggml_tensor * csa_snapshot_source_kv = inp_dsv4->get_csa().state_snapshot_src_idxs ? ggml_concat(ctx0, csa_restored.kv, csa_state_kv, 1) : nullptr;
++        ggml_tensor * csa_snapshot_source_score = inp_dsv4->get_csa().state_snapshot_src_idxs ? ggml_concat(ctx0, csa_restored.score, csa_state_score, 1) : nullptr;
+ 
+         const dsv4_state_tensors csa_snapshot = dsv4_build_state_snapshot(
+                 ctx0, inp_dsv4->get_csa(), csa_state, csa_snapshot_source_kv, csa_snapshot_source_score, il);
+@@ -1082,42 +1096,55 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+         lid_state_score = ggml_add(ctx0, lid_state_score, lid_ape_rows);
+         cb(lid_state_score, "lid_state_score_ape", il);
+ 
+-        GGML_ASSERT(inp_dsv4->get_lid().state_write_idxs);
+-
+         const auto * lid_state = inp_dsv4->mctx->get_lid_state();
+-        const dsv4_state_tensors lid_restored = dsv4_build_state_restore(
+-                ctx0, inp_dsv4->get_lid(), lid_state, il);
+-        ggml_tensor * lid_base_kv = dsv4_view_2d(
+-                ctx0, lid_restored.kv, lid_restored.kv->ne[0], lid_state->get_n_rows(), 0);
+-        ggml_tensor * lid_base_score = dsv4_view_2d(
+-                ctx0, lid_restored.score, lid_restored.score->ne[0], lid_state->get_n_rows(), 0);
+-
+-        ggml_tensor * lid_source_kv = ggml_concat(ctx0, lid_base_kv, lid_state_kv, 1);
+-        ggml_tensor * lid_source_score = ggml_concat(ctx0, lid_base_score, lid_state_score, 1);
+-
+-        ggml_tensor * kv_comp_lid_state = build_overlap_compressed_kv_from_state(
+-                lid_source_kv,
+-                lid_source_score,
+-                inp_dsv4->get_lid().state_read_idxs,
+-                inp_dsv4->get_lid().state_write_pos,
+-                layer.indexer_comp_norm,
+-                DSV4_CSA_RATIO,
+-                hparams.indexer_head_size,
+-                "lid_state_compress",
+-                il);
+-
+-        if (inp_dsv4->get_lid().k_rot) {
+-            kv_comp_lid_state = llama_mul_mat_hadamard(ctx0, kv_comp_lid_state, inp_dsv4->get_lid().k_rot);
+-            cb(kv_comp_lid_state, "lid_state_compress_rot", il);
++        dsv4_state_tensors lid_restored = {};
++        if (inp_dsv4->get_lid().state_write_idxs != nullptr || inp_dsv4->get_lid().state_restore_src_idxs != nullptr || inp_dsv4->get_lid().state_snapshot_src_idxs != nullptr) {
++            lid_restored = dsv4_build_state_restore(ctx0, inp_dsv4->get_lid(), lid_state, il);
++            if (inp_dsv4->get_lid().state_restore_src_idxs != nullptr) {
++                ggml_build_forward_expand(gf, lid_restored.kv);
++                ggml_build_forward_expand(gf, lid_restored.score);
++            }
+         }
+ 
+-        ggml_build_forward_expand(gf, inp_dsv4->mctx->get_lid()->cpy_k(ctx0,
+-                    kv_comp_lid_state, inp_dsv4->get_lid().state_write_idxs, il));
++        if (inp_dsv4->get_lid().state_write_idxs) {
++            ggml_build_forward_expand(gf, lid_state_kv);
++            ggml_build_forward_expand(gf, lid_state_score);
++            if (lid_restored.kv) ggml_build_forward_expand(gf, lid_restored.kv);
++            if (lid_restored.score) ggml_build_forward_expand(gf, lid_restored.score);
++            const int n_before_lid = ggml_graph_n_nodes(gf);
++            ggml_tensor * lid_base_kv = dsv4_view_2d(
++                    ctx0, lid_restored.kv, lid_restored.kv->ne[0], lid_state->get_n_rows(), 0);
++            ggml_tensor * lid_base_score = dsv4_view_2d(
++                    ctx0, lid_restored.score, lid_restored.score->ne[0], lid_state->get_n_rows(), 0);
++
++            ggml_tensor * lid_source_kv = ggml_concat(ctx0, lid_base_kv, lid_state_kv, 1);
++            ggml_tensor * lid_source_score = ggml_concat(ctx0, lid_base_score, lid_state_score, 1);
++
++            ggml_tensor * kv_comp_lid_state = build_overlap_compressed_kv_from_state(
++                    lid_source_kv,
++                    lid_source_score,
++                    inp_dsv4->get_lid().state_read_idxs,
++                    inp_dsv4->get_lid().state_write_pos,
++                    layer.indexer_comp_norm,
++                    DSV4_CSA_RATIO,
++                    hparams.indexer_head_size,
++                    "lid_state_compress",
++                    il);
++
++            if (inp_dsv4->get_lid().k_rot) {
++                kv_comp_lid_state = llama_mul_mat_hadamard(ctx0, kv_comp_lid_state, inp_dsv4->get_lid().k_rot);
++                cb(kv_comp_lid_state, "lid_state_compress_rot", il);
++            }
++
++            ggml_build_forward_expand(gf, inp_dsv4->mctx->get_lid()->cpy_k(ctx0,
++                        kv_comp_lid_state, inp_dsv4->get_lid().state_write_idxs, il));
++            for (int i = n_before_lid; i < ggml_graph_n_nodes(gf); ++i) {
++                ggml_graph_node(gf, i)->flags |= 0x100;
++            }
++        }
+ 
+-        ggml_tensor * lid_snapshot_source_kv = ggml_concat(ctx0,
+-                lid_restored.kv, lid_state_kv, 1);
+-        ggml_tensor * lid_snapshot_source_score = ggml_concat(ctx0,
+-                lid_restored.score, lid_state_score, 1);
++        ggml_tensor * lid_snapshot_source_kv = inp_dsv4->get_lid().state_snapshot_src_idxs ? ggml_concat(ctx0, lid_restored.kv, lid_state_kv, 1) : nullptr;
++        ggml_tensor * lid_snapshot_source_score = inp_dsv4->get_lid().state_snapshot_src_idxs ? ggml_concat(ctx0, lid_restored.score, lid_state_score, 1) : nullptr;
+ 
+         const dsv4_state_tensors lid_snapshot = dsv4_build_state_snapshot(
+                 ctx0, inp_dsv4->get_lid(), lid_state, lid_snapshot_source_kv, lid_snapshot_source_score, il);
+@@ -1182,23 +1209,16 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
+         if (hca_state == nullptr) {
+             hca_state = inp_dsv4->mctx->get_hca_state();
+         }
+-        if (hca_restored.kv == nullptr) {
++        if (hca_restored.kv == nullptr && (inp_dsv4->get_hca().state_restore_src_idxs != nullptr || inp_dsv4->get_hca().state_snapshot_src_idxs != nullptr)) {
+             hca_restored = dsv4_build_state_restore(ctx0, inp_dsv4->get_hca(), hca_state, il);
+-        }
+-        if (hca_source_kv == nullptr || hca_source_score == nullptr) {
+-            ggml_tensor * hca_base_kv = dsv4_view_2d(
+-                    ctx0, hca_restored.kv, hca_restored.kv->ne[0], hca_state->get_n_rows(), 0);
+-            ggml_tensor * hca_base_score = dsv4_view_2d(
+-                    ctx0, hca_restored.score, hca_restored.score->ne[0], hca_state->get_n_rows(), 0);
+-
+-            hca_source_kv = ggml_concat(ctx0, hca_base_kv, hca_state_kv, 1);
+-            hca_source_score = ggml_concat(ctx0, hca_base_score, hca_state_score, 1);
++            if (inp_dsv4->get_hca().state_restore_src_idxs != nullptr) {
++                ggml_build_forward_expand(gf, hca_restored.kv);
++                ggml_build_forward_expand(gf, hca_restored.score);
++            }
+         }
+ 
+-        ggml_tensor * hca_snapshot_source_kv = ggml_concat(ctx0,
+-                hca_restored.kv, hca_state_kv, 1);
+-        ggml_tensor * hca_snapshot_source_score = ggml_concat(ctx0,
+-                hca_restored.score, hca_state_score, 1);
++        ggml_tensor * hca_snapshot_source_kv = inp_dsv4->get_hca().state_snapshot_src_idxs ? ggml_concat(ctx0, hca_restored.kv, hca_state_kv, 1) : nullptr;
++        ggml_tensor * hca_snapshot_source_score = inp_dsv4->get_hca().state_snapshot_src_idxs ? ggml_concat(ctx0, hca_restored.score, hca_state_score, 1) : nullptr;
+ 
+         const dsv4_state_tensors hca_snapshot = dsv4_build_state_snapshot(
+                 ctx0, inp_dsv4->get_hca(), hca_state, hca_snapshot_source_kv, hca_snapshot_source_score, il);

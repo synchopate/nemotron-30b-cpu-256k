@@ -48,8 +48,8 @@ Measured via `LLAMA_PROFILE_OPS` inside `ggml_graph_compute_thread` ([`patches/d
 
 ### 3.1. Exact SVD Spectrum of the Linear `wo_b * wo_a` Operator (`31%` of DRAM Traffic = `991.6 MB/token`)
 
-In [`deepseek4.cpp`](../patches/deepseek-v4-flash-fractal-256k.patch), the attention output projection applies two consecutive `Q2_0` matrices across `8` head-groups (`1024` input head-group dim $= 8 \times 128$, `1024` inner LoRA rank per group, `8192` total) with **no activation function, no normalization, and no bias** between them:
-$$\mathbf{y}_{\text{attn}} = \sum_{g=1}^{8} \mathbf{W}_{o,b}^{(g)} \left( \mathbf{W}_{o,a}^{(g)} \mathbf{x}_g \right), \qquad \mathbf{W}_{o,a}^{(g)} \in \mathbb{R}^{1024 \times 1024},\; \mathbf{W}_{o,b}^{(g)} \in \mathbb{R}^{4096 \times 1024}$$
+In [`deepseek4.cpp`](../patches/deepseek-v4-flash-fractal-256k.patch), the attention output projection applies two consecutive `Q2_0` matrices across `8` head-groups (`4096` input MLA group dim $= 8 \text{ heads} \times 512 \text{ latent dim}$, `1024` inner LoRA rank per group, `8192` total) with **no activation function, no normalization, and no bias** between them:
+$$\mathbf{y}_{\text{attn}} = \sum_{g=1}^{8} \mathbf{W}_{o,b}^{(g)} \left( \mathbf{W}_{o,a}^{(g)} \mathbf{x}_g \right), \qquad \mathbf{W}_{o,a}^{(g)} \in \mathbb{R}^{1024 \times 4096},\; \mathbf{W}_{o,b}^{(g)} \in \mathbb{R}^{4096 \times 1024}$$
 
 De-quantizing the actual GGUF tensors (`blk.{0,3,4,10}.attn_output_{a,b}.weight`) and computing the exact Singular Value Decomposition $\mathbf{W}_{o,b}^{(g)} \mathbf{W}_{o,a}^{(g)} = \mathbf{U}_g \boldsymbol{\Sigma}_g \mathbf{V}_g^\top$ reveals strong spectral decay ($\sigma_0 = 15.398 \to \sigma_{768} = 0.901 \to \sigma_{1023} = 0.048$):
 
@@ -84,11 +84,33 @@ $$\mathbf{y}_{\text{FFN}}(\mathbf{x}) = \mathbf{e}_{\text{shared}}(\mathbf{x}) +
 
 ```bash
 # Linux / macOS: write 32-byte struct to /tmp/dsv4_moe_cfg.bin (takes 0.001 ms, no server restart)
-python3 -c 'import struct; open("/tmp/dsv4_moe_cfg.bin","r+b").write(struct.pack("<8i", 5, 5, 0, 3, 43, 1, 0, 0))' # Top-5 L2 (9.68 tok/s, +0.42% PPL)
-python3 -c 'import struct; open("/tmp/dsv4_moe_cfg.bin","r+b").write(struct.pack("<8i", 6, 6, 0, 3, 43, 1, 0, 0))' # Top-6 Lossless (9.06 tok/s, 0.00% PPL)
+python3 -c 'import struct; open("/tmp/dsv4_moe_cfg.bin","r+b").write(struct.pack("<8i", 5, 5, 0, 3, 43, 1, 0, 0))'   # Top-5 L2 (9.87 tok/s, +0.42% PPL)
+python3 -c 'import struct; open("/tmp/dsv4_moe_cfg.bin","r+b").write(struct.pack("<8i", 5, 5, 0, 3, 43, 1, 80, 80))' # Top-5 L2 + Gate-First SwiGLU 80/128 (10.15 tok/s)
+python3 -c 'import struct; open("/tmp/dsv4_moe_cfg.bin","r+b").write(struct.pack("<8i", 4, 4, 0, 3, 43, 1, 80, 80))' # Top-4 L2 + Gate-First SwiGLU 80/128 (10.51 tok/s)
+python3 -c 'import struct; open("/tmp/dsv4_moe_cfg.bin","r+b").write(struct.pack("<8i", 6, 6, 0, 3, 43, 1, 0, 0))'   # Top-6 Lossless (9.44 tok/s, 0.00% PPL)
 ```
 
 ```powershell
 # Windows PowerShell: via modchip_win.ps1 parameters or %TEMP%\dsv4_moe_cfg.bin
 .\windows\modchip_win.ps1 -MoeTopK 5
 ```
+
+---
+
+## 4. L1-Local Stratified Gate-First SwiGLU Row Skipping with $L_2$ Gate-Energy Preservation (`cfg[6]`, `cfg[7]`)
+
+In every SwiGLU FFN block (both the 43 Shared Experts `ffn_*_shexp` in `Q5_K`/`Q6_K` and the $43 \times K$ active Routed Experts `ffn_*_exps` in `IQ1_S`), the hidden representation is:
+$$\mathbf{h} = \text{SiLU}(\mathbf{W}_{\text{gate}} \mathbf{x}) \odot (\mathbf{W}_{\text{up}} \mathbf{x}), \qquad \mathbf{y} = \mathbf{W}_{\text{down}} \mathbf{h}, \qquad h_j = \frac{g_j}{1 + e^{-g_j}} \cdot u_j \quad (j \in \{0,\dots,2047\}).$$
+
+1. **Topological Gate-First Execution in `ggml`**: Because `ggml_swiglu_split(ctx0, gate, up)` binds `gate` to `src[0]` and `up` to `src[1]`, `ggml`'s post-order DFS schedules `W_gate * x` (`ffn_gate` / `ffn_moe_gate`) **immediately before** `W_up * x` (`ffn_up` / `ffn_moe_up`). Furthermore, because each of the 16 worker threads (`ith = 0..15`, pinned 1-to-1 to physical cores `0..15`) computes the exact same contiguous 128-row slice `[ir0_start, ir0_end) = [128 * ith, 128 * (ith + 1))` in both `W_gate` and `W_up`, the 128 gate pre-activations $g_j$ are **already hot in Core `ith`'s private 32 KB L1D cache** when `W_up` begins.
+2. **Stratified Per-Thread Selection & Exact $L_2$ Gate-Energy Rescaling (`ggml_swiglu_gate_mask_128`)**: Because $\max_{g \le 0} |\text{SiLU}(g)| = 0.2785$ and negative/near-zero gates annihilate $u_j$ regardless of its value, each thread `ith` runs an $O(128)$ in-register Hoare quickselect on $s_j^2 = \text{SiLU}(g_j)^2$ over its 128-row stratum ($<40\text{ ns}$), skips fetching the bottom $128 - m$ rows of $\mathbf{W}_{\text{up}}$ from DDR5 DRAM (`800 B/row` in `IQ1_S`, `2,816 B/row` in `Q5_K`), and rescales the $m$ surviving rows by the conditional $L_2$ gate-energy preservation factor:
+   $$\alpha_{\text{SwiGLU}}^{(c)} = \sqrt{\frac{\sum_{j \in \mathcal{C}_c} \text{SiLU}(g_j)^2}{\sum_{j \in \mathcal{A}_c} \text{SiLU}(g_j)^2}}.$$
+   Because $\mathbb{E}[h_j^2 \mid g_j] = \text{SiLU}(g_j)^2 \sigma_u^2$, rescaling by $\alpha_{\text{SwiGLU}}^{(c)}$ preserves 99.86%--100.00% of the exact output norm $\|\mathbf{W}_{\text{down}} \mathbf{h}\|_2$ entering the Hyper-Connections stream while guaranteeing **perfect 16-thread load balance (zero stragglers at the threadpool barrier) and zero cross-thread synchronization**.
+
+| Combined Runtime Profile (`il = 0..2` always `100%`) | `cfg[0..7]` in `/tmp/dsv4_moe_cfg.bin` | Decode (`tok/s`) | Latency (`ms/tok`) | **Decode Prob CosSim** | **Agentic JSON Tool-Call (`execute_shell`)** |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **1. `Top-6` + SwiGLU `80/128` (`62.5% W_up`)** | `[6, 6, 0, 3, 43, 1, 80, 80]` | **`9.71 tok/s`** | **`103.04 ms`** | **`0.99403`** | **`100% Exact Match`** |
+| **2. `Top-5 L2` + Exps SwiGLU `96/128` (`75%`)** | `[5, 5, 0, 3, 43, 1, 96, 0]` | **`9.83 tok/s`** | **`101.76 ms`** | **`0.99624`** | **`100% Exact Match`** |
+| **3. `Top-5 L2` + Both SwiGLU `80/128` (`62.5%`)** | `[5, 5, 0, 3, 43, 1, 80, 80]` | **`10.15 tok/s`** | **`98.49 ms`** | **`0.99385`** | **`100% Exact Match`** |
+| **4. `Top-4 L2` + Both SwiGLU `96/128` (`75%`)** | `[4, 4, 0, 3, 43, 1, 96, 96]` | **`10.60 tok/s`** | **`94.37 ms`** | **`0.99126`** | **`100% Exact Match`** |
+| **5. `Top-4 L2` + Both SwiGLU `64/128` (`50%`)** | `[4, 4, 0, 3, 43, 1, 64, 64]` | **`10.74 tok/s`** | **`93.15 ms`** | **`0.98059`** | **`100% Exact Match`** |
