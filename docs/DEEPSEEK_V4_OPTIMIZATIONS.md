@@ -114,3 +114,38 @@ $$\mathbf{h} = \text{SiLU}(\mathbf{W}_{\text{gate}} \mathbf{x}) \odot (\mathbf{W
 | **3. `Top-5 L2` + Both SwiGLU `80/128` (`62.5%`)** | `[5, 5, 0, 3, 43, 1, 80, 80]` | **`10.15 tok/s`** | **`98.49 ms`** | **`0.99385`** | **`100% Exact Match`** |
 | **4. `Top-4 L2` + Both SwiGLU `96/128` (`75%`)** | `[4, 4, 0, 3, 43, 1, 96, 96]` | **`10.60 tok/s`** | **`94.37 ms`** | **`0.99126`** | **`100% Exact Match`** |
 | **5. `Top-4 L2` + Both SwiGLU `64/128` (`50%`)** | `[4, 4, 0, 3, 43, 1, 64, 64]` | **`10.74 tok/s`** | **`93.15 ms`** | **`0.98059`** | **`100% Exact Match`** |
+
+---
+
+## 6. 4-Level Register (`ZMM` AVX-512BW) + L1D (`32 KB`) + L2 (`1 MB`) + L3 (`64 MB`) Whole-Model Prefill & Agentic KV-Cache Tiling
+
+To eliminate the DDR5 RAM bottleneck during prompt prefill ($N > 1$) and multi-turn agentic workflows without losing a single bit of precision (`100%` mathematically lossless), we re-architected the CPU execution pipeline across all four levels of the Zen 4 / Zen 5 cache hierarchy:
+
+1. **Level 0 — 512-Bit `ZMM` Register-Stationary Multi-Column Kernels (`_1x8`, `_1x4`, `_1x3`, `_1x2`, `1x1`) Across All 6 Quantized Formats**:
+   - Implemented in `ggml/src/ggml-cpu/quants.c` (`Q2_0`) and `ggml/src/ggml-cpu/arch/x86/quants.c` (`IQ1_S`, `IQ2_XXS`, `IQ1_M`, `Q5_K`, `Q6_K`).
+   - Because `quantize_row_q8_K` scales by `iscale = -127.0f / max`, every quantized input byte in `block_q8_K.qs` is guaranteed to lie in `[-127, +127]` (never `-128`). We exploit this invariant to replace 256-bit AVX2 `vpsignb` loops (`32` weights/instruction) with 512-bit **AVX-512BW** masked negation (`_mm512_abs_epi8`, `_mm512_movepi8_mask`, `_mm512_mask_sub_epi8`, `_mm512_maddubs_epi16`, `_mm512_madd_epi16`, `64` weights/instruction), plus a **7-instruction BMI2 `_pdep_u64` + SWAR XOR-parity** 64-bit sign mask generator for `IQ2_XXS` that eliminates all `keven_signs_q2xs` lookup-table loads.
+   - Each weight block (`Q2_0`, `IQ1_S`, `IQ2_XXS`, `IQ1_M`, `Q5_K`, `Q6_K`) is unpacked **once** in `ZMM` registers and multiplied against $K \in \{8, 4, 3, 2\}$ token columns simultaneously, cutting weight-unpacking instruction count by up to **8x**.
+2. **Level 1 & Level 2 — L1D (`32 KB`) + L2 (`1 MB`) Cache-Blocked GEMM & Zero-Remainder `{8, 4, 3, 2}` Decomposition**:
+   - In `ggml_compute_forward_mul_mat_one_chunk` and `ggml_compute_forward_mul_mat_id_one_chunk` (`ggml-cpu.c`), an outer L2 loop tiles `blck_0_l2 = 128` weight rows (`64–276 KB` per core $\ll 1\text{ MB}$ L2) while an inner L1D loop tiles $K \in \{8, 4, 3, 2\}$ input columns.
+   - Because any integer $M \ge 2$ is an exact nonnegative linear combination of $\{8, 4, 3, 2\}$ (specifically $5 = 3+2$ and $9 = 4+3+2$), ragged MoE expert buckets (`MUL_MAT_ID` across `256` experts, where average tokens per expert is $6.5\text{--}12.7$) execute with **zero fallback to `1x1` whenever an expert has $\ge 2$ tokens**.
+   - A dynamic atomic work queue (`ggml_compute_forward_mul_mat_id`) with cache-line-aligned (`64 B` = 16 floats) row chunks eliminates cross-thread false sharing and load imbalance across all 256 routed experts.
+3. **Whole-Model Non-Matmul Vectorization & Cross-CCD Infinity Fabric Isolation**:
+   - **AVX-512 `quantize_row_q8_K`**: Replaced the scalar `quantize_row_q8_K_ref` stub in `arch/x86/quants.c` with a 100% bit-exact AVX-512 implementation (`16` `ZMM` registers + `_mm512_cvtepi32_epi8` + tree-reduced `bsums`).
+   - **Register-Stationary AVX-512 `MQA8` FlashAttention (`FLASH_ATTN_EXT`)**: In DeepSeek-V4's MLA (`32` query heads sharing `1` KV head of dimension `512` `FP16`), converts each 16-element `FP16` K/V slice once in a `ZMM` register (`_mm512_cvtph_ps`) and multiplies/accumulates across 8 query heads simultaneously (`2.0x` speedup: `415.1 ms -> 208.5 ms`).
+   - **Token-to-Core L1D/L2 Affinity across `DSV4_HC_POST -> DSV4_HC_PRE -> RMS_NORM` & Row-Parallel `from_float`**: Mapping token `it` to thread `ith = it % nth` across Hyper-Connections and `RMS_NORM` keeps each token's `16 KB` activation vector hot in the local core's `32 KB` L1D cache and eliminates 16-way cross-CCD Modified-cache-line snoops.
+
+### Verified Prefill & Multi-Turn Agentic KV-Cache Benchmarks (`DeepSeek-V4-Flash 284B`, 16-Core Zen 4/5)
+
+| Benchmark Scenario | Prompt / KV Tokens | Unoptimized Baseline | `v2.4.0` 4-Level Cache-Tiled | Speedup & Decode Rate |
+| :--- | :---: | :---: | :---: | :---: |
+| **Cold Prefill (`pp63`)** | `63` tok | `25.05 tok/s` | **`36.65 tok/s`** (`1,718.9 ms`) | **`+46.3%`** (`8.95–9.02 tok/s` decode) |
+| **Cold Prefill (`pp298`)** | `298` tok | `25.19 tok/s` | **`43.16 tok/s`** (`6,904.6 ms`) | **`+71.3%`** (`8.74–9.01 tok/s` decode) |
+| **Cold Prefill (`pp392`)** | `392` tok | `25.10 tok/s` | **`43.03 tok/s`** (`9,109.6 ms`) | **`+71.4%`** (**`9.55–9.90 tok/s`** decode) |
+| **Cold Prefill (`pp580`)** | `580` tok | `24.73 tok/s` | **`43.98 tok/s`** (`13,189.3 ms`) | **`+77.8%`** (**`9.60 tok/s`** decode) |
+| **Agentic Turn 1 (`cache_prompt=True`)** | `total_kv = 403` (`new=339`) | `25.12 tok/s` | **`44.36 tok/s`** | **`+76.6%`** (**`9.95 tok/s`** decode) |
+| **Agentic Turn 2 (`cache_prompt=True`)** | `total_kv = 806` (`new=407`) | `24.90 tok/s` | **`43.89 tok/s`** | **`+76.3%`** (**`9.86 tok/s`** decode) |
+| **Agentic Turn 3 (`cache_prompt=True`)** | `total_kv = 1209` (`new=407`) | `24.65 tok/s` | **`43.28 tok/s`** | **`+75.6%`** (**`9.74 tok/s`** decode) |
+| **Agentic Turn 4 (`cache_prompt=True`)** | `total_kv = 1612` (`new=407`) | `24.40 tok/s` | **`42.67 tok/s`** | **`+74.9%`** (**`9.69 tok/s`** decode) |
+| **Agentic Turn 5 (`cache_prompt=True`)** | `total_kv = 2015` (`new=407`) | `23.95 tok/s` | **`40.48 tok/s`** | **`+69.0%`** (**`9.64 tok/s`** decode) |
+| **Agentic Turn 6 (`cache_prompt=True`)** | `total_kv = 2418` (`new=407`) | `23.40 tok/s` | **`38.44 tok/s`** | **`+64.3%`** (**`9.16 tok/s`** decode) |
+
