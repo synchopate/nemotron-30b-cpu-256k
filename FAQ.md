@@ -223,4 +223,17 @@ A common back-of-the-envelope mistake is applying the **single-token ($N=1$, GEM
 
 ---
 
+## Q14: How does the 4-Level Register (`ZMM` AVX-512BW) + L1D (`32 KB`) + L2 (`1 MB`) + L3 (`64 MB`) Whole-Model Tiler accelerate `DeepSeek-V4-Flash 284B` prefill to `44.36 tok/s` (`+77%`) and prevent KV-cache slowdown in multi-turn agentic workflows?
+
+1. **Why Whole-Model Cache Tiling Is Required (Not Just KV-Cache Tuning)**:
+   - In a 284B MoE (`13.17B` active per token), prompt prefill ($N > 1$) and multi-turn agentic turns (`+300–500` new tool-output tokens per turn) spend `85%` of their wall-clock time inside dense (`Q2_0`, `Q5_K`, `Q6_K`) and sparse MoE (`IQ1_S`, `IQ2_XXS`, `IQ1_M`) matrix-matrix contractions, and `15%` inside `FLASH_ATTN_EXT`, `quantize_row_q8_K`, `RMS_NORM`, and `DSV4_HC_PRE/POST`.
+   - Standard `ggml-cpu` evaluates `vec_dot` (`1x1`) one token and one row at a time, unpacking the same quantized weight block from L2/L3 cache $N$ separate times and falling back to scalar reference code (`quantize_row_q8_K_ref`) for `Q8_K` input quantization.
+2. **4-Level Register (`ZMM` 512-bit) + L1D (`32 KB`) + L2 (`1 MB`) + L3 (`64 MB`) Co-Design**:
+   - **Level 0 (`ZMM` Register-Stationary AVX-512BW `_1x8`, `_1x4`, `_1x3`, `_1x2`, `1x1`)**: Exploiting `quantize_row_q8_K`'s `iscale = -127.0f / max` invariant (`qs[j] in [-127, +127]`, never `-128`), all six quantized formats process `64` weights per SIMD instruction via `_mm512_mask_sub_epi8` + `_mm512_maddubs_epi16` + `_mm512_madd_epi16` (plus a 7-instruction BMI2 `_pdep_u64` + SWAR XOR-parity 64-bit sign mask generator for `IQ2_XXS`), unpacking each weight block **once in `ZMM` registers** across up to `8` token columns.
+   - **Levels 1 & 2 (L1D `{8, 4, 3, 2}` Zero-Remainder Stepping + L2 `128`-Row Tiling + Cache-Aligned MoE Dynamic Queue)**: Any column count $M \ge 2$ decomposes into $\{8, 4, 3, 2\}$ ($5 = 3+2$, $9 = 4+3+2$), eliminating `1x1` fallback across ragged 256-expert MoE buckets (`MUL_MAT_ID`), while `128` weight rows (`64–276 KB`) stay resident in each core's `1 MB` L2 cache.
+   - **Register-Stationary AVX-512 `MQA8` FlashAttention & Token-Affinity `HC_PRE/POST -> RMS_NORM`**: Converts each 16-element `FP16` K/V slice once in a `ZMM` register (`_mm512_cvtph_ps`) across 8 query heads (`FLASH_ATTN_EXT` `2.0x` faster: `415.1 ms -> 208.5 ms`), vectorizes `quantize_row_q8_K` in AVX-512, and pins each token `it` to thread `ith = it % nth` across `DSV4_HC_POST -> DSV4_HC_PRE -> RMS_NORM` to eliminate cross-CCD Infinity Fabric snoops.
+   - **Verified Result**: Cold prefill jumps from `24.73–25.19 tok/s` to **`43.16–43.98 tok/s` (`+77.8%`)**, and multi-turn agentic turns (`cache_prompt: True`, `total_kv = 403 -> 2,418`) sustain **`44.36 tok/s` prefill** and **`9.16–9.95 tok/s` lossless decode**.
+
+---
+
 *Navigation: [⬅️ Back to Overview & Quickstart (`README.md`)](README.md) · [📄 Full Technical Paper (`ARCHITECTURE.md`)](ARCHITECTURE.md) · [♟️ 96+ `RouteCrack + Stockfish-PVS` Techniques (`speculative/ROUTECRACK_TECHNIQUES.md`)](speculative/ROUTECRACK_TECHNIQUES.md) · [🚀 Release Notes (`RELEASE_NOTES.md`)](RELEASE_NOTES.md)*

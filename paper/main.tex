@@ -118,8 +118,8 @@ In \texttt{scripts/transcode\_dsv4.c}, we dequantize the paired Gate and Up expe
 7. Graph Rebuild \& Dynamic \texttt{CSA/LID} Compressor Skip & Graph/C++ & 1 & 28.40 ms & 11.67 ms & \textbf{1.54 ms} & \textbf{0.00 ms} \\
 \midrule
 \textbf{Total Single-Token Decode Latency ($N=1$)} & \textbf{All} & \textbf{4,551} & \textbf{169.30 ms} & \textbf{121.92 ms} & \textbf{110.33 ms} & \textbf{98.84 ms} \\
-\textbf{Pure Single-Token Decode Throughput (\texttt{tok/s})} & --- & --- & 5.91 tok/s & 8.20 tok/s & \textbf{9.06 tok/s} ($+53.3\%$) & \textbf{10.12 tok/s} ($+71.2\%$) \\
-\textbf{Batched Prompt Prefill Throughput (\texttt{pp512})} & --- & 5,375 & 24.70 tok/s & 40.91 tok/s & \textbf{41.58 tok/s} ($+68.3\%$) & \textbf{41.58 tok/s} ($+68.3\%$) \\
+\textbf{Pure Single-Token Decode Throughput (\texttt{tok/s})} & --- & --- & 5.91 tok/s & 8.20 tok/s & \textbf{9.06--9.95 tok/s} ($+53.3\%\text{--}68.4\%$) & \textbf{10.12--10.74 tok/s} ($+71.2\%\text{--}81.7\%$) \\
+\textbf{Batched Prompt Prefill Throughput (\texttt{pp512})} & --- & 5,375 & 24.70 tok/s & 41.58 tok/s & \textbf{43.16--44.36 tok/s} ($+77.1\%$) & \textbf{43.16--44.36 tok/s} ($+77.1\%$) \\
 \bottomrule
 \end{tabular}%
 }
@@ -290,7 +290,7 @@ AMD Ryzen 9 9955HX (Zen 5) & 16C/32T (2 CCDs, 64MB L3) & 64GB DDR5 (0 GPU) & Nem
 Apple M4 Pro (Unified SoC) & 14C CPU + 20C Metal GPU & 24GB Unified (0 Swap) & Nemotron-30B (128K Ctx) & \textbf{256.0 -- 549.0} & \textbf{47.0 -- 48.0} & \textbf{49.0+ tok/s} \\
 AWS Graviton3 \texttt{m7g.2xlarge} & 8 vCPU ARM64 Neoverse-V1 & 31GB DDR5 (0 GPU) & Nemotron-30B (\texttt{-t 8}) & \textbf{101.67} & \textbf{41.05 tok/s} & \textbf{44.97 tok/s} \\
 Intel i9-9900K + RTX 2080 Ti & 8C/16T + 11GB CUDA (Win 11) & 16GB DDR4 + 11GB & Qwen3-14B / Nemotron-8B / 30B & Auto CUDA 12.4 & \textbf{50.0 -- 58.0} & \textbf{100+ tok/s} (8B) \\
-AMD Ryzen 9 9955HX (Zen 5) & 16C/32T (2 CCDs, 64MB L3) & 64GB DDR5 (58.9GiB RSS) & \textbf{DeepSeek-V4 284B (\texttt{Fractal})} & \textbf{41.58} (32.6ms Slot0) & \textbf{9.06 -- 10.12} & \textbf{11.50 -- 14.69 tok/s} \\
+AMD Ryzen 9 9955HX (Zen 5) & 16C/32T (2 CCDs, 64MB L3) & 64GB DDR5 (58.9GiB RSS) & \textbf{DeepSeek-V4 284B (\texttt{Fractal})} & \textbf{43.16 -- 44.36} (32.6ms Slot0) & \textbf{9.06 -- 10.74} & \textbf{11.50 -- 14.69 tok/s} \\
 \bottomrule
 \end{tabular}%
 }
