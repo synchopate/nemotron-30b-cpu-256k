@@ -3040,7 +3040,7 @@ index 42ec809..a5dc038 100644
          }
      }
 diff --git a/ggml/src/ggml-cpu/quants.c b/ggml/src/ggml-cpu/quants.c
-index 5e36459..4f68a51 100644
+index 5e36459..e41027d 100644
 --- a/ggml/src/ggml-cpu/quants.c
 +++ b/ggml/src/ggml-cpu/quants.c
 @@ -188,38 +188,154 @@ void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
@@ -3108,8 +3108,6 @@ index 5e36459..4f68a51 100644
 +    );
 +    const __m256i shift_qs01 = _mm256_setr_epi32(0, 0, 0, 0, 2, 2, 2, 2);
 +    const __m256i shift_qs23 = _mm256_setr_epi32(4, 4, 4, 4, 6, 6, 6, 6);
-+    const __m256i shift_qh01 = _mm256_setr_epi64x(0, 1, 2, 3);
-+    const __m256i shift_qh23 = _mm256_setr_epi64x(2, 3, 4, 5);
 +
 +    __m256 acc0 = _mm256_setzero_ps();
 +    __m256 acc1 = _mm256_setzero_ps();
@@ -3132,12 +3130,14 @@ index 5e36459..4f68a51 100644
 +        const __m256i qs256 = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)x[i].qs));
 +
 +        const __m256i qs_01 = _mm256_srlv_epi32(qs256, shift_qs01);
-+        const __m256i qh_01 = _mm256_and_si256(_mm256_srlv_epi64(_mm256_set1_epi64x((int64_t)(qh64 << 2)), shift_qh01), m4);
++        const __m256i qh_01 = _mm256_and_si256(_mm256_setr_epi64x(
++            (int64_t)(qh64 << 2), (int64_t)(qh64 << 1), (int64_t)qh64, (int64_t)(qh64 >> 1)), m4);
 +        const __m256i idx01 = _mm256_or_si256(_mm256_and_si256(qs_01, m3), qh_01);
 +        const __m256i q01   = _mm256_shuffle_epi8(lut256, idx01);
 +
 +        const __m256i qs_23 = _mm256_srlv_epi32(qs256, shift_qs23);
-+        const __m256i qh_23 = _mm256_and_si256(_mm256_srlv_epi64(_mm256_set1_epi64x((int64_t)qh64), shift_qh23), m4);
++        const __m256i qh_23 = _mm256_and_si256(_mm256_setr_epi64x(
++            (int64_t)(qh64 >> 2), (int64_t)(qh64 >> 3), (int64_t)(qh64 >> 4), (int64_t)(qh64 >> 5)), m4);
 +        const __m256i idx23 = _mm256_or_si256(_mm256_and_si256(qs_23, m3), qh_23);
 +        const __m256i q23   = _mm256_shuffle_epi8(lut256, idx23);
 +
@@ -3436,7 +3436,7 @@ index 2be3b75..c894b9e 100644
  
      if (debug || dsv4_compress_debug()) {
 diff --git a/src/llama-kv-cache-dsv4.cpp b/src/llama-kv-cache-dsv4.cpp
-index 5caa05e..71d4ea6 100644
+index 5caa05e..e79b88a 100644
 --- a/src/llama-kv-cache-dsv4.cpp
 +++ b/src/llama-kv-cache-dsv4.cpp
 @@ -553,7 +553,7 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
@@ -3480,18 +3480,19 @@ index 5caa05e..71d4ea6 100644
                  const int64_t dst_plane = (int64_t) d*state_rows;
  
                  for (uint32_t r = 0; r < state_size; ++r) {
-@@ -666,7 +671,9 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
+@@ -666,7 +671,10 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
                              }
                          }
                      } else {
 -                        const int64_t src_plane = (int64_t) (d - n_seq_tokens)*state_rows;
-+                        const uint32_t eff_rollback = (rollback > 0 && rollback <= n_rs_seq) ? rollback : 0;
-+                        const uint32_t hist_plane = std::min<uint32_t>(n_rs_seq, eff_rollback + (d - n_seq_tokens));
++                        const int32_t eff_rollback = (rollback > 0 && rollback <= n_rs_seq) ? (int32_t)rollback : 0;
++                        const int32_t raw_plane = eff_rollback + ((int32_t)d - (int32_t)n_seq_tokens);
++                        const uint32_t hist_plane = (raw_plane <= 0) ? 0u : (uint32_t)std::min<int32_t>((int32_t)n_rs_seq, raw_plane);
 +                        const int64_t src_plane = (int64_t) hist_plane*state_rows;
                          src = (int32_t) (src_plane + stream_off + r);
                      }
  
-@@ -1435,6 +1442,9 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
+@@ -1435,6 +1443,9 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
  
          const bool res = kv_raw->seq_rm(seq_id, p0, p1);
          if (res) {
