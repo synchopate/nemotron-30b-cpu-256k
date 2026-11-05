@@ -13,6 +13,58 @@
 
 [**⚡ Quickstart**](#-quickstart) · [**🧩 Supported Models**](#-supported-models--model-specific-optimizations) · [**🖥️ Supported Chips & Platforms**](#️-supported-chips--processor-specific-optimizations) · [**🏆 Leaderboard**](#-community-cpu--hybrid-leaderboard) · [**📄 Preprint PDF (`paper/`)**](paper/llama-modchip-paper.pdf) · [**📐 Architecture**](ARCHITECTURE.md) · [**❓ FAQ**](FAQ.md)
 
+<table>
+<tr>
+<td align="center"><b>284.33B</b><br><sub>Frontier MoE params</sub></td>
+<td align="center"><b>56.56 GiB</b><br><sub>checkpoint on disk</sub></td>
+<td align="center"><b>57.61 GiB</b><br><sub>peak VmRSS @ 256K ctx</sub></td>
+<td align="center"><b>44.36 tok/s</b><br><sub>284B CPU prefill</sub></td>
+<td align="center"><b>60.4–111.6 tok/s</b><br><sub>30B MoE CPU decode</sub></td>
+<td align="center"><b>13.1 ms</b><br><sub>Claude Code restore</sub></td>
+<td align="center"><b>0</b><br><sub>GPUs required</sub></td>
+</tr>
+</table>
+
+<p><b>Real-time Frontier & Agentic MoE inference on the CPU workstation you already own — 100% in RAM, zero NVMe swap:</b></p>
+
+<table>
+<tr>
+<th align="left">the machine you have</th>
+<th align="right">RAM</th>
+<th align="left">recommended model</th>
+<th align="right">speed (0 GPUs)</th>
+<th align="left">what is going on</th>
+</tr>
+<tr>
+<td align="left">a developer laptop / mini-PC</td>
+<td align="right">16–32 GB</td>
+<td align="left"><b>Nemotron-3.5-30B-A3B</b> (<code>14.35 GiB</code>)</td>
+<td align="right"><b>25.0–60.4 tok/s</b></td>
+<td>46 Mamba-2 SSM layers + 1.64 MB L3 Stockfish-PVS drafter; 256K ctx in 6 GiB KV</td>
+</tr>
+<tr>
+<td align="left">a 64 GB desktop / server</td>
+<td align="right">64 GB</td>
+<td align="left"><b>DeepSeek-V4-Flash 284B</b> (<code>56.56 GiB</code>)</td>
+<td align="right"><b>44.4 tok/s pp · 9.1–14.7 tok/s tg</b></td>
+<td>SwiGLU-H2 shaves 20.31 GiB; entire 284B model + 256K ctx sits in RAM (57.61 GiB VmRSS)</td>
+</tr>
+<tr>
+<td align="left">a hybrid desktop (CPU + 16 GB GPU)</td>
+<td align="right">32–64 GB</td>
+<td align="left"><b>Nemotron-30B / Qwen3-30B</b></td>
+<td align="right"><b>80.80 tok/s</b></td>
+<td>hot attention trunk on GPU (<code>-ngl 99</code>), cold routed MoE experts in CPU DDR5</td>
+</tr>
+<tr>
+<td align="left">an 8-channel workstation (Threadripper)</td>
+<td align="right">128 GB+</td>
+<td align="left"><b>DeepSeek-284B / Nemotron-30B</b></td>
+<td align="right"><b>111.62 tok/s</b> (30B)</td>
+<td>8-CCD AVX-512BW <code>_1x8</code> register tiling saturates 8-channel DDR5 memory bandwidth</td>
+</tr>
+</table>
+
 </div>
 
 > **TL;DR — The 3 Paradigm-Breaking Pillars of `llama-modchip`:**
