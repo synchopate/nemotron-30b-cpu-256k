@@ -82,11 +82,27 @@
 
 ## ⚡ Quickstart
 
-### 🐧 Linux & 🍎 macOS (1-Command Setup & Chat)
+### 🐧 Linux & 🍎 macOS (1-Command Automated Setup & Chat)
 ```bash
 git clone https://github.com/synchopate/llama-modchip.git
 cd llama-modchip
 ./modchip chat
+```
+
+### ⚡ Zero-Compile Direct Run (Pre-Compiled Linux `x86_64` Binary + Hugging Face `.gguf`)
+> **⚠️ Important Compatibility Note (`GGML_TYPE_Q2_0 = 40`):** Our **`Fractal-64`** models use custom block-64 `BF16`-scale Gray-coded tensors (`GGML_TYPE_Q2_0`, type ID `40`) and custom `deepseek4` / `Stockfish-PVS` kernels. Opening them in unpatched `llama.cpp`, Ollama, or LM Studio will fail with `unknown tensor type 40`. Use either `./modchip` above or our **standalone single-file pre-compiled binary (`llama-server-modchip-linux-x86_64`, zero `.so` dependencies)** bundled directly inside the Hugging Face repositories and [GitHub Release `v2.4.0`](https://github.com/synchopate/llama-modchip/releases/tag/v2.4.0):
+
+```bash
+# 1. For 30B Nemotron-3.5-A3B (14.35 GiB — runs in 16–32 GB RAM at 25–60.4 tok/s):
+hf download Synchopate/NVIDIA-Nemotron-3.5-30B-A3B-Fractal-64-CPU-GGUF \
+  llama-server-modchip-linux-x86_64 NVIDIA-Nemotron-3.5-30B-A3B-Fractal-64.gguf --local-dir .
+chmod +x llama-server-modchip-linux-x86_64
+./llama-server-modchip-linux-x86_64 -m NVIDIA-Nemotron-3.5-30B-A3B-Fractal-64.gguf -c 262144 -t 16 --port 8080
+
+# 2. For 284B DeepSeek-V4-Flash (56.56 GiB — fits in 64 GB RAM at 9.1–14.7 tok/s):
+hf download Synchopate/DeepSeek-V4-Flash-0731-Fractal-64GB-CPU-GGUF --local-dir ./dsv4
+chmod +x ./dsv4/llama-server-modchip-linux-x86_64
+./dsv4/llama-server-modchip-linux-x86_64 -m ./dsv4/DeepSeek-V4-Flash-0731-Fractal-00001-of-00003.gguf -c 32768 -t 16 -fa on --port 8080
 ```
 
 ### 🪟 Windows 10/11 (1-Click Hybrid GPU + CPU MoE Pack)
